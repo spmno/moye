@@ -1,6 +1,6 @@
 // 提示词进化模块：用一套固定的评估基准（benchmark）给"候选提示词"打分，
 // 只有分数不低于当前版本的提示词才会被采用，从而防止提示词越改越差（漂移）。
-use crate::providers::{deepseek_client, ChatAgent};
+use crate::providers::{create_client, ChatAgent};
 use crate::registry::{AgentRegistry, Role};
 use anyhow::Result;
 use rig_core::client::CompletionClient;
@@ -37,12 +37,14 @@ impl PromptEvolver {
 
     /// 针对给定提示词跑一遍基准，返回通过的任务数量。
     pub async fn eval_preamble(&self, preamble: &str) -> Result<usize> {
-        let client = deepseek_client()?;
+        let client = create_client()?;
         let model = self.registry.effective_model();
+        let params = crate::providers::provider_additional_params();
         let agent: ChatAgent = client
             .agent(&model)
             .preamble(preamble)
             .temperature(0.0)
+            .additional_params(params)
             .build();
         let judge = self.registry.build(Role::Auditor)?;
         let mut passed = 0;

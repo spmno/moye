@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
             .with_timer(timer)
             .with_writer(std::io::stdout);
         tracing_subscriber::registry()
-            .with(tracing_subscriber::EnvFilter::new("info"))
+            .with(tracing_subscriber::EnvFilter::new("info,rig_core=debug"))
             .with(file_layer)
             .with(stdout_layer)
             .init();
@@ -61,8 +61,9 @@ async fn main() -> Result<()> {
 
     let mem = memory::MemoryStore::new(&load_memory_cfg()?)?;
 
+    let provider_name = format!("{:?}", providers::current_provider());
     info!(
-        "my-agent ready (DeepSeek). model: {}\nCommands: model <slug> | evolve | evolve-code | add-tool | add-skill | skills | quit",
+        "my-agent ready ({provider_name}). model: {}\nCommands: model <slug> | evolve | evolve-code | add-tool | add-skill | skills | quit",
         current_model(&registry)
     );
 
@@ -183,7 +184,10 @@ async fn main() -> Result<()> {
                     ts: now(),
                 })?;
             }
-            Err(e) => error!("autonomous loop error: {e}"),
+            Err(e) => {
+                error!("autonomous loop error: {e}");
+                error!("  detail: {e:?}");
+            },
         }
     }
     Ok(())

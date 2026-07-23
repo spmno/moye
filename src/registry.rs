@@ -1,10 +1,11 @@
 // 注册表模块：定义角色（Role）、按工具的权限分级（ToolPerms / Permission）、
 // 以及构建和管理各角色 Agent 的 AgentRegistry。权限分级驱动自主循环的 HITL（人在环）控制。
-use crate::providers::{deepseek_client, ChatAgent};
+use crate::providers::{create_client, ChatAgent};
 use rig_core::client::CompletionClient;
 use rig_core::completion::Prompt;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
+use tracing::info;
 
 /// Agent 角色：编排者 / 规划者 / 构建者 / 审计者。
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -160,7 +161,7 @@ impl AgentRegistry {
             .roles
             .get(&key)
             .ok_or_else(|| anyhow::anyhow!("no config for role {key}"))?;
-        let client = deepseek_client()?;
+        let client = create_client()?;
         let preamble = std::fs::read_to_string(&rc.preamble)
             .unwrap_or_else(|_| format!("你是 {key} agent。"));
         // 把与角色领域相关的技能指令注入提示词，使模型遵循技能中的步骤。
@@ -170,11 +171,13 @@ impl AgentRegistry {
             Some(ref m) => m.clone(),
             None => rc.model.clone(),
         };
+        info!("[build] role={key} model={model}");
         // 只要该角色任一内置工具被允许，就为其装配工具。
         let with_tools = rc.permissions.read_file == Permission::Allow
             || rc.permissions.run_bash_readonly == Permission::Allow
             || rc.permissions.run_bash_mutating == Permission::Allow
             || rc.permissions.edit_file == Permission::Allow;
+        let params = crate::providers::provider_additional_params();
         let agent = if with_tools {
             let tools = crate::tools::builtin_tools()?;
             client
@@ -182,12 +185,14 @@ impl AgentRegistry {
                 .preamble(&preamble)
                 .temperature(0.7)
                 .tools(tools)
+                .additional_params(params)
                 .build()
         } else {
             client
                 .agent(&model)
                 .preamble(&preamble)
                 .temperature(0.7)
+                .additional_params(params)
                 .build()
         };
         Ok(RoleAgent {

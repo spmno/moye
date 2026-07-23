@@ -1,25 +1,78 @@
-// DeepSeek 供应商客户端：rig 自带原生 `providers::deepseek` 客户端，
-// API Key 从环境变量 DEEPSEEK_API_KEY 读取。DeepSeek API 兼容 OpenAI 格式。
+// 供应商客户端：通过 MY_AGENT_PROVIDER 环境变量选择供应商（deepseek / bailian）。
+// 均使用 OpenAI 兼容接口，Bailian 百炼平台通过自定义 base URL 接入。
 use anyhow::Result;
-use rig_core::{client::{ProviderClient, CompletionClient}, providers::deepseek};
+use rig_core::providers::openai::{self, CompletionsClient};
+use tracing::info;
 
-/// 构建 DeepSeek 客户端。rig 自带原生的 `providers::deepseek` 客户端
-/// （直连 DeepSeek API，不经过 OpenRouter）。API Key 从环境变量
-/// DEEPSEEK_API_KEY 读取。
-pub fn deepseek_client() -> Result<deepseek::Client> {
-    let client = deepseek::Client::from_env()?;
+/// 供应商类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    DeepSeek,
+    Bailian,
+}
+
+impl Provider {
+    /// 从环境变量 MY_AGENT_PROVIDER 解析；默认 deepseek。
+    fn from_env() -> Self {
+        match std::env::var("MY_AGENT_PROVIDER")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str()
+        {
+            "bailian" => Provider::Bailian,
+            _ => Provider::DeepSeek,
+        }
+    }
+
+    /// API Key 环境变量名。
+    fn api_key_env(&self) -> &'static str {
+        match self {
+            Provider::DeepSeek => "DEEPSEEK_API_KEY",
+            Provider::Bailian => "DASHSCOPE_API_KEY",
+        }
+    }
+
+    /// OpenAI 兼容 base URL（含 /v1 前缀）。
+    fn base_url(&self) -> &'static str {
+        match self {
+            Provider::DeepSeek => "https://api.deepseek.com/v1",
+            Provider::Bailian => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        }
+    }
+}
+
+/// 构建当前供应商的 OpenAI 兼容客户端。
+pub fn create_client() -> Result<CompletionsClient> {
+    let provider = Provider::from_env();
+    let api_key = std::env::var(provider.api_key_env())
+        .map_err(|_| anyhow::anyhow!("{} not set", provider.api_key_env()))?;
+    info!(
+        "[provider] {:?} | base_url={} | api_key={}...{}",
+        provider,
+        provider.base_url(),
+        &api_key[..8.min(api_key.len())],
+        &api_key[api_key.len().saturating_sub(4)..],
+    );
+    let client = CompletionsClient::builder()
+        .api_key(api_key)
+        .base_url(provider.base_url())
+        .build()?;
     Ok(client)
 }
 
-/// 对话型 Agent 的别名：基于 DeepSeek CompletionModel 的 rig Agent。
-pub type ChatAgent = rig_core::agent::Agent<deepseek::CompletionModel>;
-
-// 预留给 Phase-3 的公开辅助函数（在 registry 之外构造按角色划分的 Agent）。
-#[allow(dead_code)]
-pub fn build_agent(client: &deepseek::Client, model: &str, preamble: &str) -> ChatAgent {
-    client
-        .agent(model)
-        .preamble(preamble)
-        .temperature(0.7)
-        .build()
+/// 返回当前生效的供应商。
+pub fn current_provider() -> Provider {
+    Provider::from_env()
 }
+
+/// 返回当前供应商需要的额外请求参数。
+/// Bailian/Kimi 需要 reasoning_effort 参数才正常工作。
+pub fn provider_additional_params() -> serde_json::Value {
+    match Provider::from_env() {
+        Provider::Bailian => serde_json::json!({"reasoning_effort": "max"}),
+        Provider::DeepSeek => serde_json::json!({}),
+    }
+}
+
+/// 对话型 Agent 别名：基于 OpenAI CompletionModel 的 rig Agent（兼容所有供应商）。
+pub type ChatAgent = rig_core::agent::Agent<openai::CompletionModel>;

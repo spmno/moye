@@ -1,14 +1,19 @@
 # Agent 运行时配置。
-# 供应商直连 DeepSeek API（非 OpenRouter），rig 自带原生 deepseek 客户端。
-# API Key 从环境变量 DEEPSEEK_API_KEY 读取。
+# 通过环境变量 MY_AGENT_PROVIDER 选择供应商（默认 deepseek，可设为 bailian）。
+# API Key 从供应商对应的环境变量读取（DEEPSEEK_API_KEY / DASHSCOPE_API_KEY）。
+# Bailian 百炼平台通过 OpenAI 兼容接口接入：base_url 已在代码中内置。
 
 [provider]
-# DeepSeek API 直连（rig 内置客户端），无需手动配置 base_url。
-api_key_env = "DEEPSEEK_API_KEY"
+# 当前供应商（由 MY_AGENT_PROVIDER 环境变量控制，默认 deepseek）
+# Bailian 示例：export MY_AGENT_PROVIDER=bailian
+#            export DASHSCOPE_API_KEY=sk-xxx
+api_key_env = "AUTO"  # 代码自动根据供应商选择
 
 [agent]
-# 默认模型：deepseek-v4-pro（推理模式）。切换模型用 REPL 命令：model <slug>
-default_model = "deepseek-v4-pro"
+# 默认模型：需与供应商匹配。DeepSeek 可用 deepseek-v4-pro / deepseek-v4-flash；
+# Bailian 可用 qwen-plus / qwen-max / qwen-turbo 等。
+# 切换模型用 REPL 命令：model <slug>
+default_model = "kimi/kimi-k3"
 # 自主循环上限：agent 最多执行的轮数。
 max_turns = 20
 
@@ -18,7 +23,7 @@ max_turns = 20
 #   read_file / run_bash_readonly 默认自动执行（如 ls, cat, git status）；
 #   run_bash_mutating / edit_file 默认需询问。
 [agents.orchestrator]
-model = "deepseek-v4-pro"
+model = "kimi/kimi-k3"
 preamble = "AGENTS.md"
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
@@ -26,7 +31,7 @@ permissions.run_bash_mutating = "deny"
 permissions.edit_file = "deny"
 
 [agents.planner]
-model = "deepseek-v4-pro"
+model = "kimi/kimi-k3"
 preamble = "prompts/planner.md"
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
@@ -34,7 +39,7 @@ permissions.run_bash_mutating = "deny"
 permissions.edit_file = "deny"
 
 [agents.builder]
-model = "deepseek-v4-pro"
+model = "kimi/kimi-k3"
 preamble = "prompts/builder.md"
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
@@ -42,7 +47,7 @@ permissions.run_bash_mutating = "ask"
 permissions.edit_file = "allow"
 
 [agents.auditor]
-model = "deepseek-v4-pro"
+model = "kimi/kimi-k3"
 preamble = "prompts/auditor.md"
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"

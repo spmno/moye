@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use rig_core::agent::{AgentHook, Flow, HookContext, StepEvent};
 use rig_core::client::CompletionClient;
 use rig_core::completion::{CompletionModel, AssistantContent, Usage};
-use rig_core::providers::deepseek::CompletionModel as DeepSeekModel;
+use rig_core::providers::openai::CompletionModel as OpenAiModel;
 use rig_core::tool::ToolDyn;
 use tracing::{info, warn};
 
@@ -212,22 +212,25 @@ pub async fn run_autonomous(registry: &AgentRegistry, goal: &str) -> anyhow::Res
 fn build_runner_agent(
     registry: &AgentRegistry,
     role: Role,
-) -> anyhow::Result<rig_core::agent::Agent<DeepSeekModel>> {
+) -> anyhow::Result<rig_core::agent::Agent<OpenAiModel>> {
     let rc = registry
         .role_config(role)
         .ok_or_else(|| anyhow::anyhow!("no config for role {role:?}"))?;
-    let client = crate::providers::deepseek_client()?;
+    let client = crate::providers::create_client()?;
     let preamble = std::fs::read_to_string(&rc.preamble)
         .unwrap_or_else(|_| format!("你是 {role:?} agent。"));
     // 与 registry 的 build 一致：把相关技能指令注入提示词。
     let preamble = crate::registry::inject_skills_public(&preamble);
     let model = registry.session_model().unwrap_or_else(|| rc.model.clone());
+    info!("[runner] role={role:?} model={model}");
     let tools: Vec<Box<dyn ToolDyn>> = crate::tools::builtin_tools()?;
+    let params = crate::providers::provider_additional_params();
     let agent = client
         .agent(&model)
         .preamble(&preamble)
         .temperature(0.7)
         .tools(tools)
+        .additional_params(params)
         .build();
     Ok(agent)
 }

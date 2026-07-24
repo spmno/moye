@@ -1,5 +1,5 @@
-// 供应商客户端：通过 MY_AGENT_PROVIDER 环境变量选择供应商（deepseek / bailian）。
-// 均使用 OpenAI 兼容接口，Bailian 百炼平台通过自定义 base URL 接入。
+// 供应商客户端：通过 MY_AGENT_PROVIDER 环境变量选择供应商（deepseek / bailian / moonshot）。
+// 均使用 OpenAI 兼容接口，Bailian 百炼平台和 Moonshot Kimi 平台通过自定义 base URL 接入。
 use anyhow::Result;
 use rig_core::providers::openai::{self, CompletionsClient};
 use tracing::info;
@@ -9,6 +9,8 @@ use tracing::info;
 pub enum Provider {
     DeepSeek,
     Bailian,
+    /// Moonshot Kimi 平台（https://platform.kimi.com）。Kimi K3 需要用原生 API。
+    Moonshot,
 }
 
 impl Provider {
@@ -20,6 +22,8 @@ impl Provider {
             .as_str()
         {
             "bailian" => Provider::Bailian,
+            "moonshot" => Provider::Moonshot,
+            "kimi" => Provider::Moonshot,
             _ => Provider::DeepSeek,
         }
     }
@@ -29,6 +33,7 @@ impl Provider {
         match self {
             Provider::DeepSeek => "DEEPSEEK_API_KEY",
             Provider::Bailian => "DASHSCOPE_API_KEY",
+            Provider::Moonshot => "MOONSHOT_API_KEY",
         }
     }
 
@@ -37,6 +42,16 @@ impl Provider {
         match self {
             Provider::DeepSeek => "https://api.deepseek.com/v1",
             Provider::Bailian => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            Provider::Moonshot => "https://api.moonshot.cn/v1",
+        }
+    }
+
+    /// 将请求的 temperature 限制在供应商允许的范围内。
+    pub fn clamp_temperature(desired: f64) -> f64 {
+        match Self::from_env() {
+            // Kimi K3 只接受 1.0
+            Provider::Moonshot => 1.0,
+            _ => desired,
         }
     }
 }
@@ -66,11 +81,13 @@ pub fn current_provider() -> Provider {
 }
 
 /// 返回当前供应商需要的额外请求参数。
-/// Bailian/Kimi 需要 reasoning_effort 参数才正常工作。
 pub fn provider_additional_params() -> serde_json::Value {
     match Provider::from_env() {
-        Provider::Bailian => serde_json::json!({"reasoning_effort": "max"}),
-        Provider::DeepSeek => serde_json::json!({}),
+        // Moonshot Kimi K3 支持 reasoning_effort，但设为 max 时流式输出会很慢。
+        // 先不加，等基础连通后再按需调整。
+        Provider::Moonshot => serde_json::json!({}),
+        // Bailian 在工具调用场景下加 reasoning_effort 可能导致超时，先不加。
+        Provider::Bailian | Provider::DeepSeek => serde_json::json!({}),
     }
 }
 

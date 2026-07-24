@@ -58,6 +58,13 @@ impl HitlHook {
 impl<M: CompletionModel> AgentHook<M> for HitlHook {
     async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
         match event {
+            // 流式文本增量：实时输出到终端和日志文件。
+            StepEvent::TextDelta { delta, .. } => {
+                if !delta.is_empty() {
+                    info!("{delta}");
+                }
+                Flow::Continue
+            }
             // 模型回合完成：打印思考过程（reasoning）与最终输出。
             StepEvent::ModelTurnFinished { turn, content, usage } => {
                 info!("\n--- 轮次 {turn} ---");
@@ -228,7 +235,7 @@ fn build_runner_agent(
     let agent = client
         .agent(&model)
         .preamble(&preamble)
-        .temperature(0.7)
+        .temperature(crate::providers::Provider::clamp_temperature(0.7))
         .tools(tools)
         .additional_params(params)
         .build();

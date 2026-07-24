@@ -183,7 +183,7 @@ impl AgentRegistry {
             client
                 .agent(&model)
                 .preamble(&preamble)
-                .temperature(0.7)
+                .temperature(crate::providers::Provider::clamp_temperature(0.7))
                 .tools(tools)
                 .additional_params(params)
                 .build()
@@ -191,7 +191,7 @@ impl AgentRegistry {
             client
                 .agent(&model)
                 .preamble(&preamble)
-                .temperature(0.7)
+                .temperature(crate::providers::Provider::clamp_temperature(0.7))
                 .additional_params(params)
                 .build()
         };

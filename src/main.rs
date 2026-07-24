@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
             .with_timer(timer)
             .with_writer(std::io::stdout);
         tracing_subscriber::registry()
-            .with(tracing_subscriber::EnvFilter::new("info,rig_core=debug"))
+            .with(tracing_subscriber::EnvFilter::new("info,rig_core=trace"))
             .with(file_layer)
             .with(stdout_layer)
             .init();

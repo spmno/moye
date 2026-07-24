@@ -43,7 +43,7 @@ impl PromptEvolver {
         let agent: ChatAgent = client
             .agent(&model)
             .preamble(preamble)
-            .temperature(0.0)
+            .temperature(crate::providers::Provider::clamp_temperature(0.0))
             .additional_params(params)
             .build();
         let judge = self.registry.build(Role::Auditor)?;

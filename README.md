@@ -54,7 +54,7 @@ cargo --version
 ### 2. 获取项目代码
 
 ```bash
-git clone <repository-url> my-agent
+git clone https://github.com/spmno/my-agent.git
 cd my-agent
 ```
 

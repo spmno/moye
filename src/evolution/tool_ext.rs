@@ -90,7 +90,7 @@ pub fn add_tool(name: &str, description: &str) -> Result<String> {
     let mod_name = name.replace('-', "_");
     let file = format!("src/tools_ext/{mod_name}.rs");
     let src = format!(
-        "// AUTO-GENERATED tool scaffold. Implement `call`.\n\
+        "// AUTO-GENERATED tool scaffold. 请编辑 call 函数体补全实现。\n\
          use rig_core::tool::Tool;\n\
          use serde::Deserialize;\n\
          use serde_json::json;\n\n\
@@ -104,8 +104,8 @@ pub fn add_tool(name: &str, description: &str) -> Result<String> {
          \x20   type Output = String;\n\n\
          \x20   fn description(&self) -> String {{ \"{description}\".to_string() }}\n\n\
          \x20   fn parameters(&self) -> serde_json::Value {{ json!({{ \"type\": \"object\", \"properties\": {{}}, \"required\": [] }}) }}\n\n\
-         \x20   async fn call(&self, _args: Self::Args) -> anyhow::Result<Self::Output> {{\n\
-         \x20       todo!(\"implement {name}\")\n\
+         \x20   async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {{\n\
+         \x20       Err(anyhow::anyhow!(\"工具 '{name}' 尚未实现；请编辑此文件补全 call 函数体\"))\n\
          \x20   }}\n\
          }}\n"
     );

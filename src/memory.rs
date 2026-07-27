@@ -1,6 +1,6 @@
-// 核心记忆/经验存储模块。部分方法当前尚未被自主循环调用，但属于自我进化设计
-// 的一部分（规则升级、为"评审门"模式记录经验）。
-#![allow(dead_code)]
+// 核心记忆/经验存储模块：会话 Turn + 教训 Lesson + 规则 Rule。
+// 被 AppContext（cli/context.rs）在每次任务完成后调用：
+// append_turn → record_lesson → observe_rule → promote_rule_to_agents_md。
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -40,8 +40,6 @@ pub struct MemoryConfig {
 
 /// 记忆存储：管理会话、经验、规则的 JSONL / JSON 文件读写。
 pub struct MemoryStore {
-    #[allow(dead_code)]
-    dir: PathBuf,
     conversation_file: PathBuf,
     lessons_file: PathBuf,
     rules_file: PathBuf,
@@ -52,7 +50,6 @@ impl MemoryStore {
     pub fn new(cfg: &MemoryConfig) -> Result<Self> {
         std::fs::create_dir_all(&cfg.dir)?;
         Ok(Self {
-            dir: cfg.dir.clone(),
             conversation_file: cfg.dir.join(&cfg.conversation_file),
             lessons_file: cfg.dir.join(&cfg.lessons_file),
             rules_file: cfg.dir.join(&cfg.rules_file),

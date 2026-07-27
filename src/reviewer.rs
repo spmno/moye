@@ -1,6 +1,6 @@
-// 两阶段评审门。为"评审门"模式预留；当前自主循环使用自身的权限分级 hook 实现
-// HITL（human-in-the-loop，人在环）控制。
-#![allow(dead_code)]
+// 两阶段评审门（ReviewGate）。被 Orchestrator 在 SDD 管线中调用：
+// Builder 产出后，Auditor 先做规格符合性评审，再做代码质量评审。
+// 两者都 APPROVE 才算通过，否则带反馈退回。
 
 use crate::registry::{AgentRegistry, Role};
 

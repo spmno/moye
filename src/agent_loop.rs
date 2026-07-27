@@ -10,7 +10,7 @@ use rig_core::tool::ToolDyn;
 use tracing::{info, warn};
 
 use crate::registry::{AgentRegistry, Permission, Role, ToolPerms};
-use crate::tools::{is_readonly_bash, TOOL_NAMES};
+use crate::tools::is_readonly_bash;
 
 /// HITL（人在环）门控。实现为 rig 的 `AgentHook`，拦截每一次 `ToolCall` 并按角色的
 /// 按工具权限分级处理：
@@ -25,7 +25,6 @@ pub struct HitlHook {
     perms: Arc<Mutex<ToolPerms>>,
 }
 
-#[allow(dead_code)]
 impl HitlHook {
     pub fn new(perms: ToolPerms) -> Self {
         Self {
@@ -182,8 +181,8 @@ pub fn decide_tier(perms: &ToolPerms, tool_name: &str, args: &str) -> Permission
 /// 纯函数形式的流程决策。仅用于单元测试，保证确定性与无 IO 依赖。
 /// `Ask` 在此解析为 `Flow::Skip`；线上 hook 应改用 `on_event` 中
 /// 的 match tier 分支，对 `Ask` 通过 `confirm()` 进行终端交互询问。
-#[allow(dead_code)]
-pub fn decide_flow(perms: &ToolPerms, tool_name: &str, args: &str) -> Flow {
+#[cfg(test)]
+fn decide_flow(perms: &ToolPerms, tool_name: &str, args: &str) -> Flow {
     match decide_tier(perms, tool_name, args) {
         Permission::Allow => Flow::Continue,
         Permission::Deny => Flow::Skip {
@@ -195,14 +194,18 @@ pub fn decide_flow(perms: &ToolPerms, tool_name: &str, args: &str) -> Flow {
     }
 }
 
-/// 针对 `goal` 驱动自主 Agent 循环。Builder 角色自行规划并执行，调用工具；
+/// 针对 `goal` 驱动自主 Agent 循环。指定角色的 Agent 自行规划并执行，调用工具；
 /// `HitlHook` 门控关键决策。模型结束或达到 max_turns 时停止。
-pub async fn run_autonomous(registry: &AgentRegistry, goal: &str) -> anyhow::Result<String> {
-    let perms = registry.tool_perms(Role::Builder);
+pub async fn run_autonomous(
+    registry: &AgentRegistry,
+    role: Role,
+    goal: &str,
+) -> anyhow::Result<String> {
+    let perms = registry.tool_perms(role);
     let max_turns = registry.max_turns();
     let hook = HitlHook::new(perms);
 
-    let agent = build_runner_agent(registry, Role::Builder)?;
+    let agent = build_runner_agent(registry, role)?;
     let response = agent
         .runner(goal)
         .max_turns(max_turns)
@@ -240,12 +243,6 @@ fn build_runner_agent(
         .additional_params(params)
         .build();
     Ok(agent)
-}
-
-#[allow(dead_code)]
-fn _assert_tool_names() {
-    // 编译期守卫：确保分类器覆盖了每一个内置工具。
-    let _ = TOOL_NAMES;
 }
 
 #[cfg(test)]

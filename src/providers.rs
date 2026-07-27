@@ -11,6 +11,8 @@ pub enum Provider {
     Bailian,
     /// Moonshot Kimi 平台（https://platform.kimi.com）。Kimi K3 需要用原生 API。
     Moonshot,
+    /// 自定义 OpenAI 兼容供应商。通过 MY_AGENT_BASE_URL + MY_AGENT_API_KEY 配置。
+    Custom,
 }
 
 impl Provider {
@@ -22,8 +24,8 @@ impl Provider {
             .as_str()
         {
             "bailian" => Provider::Bailian,
-            "moonshot" => Provider::Moonshot,
-            "kimi" => Provider::Moonshot,
+            "moonshot" | "kimi" => Provider::Moonshot,
+            "custom" | "openai" | "glm" => Provider::Custom,
             _ => Provider::DeepSeek,
         }
     }
@@ -34,22 +36,24 @@ impl Provider {
             Provider::DeepSeek => "DEEPSEEK_API_KEY",
             Provider::Bailian => "DASHSCOPE_API_KEY",
             Provider::Moonshot => "MOONSHOT_API_KEY",
+            Provider::Custom => "MY_AGENT_API_KEY",
         }
     }
 
     /// OpenAI 兼容 base URL（含 /v1 前缀）。
-    fn base_url(&self) -> &'static str {
+    fn base_url(&self) -> String {
         match self {
-            Provider::DeepSeek => "https://api.deepseek.com/v1",
-            Provider::Bailian => "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            Provider::Moonshot => "https://api.moonshot.cn/v1",
+            Provider::DeepSeek => "https://api.deepseek.com/v1".to_string(),
+            Provider::Bailian => "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
+            Provider::Moonshot => "https://api.moonshot.cn/v1".to_string(),
+            Provider::Custom => std::env::var("MY_AGENT_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
         }
     }
 
     /// 将请求的 temperature 限制在供应商允许的范围内。
     pub fn clamp_temperature(desired: f64) -> f64 {
         match Self::from_env() {
-            // Kimi K3 只接受 1.0
             Provider::Moonshot => 1.0,
             _ => desired,
         }
@@ -61,16 +65,17 @@ pub fn create_client() -> Result<CompletionsClient> {
     let provider = Provider::from_env();
     let api_key = std::env::var(provider.api_key_env())
         .map_err(|_| anyhow::anyhow!("{} not set", provider.api_key_env()))?;
+    let base_url = provider.base_url();
     info!(
         "[provider] {:?} | base_url={} | api_key={}...{}",
         provider,
-        provider.base_url(),
+        base_url,
         &api_key[..8.min(api_key.len())],
         &api_key[api_key.len().saturating_sub(4)..],
     );
     let client = CompletionsClient::builder()
         .api_key(api_key)
-        .base_url(provider.base_url())
+        .base_url(&base_url)
         .build()?;
     Ok(client)
 }
@@ -83,11 +88,8 @@ pub fn current_provider() -> Provider {
 /// 返回当前供应商需要的额外请求参数。
 pub fn provider_additional_params() -> serde_json::Value {
     match Provider::from_env() {
-        // Moonshot Kimi K3 支持 reasoning_effort，但设为 max 时流式输出会很慢。
-        // 先不加，等基础连通后再按需调整。
         Provider::Moonshot => serde_json::json!({}),
-        // Bailian 在工具调用场景下加 reasoning_effort 可能导致超时，先不加。
-        Provider::Bailian | Provider::DeepSeek => serde_json::json!({}),
+        Provider::Bailian | Provider::DeepSeek | Provider::Custom => serde_json::json!({}),
     }
 }
 

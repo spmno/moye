@@ -1,6 +1,6 @@
-// 内置工具模块：为 Builder Agent 提供文件读写与命令执行能力。
-// 注意：各工具的 `description()` 是面向模型（LLM）的英文提示，需保持英文，
-// 不应改为中文；下方模块级与函数级注释才使用中文。
+// 内置工具模块：为 Agent 提供文件读写与命令执行能力。
+// 各工具的 `description()` 是面向模型（LLM）的自然语言提示，统一使用中文
+// （本项目主要使用中文模型：DeepSeek / GLM / Kimi）。
 use anyhow::Result;
 use rig_core::tool::Tool;
 use serde::Deserialize;
@@ -162,9 +162,6 @@ impl Tool for RunBash {
     }
 }
 
-/// 内置工具名称表，与各工具的 `const NAME` 一一对应。供自主循环按名称分类工具调用。
-pub const TOOL_NAMES: &[&str] = &["read_file", "edit_file", "write_file", "run_bash"];
-
 /// 判断 shell 命令是否为只读（可安全自动执行）还是会改变状态（需询问）。
 /// 拿不准时返回 false —— 循环会将其视为"会改变状态"并询问人类，
 /// 因为自动执行破坏性命令比多一次确认更危险。
@@ -189,15 +186,18 @@ pub fn is_readonly_bash(command: &str) -> bool {
     true
 }
 
-/// 每个 Builder Agent 都内置的工具集合。Phase 4 的扩展会追加更多工具，
-/// 并以清单（manifest）形式持久化，在启动时加载。
+/// 内置工具集合 + 动态工具（tools_ext）。
+/// 动态工具由 /add-tool 命令生成，需重新 cargo build 后生效。
 pub fn builtin_tools() -> Result<Vec<Box<dyn rig_core::tool::ToolDyn>>> {
-    Ok(vec![
+    let mut tools: Vec<Box<dyn rig_core::tool::ToolDyn>> = vec![
         Box::new(ReadFile),
         Box::new(EditFile),
         Box::new(WriteFile),
         Box::new(RunBash),
-    ])
+    ];
+    // 加载动态工具（由 ToolManifest 重新生成的 mod.rs 提供）
+    tools.extend(crate::tools_ext::load_all());
+    Ok(tools)
 }
 
 #[cfg(test)]

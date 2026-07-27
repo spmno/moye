@@ -97,20 +97,16 @@ impl AgentRegistryConfig {
     }
 }
 
-/// 绑定到某个角色的 Agent：模型 + preamble（提示词，从 .md 文件加载）+ 权限。
+/// 绑定到某个角色的 Agent：模型 + preamble（提示词，从 .md 文件加载）。
 pub struct RoleAgent {
-    #[allow(dead_code)]
-    pub role: Role,
+    role: Role,
     agent: ChatAgent,
-    // 权限在构建时即已生效（决定 Agent 能拿到哪些工具）。此处保留字段用于
-    // 运行时检视 / Phase-3 的策略检查。
-    #[allow(dead_code)]
-    pub permissions: ToolPerms,
 }
 
 impl RoleAgent {
-    /// 用该角色 Agent 直接执行一次任务（用于一次性 chat 模式）。
+    /// 用该角色 Agent 直接执行一次任务（用于 Planner/Auditor 等不需要工具循环的角色）。
     pub async fn run(&self, task: &str) -> anyhow::Result<String> {
+        info!("[{:?}] 执行任务", self.role);
         Ok(self.agent.prompt(task).await?)
     }
 }
@@ -198,7 +194,6 @@ impl AgentRegistry {
         Ok(RoleAgent {
             role,
             agent,
-            permissions: rc.permissions.clone(),
         })
     }
 
@@ -244,9 +239,7 @@ pub fn inject_skills_public(preamble: &str) -> String {
     }
 }
 
-/// 将用户消息分类为意图，对应 OMO 的意图门（Intent Gate）。
-/// 为一次性 chat 模式预留；当前自主循环直接处理所有非元命令输入。
-#[allow(dead_code)]
+/// 意图分类：驱动 SDD 管线路由。
 #[derive(Debug, PartialEq, Eq)]
 pub enum Intent {
     Implement,
@@ -254,32 +247,35 @@ pub enum Intent {
     Chat,
 }
 
-#[allow(dead_code)]
+/// 将用户消息分类为意图，驱动 SDD 管线路由。
+/// 关键词同时覆盖中文和英文，适配中文模型（DeepSeek/GLM/Kimi）为主的使用场景。
 pub fn classify(message: &str) -> Intent {
     let m = message.to_lowercase();
-    if ["implement", "add", "create", "fix", "write", "build"]
-        .iter()
-        .any(|k| m.contains(k))
-    {
+    let implement_kws = [
+        "实现", "添加", "创建", "修复", "编写", "构建", "修改", "重构", "删除",
+        "implement", "add", "create", "fix", "write", "build", "refactor",
+    ];
+    let investigate_kws = [
+        "看一下", "调查", "检查", "查找", "怎么", "分析", "对比", "差距",
+        "look into", "investigate", "check", "find", "how does", "explain", "compare",
+    ];
+    if implement_kws.iter().any(|k| m.contains(k)) {
         Intent::Implement
-    } else if ["look into", "investigate", "check", "find", "how does"]
-        .iter()
-        .any(|k| m.contains(k))
-    {
+    } else if investigate_kws.iter().any(|k| m.contains(k)) {
         Intent::Investigate
     } else {
         Intent::Chat
     }
 }
 
-/// 编排者：先分类意图，再委派给对应的角色 Agent。相当于 Sisyphus 的编排层。
-/// 为一次性 chat 模式预留；当前自主循环直接处理非元命令输入。
-#[allow(dead_code)]
+/// 编排者：先分类意图，再按 SDD 纪律委派给对应的角色 Agent。
+/// Implement → 规划者拆解 → 构建者执行（工具循环 + HITL）→ 审计者两轮评审。
+/// Investigate → 规划者只读探索（工具循环，无编辑权限）。
+/// Chat → 构建者直接对话（无工具循环）。
 pub struct Orchestrator {
     registry: AgentRegistry,
 }
 
-#[allow(dead_code)]
 impl Orchestrator {
     pub fn new(registry: AgentRegistry) -> Self {
         Self { registry }
@@ -287,12 +283,46 @@ impl Orchestrator {
 
     pub async fn handle(&self, message: &str) -> anyhow::Result<String> {
         let intent = classify(message);
-        let role = match intent {
-            Intent::Implement => Role::Builder,
-            Intent::Investigate => Role::Planner,
-            Intent::Chat => Role::Orchestrator,
-        };
-        let agent = self.registry.build(role)?;
-        agent.run(message).await
+        match intent {
+            Intent::Implement => self.run_sdd_pipeline(message).await,
+            Intent::Investigate => {
+                crate::agent_loop::run_autonomous(&self.registry, Role::Planner, message).await
+            }
+            Intent::Chat => {
+                let agent = self.registry.build(Role::Builder)?;
+                agent.run(message).await
+            }
+        }
+    }
+
+    /// SDD 管线：规划者拆解 → 构建者执行 → 审计者两轮评审。
+    /// 审计不通过时带反馈重试一次（避免无限循环）。
+    async fn run_sdd_pipeline(&self, message: &str) -> anyhow::Result<String> {
+        let planner = self.registry.build(Role::Planner)?;
+        let plan = planner
+            .run(&format!("任务：{message}\n\n请拆解为相互独立、可执行的步骤。"))
+            .await?;
+
+        let built = crate::agent_loop::run_autonomous(
+            &self.registry,
+            Role::Builder,
+            &format!("{message}\n\n参考计划：\n{plan}"),
+        )
+        .await?;
+
+        let gate = crate::reviewer::ReviewGate::new(self.registry.clone());
+        match gate.review(message, &built).await? {
+            crate::reviewer::Verdict::Approve => Ok(built),
+            crate::reviewer::Verdict::Reject(reason) => {
+                info!("[SDD] 审计驳回，带反馈重试一次：{reason}");
+                let retry = format!(
+                    "之前的尝试被驳回：{reason}\n\n原始任务：{message}\n\n参考计划：{plan}"
+                );
+                crate::agent_loop::run_autonomous(&self.registry, Role::Builder, &retry).await
+            }
+            crate::reviewer::Verdict::Clarify(q) => {
+                Ok(format!("需要澄清：{q}\n\n已产出的工作：\n{built}"))
+            }
+        }
     }
 }

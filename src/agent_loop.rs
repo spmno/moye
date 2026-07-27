@@ -1,10 +1,14 @@
 // 自主循环模块：用 rig 的 AgentRunner 驱动一个自我驱动的 Agent 循环（上限 max_turns），
 // 并通过 HitlHook（rig AgentHook）在每次工具调用时按权限分级做 HITL（人在环）门控。
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use futures::StreamExt;
 use rig_core::agent::{AgentHook, Flow, HookContext, StepEvent};
 use rig_core::client::CompletionClient;
-use rig_core::completion::{CompletionModel, AssistantContent, Usage};
+use rig_core::completion::{CompletionModel, Usage};
 use rig_core::providers::openai::CompletionModel as OpenAiModel;
 use rig_core::tool::ToolDyn;
 use tracing::{info, warn};
@@ -23,18 +27,19 @@ use crate::tools::is_readonly_bash;
 #[derive(Clone)]
 pub struct HitlHook {
     perms: Arc<Mutex<ToolPerms>>,
+    waiting: Arc<AtomicBool>,
 }
 
 impl HitlHook {
-    pub fn new(perms: ToolPerms) -> Self {
+    pub fn new(perms: ToolPerms, waiting: Arc<AtomicBool>) -> Self {
         Self {
             perms: Arc::new(Mutex::new(perms)),
+            waiting,
         }
     }
 
-    /// 在终端阻塞式询问 yes/no。通过 `spawn_blocking` 在独立线程执行阻塞的
-    /// rustyline 读取，避免卡住异步运行时，随后 await 其结果。返回 true 表示"是"。
     async fn confirm(&self, prompt: &str) -> bool {
+        self.waiting.store(true, Ordering::Relaxed);
         let prompt = prompt.to_string();
         let handle = tokio::task::spawn_blocking(move || {
             use rustyline::DefaultEditor;
@@ -50,39 +55,21 @@ impl HitlHook {
                 Err(_) => false,
             }
         });
-        handle.await.unwrap_or(false)
+        let result = handle.await.unwrap_or(false);
+        self.waiting.store(false, Ordering::Relaxed);
+        result
     }
 }
 
 impl<M: CompletionModel> AgentHook<M> for HitlHook {
     async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
         match event {
-            // 流式文本增量：实时输出到终端和日志文件。
-            StepEvent::TextDelta { delta, .. } => {
-                if !delta.is_empty() {
-                    info!("{delta}");
-                }
-                Flow::Continue
-            }
-            // 模型回合完成：打印思考过程（reasoning）与最终输出。
-            StepEvent::ModelTurnFinished { turn, content, usage } => {
-                info!("\n--- 轮次 {turn} ---");
-                for item in content.iter() {
-                    match item {
-                        AssistantContent::Reasoning(r) => {
-                            let text = r.display_text();
-                            if !text.is_empty() {
-                                info!("[思考] {text}");
-                            }
-                        }
-                        AssistantContent::Text(t) => {
-                            if !t.text.is_empty() {
-                                info!("[回复] {}", t.text);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+            // 流式模式下文本增量由 stream consumer 直接 print 到 stdout，
+            // hook 不再重复打印。
+            StepEvent::TextDelta { .. } => Flow::Continue,
+            // 模型回合完成：仅打印轮次标记与用量（文本已由流式增量输出）。
+            StepEvent::ModelTurnFinished { turn, usage, .. } => {
+                info!("\n--- 轮次 {turn} 完成 ---");
                 print_usage(&usage);
                 Flow::Continue
             }
@@ -196,25 +183,176 @@ fn decide_flow(perms: &ToolPerms, tool_name: &str, args: &str) -> Flow {
 
 /// 针对 `goal` 驱动自主 Agent 循环。指定角色的 Agent 自行规划并执行，调用工具；
 /// `HitlHook` 门控关键决策。模型结束或达到 max_turns 时停止。
+///
+/// SSE 断连时自动重试最多 3 次，每次告知模型已完成的工作让其继续。
 pub async fn run_autonomous(
     registry: &AgentRegistry,
     role: Role,
     goal: &str,
 ) -> anyhow::Result<String> {
-    let perms = registry.tool_perms(role);
-    let max_turns = registry.max_turns();
-    let hook = HitlHook::new(perms);
+    const MAX_RETRIES: usize = 3;
 
-    let agent = build_runner_agent(registry, role)?;
-    let response = agent
-        .runner(goal)
-        .max_turns(max_turns)
-        // 对模型臆造的未知工具名做容错：重试该回合并附带纠正反馈，而非直接中止循环。
-        .max_invalid_tool_call_retries(3)
-        .add_hook(hook)
-        .run()
-        .await?;
-    Ok(response.output)
+    for attempt in 0..=MAX_RETRIES {
+        let prompt = if attempt == 0 {
+            goal.to_string()
+        } else {
+            format!(
+                "{goal}\n\n\
+                 [系统提示] 上次执行因 SSE 连接中断（第 {attempt} 次重试）。\
+                 请用 `ls -R .` 检查已创建的文件，跳过已完成的步骤，继续未完成的部分。"
+            )
+        };
+
+        let perms = registry.tool_perms(role);
+        let max_turns = registry.max_turns();
+        let hitl_waiting = Arc::new(AtomicBool::new(false));
+        let hook = HitlHook::new(perms, hitl_waiting.clone());
+
+        let agent = build_runner_agent(registry, role)?;
+        let stream = agent
+            .runner(&prompt)
+            .max_turns(max_turns)
+            .max_invalid_tool_call_retries(3)
+            .add_hook(hook)
+            .stream()
+            .await;
+
+        match consume_stream(stream, Some(hitl_waiting)).await {
+            Ok(output) => return Ok(output),
+            Err(e) if is_stream_error(&e) && attempt < MAX_RETRIES => {
+                info!(
+                    "[重试] {role:?} 第 {}/{} 次：SSE 连接中断，重新调用",
+                    attempt + 1,
+                    MAX_RETRIES
+                );
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(anyhow::anyhow!("{role:?} 重试 {MAX_RETRIES} 次后仍失败"))
+}
+
+/// 判断错误是否为 SSE 流式断连（可安全重试）。
+pub fn is_stream_error(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("error decoding response body")
+        || msg.contains("SSE error")
+        || msg.contains("Reset(StreamId")
+        || msg.contains("流式错误")
+        || msg.contains("空闲超时")
+}
+
+/// 消费流式输出：文本增量直接 print 到 stdout，reasoning 缓冲后整块输出。
+/// 供 `run_autonomous` 和 `RoleAgent::run` 共用。
+///
+/// 当模型将全部内容放在 reasoning 通道（content 字段为空）时，
+/// 用累积的 reasoning 内容作为输出回退，避免下游收到空计划。
+pub async fn consume_stream<R>(
+    mut stream: rig_core::agent::StreamingResult<R>,
+    hitl_waiting: Option<Arc<AtomicBool>>,
+) -> anyhow::Result<String> {
+    use rig_core::agent::MultiTurnStreamItem;
+    use rig_core::streaming::StreamedAssistantContent;
+
+    const CHUNK_TIMEOUT: Duration = Duration::from_secs(120);
+    const THINK_HINT_DELAY: Duration = Duration::from_secs(5);
+
+    let mut output = String::new();
+    let mut reasoning_buf = String::new();
+    let mut all_reasoning = String::new();
+    let mut reasoning_start: Option<std::time::Instant> = None;
+    let mut thinking_hint_shown = false;
+
+    let flush_reasoning = |buf: &mut String, all: &mut String, hint: &mut bool| {
+        if !buf.is_empty() {
+            if *hint {
+                println!();
+                std::io::stdout().flush().ok();
+                *hint = false;
+            }
+            info!("[思考] {}", buf.trim());
+            all.push_str(buf.trim());
+            all.push('\n');
+            buf.clear();
+        }
+    };
+
+    loop {
+        let next = match &hitl_waiting {
+            Some(flag) if flag.load(Ordering::Relaxed) => stream.next().await,
+            _ => match tokio::time::timeout(CHUNK_TIMEOUT, stream.next()).await {
+                Ok(item) => item,
+                Err(_) => {
+                    flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);
+                    return Err(anyhow::anyhow!(
+                        "SSE 空闲超时（{}秒无数据），可能连接已断开",
+                        CHUNK_TIMEOUT.as_secs()
+                    ));
+                }
+            },
+        };
+
+        let Some(item) = next else { break };
+
+        match item {
+            Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => {
+                match content {
+                    StreamedAssistantContent::Text(t) => {
+                        flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);
+                        if !t.text.is_empty() {
+                            print!("{}", t.text);
+                            std::io::stdout().flush().ok();
+                        }
+                    }
+                    StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+                        if reasoning_start.is_none() {
+                            reasoning_start = Some(std::time::Instant::now());
+                        }
+                        if !thinking_hint_shown {
+                            if let Some(start) = &reasoning_start {
+                                if start.elapsed() >= THINK_HINT_DELAY {
+                                    print!("思考中");
+                                    std::io::stdout().flush().ok();
+                                    thinking_hint_shown = true;
+                                }
+                            }
+                        }
+                        reasoning_buf.push_str(&reasoning);
+                    }
+                    StreamedAssistantContent::ToolCall { tool_call, .. } => {
+                        flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);
+                        info!("[模型调用] {}", tool_call.function.name);
+                    }
+                    _ => {
+                        flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);
+                    }
+                }
+            }
+            Ok(MultiTurnStreamItem::FinalResponse(resp)) => {
+                flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);
+                output = resp.output;
+            }
+            Err(e) => {
+                flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);
+                return Err(anyhow::anyhow!("流式错误: {e}"));
+            }
+            _ => {
+                flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);
+            }
+        }
+    }
+
+    flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);
+    if output.is_empty() {
+        if !all_reasoning.is_empty() {
+            output = all_reasoning;
+        } else {
+            output.push_str("(无输出)");
+        }
+    }
+    Ok(output)
 }
 
 /// 为某角色构建"可运行"的 rig `Agent`（带工具），并遵循会话级模型覆盖。

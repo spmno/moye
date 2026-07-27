@@ -69,7 +69,7 @@ fn init_logging() {
         .with_writer(std::io::stdout);
 
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new("info,rig_core=trace"))
+        .with(tracing_subscriber::EnvFilter::new("info,rig_core=off"))
         .with(file_layer)
         .with(stdout_layer)
         .init();

@@ -278,7 +278,7 @@ rule_escalation_threshold = 3
 logs/2025-07-25_14-30-00.log
 ```
 
-日志级别：`info`（默认），`rig_core=trace`（HTTP 调用详情）。
+日志级别：`info`（默认），`rig_core=off`（关闭 rig 内部日志，避免 SSE span 字段洪流）。
 
 如需调整日志级别，修改 `src/main.rs` 中的 `EnvFilter`：
 
@@ -286,8 +286,11 @@ logs/2025-07-25_14-30-00.log
 // 只看 info 及以上
 tracing_subscriber::EnvFilter::new("info")
 
-// 包含 rig HTTP 调试
+// 包含 rig HTTP 调试（大量日志，仅调试时使用）
 tracing_subscriber::EnvFilter::new("info,rig_core=trace")
+
+// 关闭 rig 内部日志（默认，避免 SSE span 字段洪流）
+tracing_subscriber::EnvFilter::new("info,rig_core=off")
 ```
 
 ---

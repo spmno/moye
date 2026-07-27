@@ -2,7 +2,6 @@
 // 以及构建和管理各角色 Agent 的 AgentRegistry。权限分级驱动自主循环的 HITL（人在环）控制。
 use crate::providers::{create_client, ChatAgent};
 use rig_core::client::CompletionClient;
-use rig_core::completion::Prompt;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use tracing::info;
@@ -115,9 +114,36 @@ pub struct RoleAgent {
 
 impl RoleAgent {
     /// 用该角色 Agent 直接执行一次任务（用于 Planner/Auditor 等不需要工具循环的角色）。
+    /// 流式输出模型文本到 stdout。
     pub async fn run(&self, task: &str) -> anyhow::Result<String> {
-        info!("[{:?}] 执行任务", self.role);
-        Ok(self.agent.prompt(task).await?)
+        const MAX_RETRIES: usize = 3;
+
+        for attempt in 0..=MAX_RETRIES {
+            let prompt = if attempt == 0 {
+                task.to_string()
+            } else {
+                format!("{task}\n\n[系统提示] 上次因 SSE 连接中断，请重新生成。")
+            };
+
+            info!("[{:?}] 执行任务（尝试 {}/{}）", self.role, attempt + 1, MAX_RETRIES + 1);
+            let stream = self.agent.runner(&prompt).stream().await;
+
+            match crate::agent_loop::consume_stream(stream, None).await {
+                Ok(output) => return Ok(output),
+                Err(e) if crate::agent_loop::is_stream_error(&e) && attempt < MAX_RETRIES => {
+                    info!(
+                        "[重试] {:?} 第 {}/{} 次：SSE 连接中断",
+                        self.role,
+                        attempt + 1,
+                        MAX_RETRIES
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(anyhow::anyhow!("{:?} 重试 {MAX_RETRIES} 次后仍失败", self.role))
     }
 }
 

@@ -44,7 +44,7 @@ model = "kimi-k3"
 preamble = "prompts/builder.md"
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
-permissions.run_bash_mutating = "ask"
+permissions.run_bash_mutating = "allow"
 permissions.edit_file = "allow"
 
 [agents.auditor]

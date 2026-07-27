@@ -73,9 +73,15 @@ pub fn create_client() -> Result<CompletionsClient> {
         &api_key[..8.min(api_key.len())],
         &api_key[api_key.len().saturating_sub(4)..],
     );
+    let http = rig_core::http_client::ReqwestClient::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| anyhow::anyhow!("HTTP client build failed: {e}"))?;
     let client = CompletionsClient::builder()
         .api_key(api_key)
         .base_url(&base_url)
+        .http_client(http)
         .build()?;
     Ok(client)
 }

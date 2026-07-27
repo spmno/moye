@@ -23,6 +23,11 @@ impl ReplCommand {
             return Self::InvalidUsage("empty input");
         }
 
+        match line {
+            "quit" | "exit" | "q" => return Self::Quit,
+            _ => {}
+        }
+
         // `/` 前缀 = 命令；否则 = goal。消除 evolve/evolve-code 顺序依赖。
         if !line.starts_with('/') {
             return Self::Goal(line.to_owned());
@@ -74,7 +79,7 @@ pub async fn run_repl(ctx: &AppContext) -> anyhow::Result<()> {
     loop {
         let line = match rl.readline("» ") {
             Ok(l) => l,
-            Err(rustyline::error::ReadlineError::Interrupted) => continue,
+            Err(rustyline::error::ReadlineError::Interrupted) => break,
             Err(rustyline::error::ReadlineError::Eof) => break,
             Err(e) => return Err(e.into()),
         };

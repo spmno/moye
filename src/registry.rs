@@ -121,9 +121,12 @@ pub struct AgentRegistry {
 
 impl AgentRegistry {
     pub fn new(config: AgentRegistryConfig) -> Self {
+        // MY_AGENT_MODEL 环境变量作为会话级模型覆盖的初始值。
+        // 优先级：/model REPL 命令 > MY_AGENT_MODEL env > agent.toml 各角色配置。
+        let session_model = std::env::var("MY_AGENT_MODEL").ok();
         Self {
             config: Arc::new(config),
-            session_model: Arc::new(Mutex::new(None)),
+            session_model: Arc::new(Mutex::new(session_model)),
         }
     }
 

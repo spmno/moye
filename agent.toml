@@ -24,7 +24,7 @@ max_turns = 20
 #   read_file / run_bash_readonly 默认自动执行（如 ls, cat, git status）；
 #   run_bash_mutating / edit_file 默认需询问。
 [agents.orchestrator]
-model = "kimi-k3"
+model = "deepseek-v4-pro"
 preamble = "AGENTS.md"
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
@@ -32,7 +32,7 @@ permissions.run_bash_mutating = "deny"
 permissions.edit_file = "deny"
 
 [agents.planner]
-model = "kimi-k3"
+model = "deepseek-v4-pro"
 preamble = "prompts/planner.md"
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
@@ -40,7 +40,7 @@ permissions.run_bash_mutating = "deny"
 permissions.edit_file = "deny"
 
 [agents.builder]
-model = "kimi-k3"
+model = "deepseek-v4-pro"
 preamble = "prompts/builder.md"
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
@@ -48,7 +48,7 @@ permissions.run_bash_mutating = "allow"
 permissions.edit_file = "allow"
 
 [agents.auditor]
-model = "kimi-k3"
+model = "deepseek-v4-pro"
 preamble = "prompts/auditor.md"
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"

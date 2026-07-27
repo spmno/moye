@@ -125,7 +125,9 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        // 找到 max 字节之前的最后一个合法字符边界，避免切到多字节字符中间
+        let end = s[..max].char_indices().last().map_or(0, |(i, c)| i + c.len_utf8());
+        format!("{}…", &s[..end])
     }
 }
 

@@ -232,7 +232,8 @@ fn build_runner_agent(
     // 与 registry 的 build 一致：把相关技能指令注入提示词。
     let preamble = crate::registry::inject_skills_public(&preamble);
     let model = registry.session_model().unwrap_or_else(|| rc.model.clone());
-    info!("[runner] role={role:?} model={model}");
+    let max_turns = registry.max_turns();
+    info!("[runner] role={role:?} model={model} max_turns={max_turns}");
     let tools: Vec<Box<dyn ToolDyn>> = crate::tools::builtin_tools()?;
     let params = crate::providers::provider_additional_params();
     let agent = client
@@ -241,6 +242,7 @@ fn build_runner_agent(
         .temperature(crate::providers::Provider::clamp_temperature(0.7))
         .tools(tools)
         .additional_params(params)
+        .default_max_turns(max_turns)
         .build();
     Ok(agent)
 }

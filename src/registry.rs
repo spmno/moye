@@ -70,11 +70,20 @@ pub enum Permission {
     Deny,
 }
 
+/// `[agent]` 子节：默认模型与循环上限。
+#[derive(Debug, Deserialize, Default)]
+pub struct AgentSection {
+    #[serde(default)]
+    pub default_model: String,
+    #[serde(default)]
+    pub max_turns: usize,
+}
+
 /// 注册表顶层配置：来自 agent.toml，包含循环上限与各角色配置。
 #[derive(Debug, Deserialize)]
 pub struct AgentRegistryConfig {
     #[serde(default)]
-    pub max_turns: usize,
+    pub agent: AgentSection,
     #[serde(rename = "agents")]
     pub roles: std::collections::HashMap<String, RoleConfig>,
 }
@@ -89,10 +98,11 @@ impl AgentRegistryConfig {
 
     /// 返回循环上限；为 0 时回退到默认 20 轮。
     pub fn max_turns(&self) -> usize {
-        if self.max_turns == 0 {
+        let turns = self.agent.max_turns;
+        if turns == 0 {
             20
         } else {
-            self.max_turns
+            turns
         }
     }
 }
@@ -170,13 +180,13 @@ impl AgentRegistry {
             Some(ref m) => m.clone(),
             None => rc.model.clone(),
         };
-        info!("[build] role={key} model={model}");
-        // 只要该角色任一内置工具被允许，就为其装配工具。
         let with_tools = rc.permissions.read_file == Permission::Allow
             || rc.permissions.run_bash_readonly == Permission::Allow
             || rc.permissions.run_bash_mutating == Permission::Allow
             || rc.permissions.edit_file == Permission::Allow;
         let params = crate::providers::provider_additional_params();
+        let max_turns = self.max_turns();
+        info!("[build] role={key} model={model} max_turns={max_turns}");
         let agent = if with_tools {
             let tools = crate::tools::builtin_tools()?;
             client
@@ -185,6 +195,7 @@ impl AgentRegistry {
                 .temperature(crate::providers::Provider::clamp_temperature(0.7))
                 .tools(tools)
                 .additional_params(params)
+                .default_max_turns(max_turns)
                 .build()
         } else {
             client
@@ -192,6 +203,7 @@ impl AgentRegistry {
                 .preamble(&preamble)
                 .temperature(crate::providers::Provider::clamp_temperature(0.7))
                 .additional_params(params)
+                .default_max_turns(max_turns)
                 .build()
         };
         Ok(RoleAgent {
@@ -218,10 +230,13 @@ impl AgentRegistry {
         self.config.roles.get(&key)
     }
 
-    /// 解析当前生效的模型：会话覆盖 → agent.toml 各角色配置中的首选模型。
-    /// 用于在 registry.build() 之外（如基准评估）获取模型名。
+    /// 解析当前生效的模型：会话覆盖 → [agent].default_model → 各角色配置中的首选模型。
     pub fn effective_model(&self) -> String {
         self.session_model().unwrap_or_else(|| {
+            let dm = &self.config.agent.default_model;
+            if !dm.is_empty() {
+                return dm.clone();
+            }
             self.config
                 .roles
                 .values()

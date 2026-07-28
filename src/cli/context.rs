@@ -183,9 +183,33 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        // 找到 max 字节之前的最后一个合法字符边界，避免切到多字节字符中间
-        let end = s[..max].char_indices().last().map_or(0, |(i, c)| i + c.len_utf8());
-        format!("{}…", &s[..end])
+        format!("{}…", &s[..s.floor_char_boundary(max)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_short_text_unchanged() {
+        assert_eq!(truncate("hello", 500), "hello");
+    }
+
+    #[test]
+    fn truncate_chinese_text_no_panic() {
+        let s = "你好世界".repeat(100);
+        let result = truncate(&s, 500);
+        assert!(result.ends_with('…'));
+        assert!(result.len() < 500 + 10);
+    }
+
+    #[test]
+    fn truncate_at_exact_boundary() {
+        // 3-byte chars, boundary at byte 6
+        let s = "你好世界";
+        let result = truncate(s, 6);
+        assert_eq!(result, "你好…");
     }
 }
 

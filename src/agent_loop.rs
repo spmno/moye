@@ -108,7 +108,7 @@ impl<M: CompletionModel> AgentHook<M> for HitlHook {
             // 工具结果：打印执行结果。
             StepEvent::ToolResult { tool_name, result, .. } => {
                 let truncated = if result.len() > 500 {
-                    format!("{}…(截断，共 {} 字节)", &result[..500], result.len())
+                    format!("{}…(截断，共 {} 字节)", &result[..result.floor_char_boundary(500)], result.len())
                 } else {
                     result.to_string()
                 };

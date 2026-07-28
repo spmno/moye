@@ -223,11 +223,14 @@ impl Tool for WebFetch {
             body
         };
         let truncated = if text.len() > MAX_CONTENT {
-            let end = text[..MAX_CONTENT]
+            // 先找到不超过 MAX_CONTENT 的最后一个字符边界，再切片，
+            // 避免在多字节 UTF-8 字符中间切片导致 panic。
+            let end = text
                 .char_indices()
+                .take_while(|(i, _)| *i <= MAX_CONTENT)
                 .last()
                 .map(|(i, c)| i + c.len_utf8())
-                .unwrap_or(MAX_CONTENT);
+                .unwrap_or(0);
             format!("{}…(截断，共 {} 字符)", &text[..end], text.chars().count())
         } else {
             text

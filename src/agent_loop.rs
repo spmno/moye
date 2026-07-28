@@ -75,7 +75,8 @@ impl<M: CompletionModel> AgentHook<M> for HitlHook {
             }
             // 工具调用：打印调用信息，然后按权限分级做 HITL 决策。
             StepEvent::ToolCall { tool_name, args, .. } => {
-                info!("[调用工具] {tool_name}({args})");
+                let desc = format_tool_call_desc(tool_name, args);
+                info!("[调用工具] {desc}");
                 let perms = self.perms.lock().unwrap().clone();
                 let tier = decide_tier(&perms, tool_name, args);
                 match tier {
@@ -111,7 +112,7 @@ impl<M: CompletionModel> AgentHook<M> for HitlHook {
                 } else {
                     result.to_string()
                 };
-                info!("[工具结果] {tool_name}: {truncated}");
+                info!("[工具结果] {tool_name}:\n{truncated}");
                 Flow::Continue
             }
             // 未知工具名：打印警告。
@@ -121,6 +122,56 @@ impl<M: CompletionModel> AgentHook<M> for HitlHook {
             }
             _ => Flow::Continue,
         }
+    }
+}
+
+/// 将工具调用参数格式化为人类可读的描述。
+/// 例如 `read_file` 打印读取的文件路径，`run_bash` 打印执行的命令。
+fn format_tool_call_desc(tool_name: &str, args: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(args).ok();
+    let get_str = |key: &str| -> Option<String> {
+        parsed
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    match tool_name {
+        "read_file" => {
+            let path = get_str("path").unwrap_or_default();
+            format!("read_file → 读取文件: {path}")
+        }
+        "edit_file" => {
+            let path = get_str("path").unwrap_or_default();
+            let old = get_str("old").unwrap_or_default();
+            let new = get_str("new").unwrap_or_default();
+            format!(
+                "edit_file → 编辑文件: {path}\n  替换: {old}\n  替换为: {new}"
+            )
+        }
+        "write_file" => {
+            let path = get_str("path").unwrap_or_default();
+            let content_len = parsed
+                .as_ref()
+                .and_then(|v| v.get("content"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.len())
+                .unwrap_or(0);
+            format!("write_file → 写入文件: {path} ({content_len} 字节)")
+        }
+        "run_bash" => {
+            let command = get_str("command").unwrap_or_default();
+            format!("run_bash → 执行命令: {command}")
+        }
+        "web_fetch" => {
+            let url = get_str("url").unwrap_or_default();
+            format!("web_fetch → 抓取网页: {url}")
+        }
+        "web_search" => {
+            let query = get_str("query").unwrap_or_default();
+            format!("web_search → 搜索: {query}")
+        }
+        _ => format!("{tool_name}({args})"),
     }
 }
 
@@ -325,7 +376,11 @@ pub async fn consume_stream<R>(
                     }
                     StreamedAssistantContent::ToolCall { tool_call, .. } => {
                         flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);
-                        info!("[模型调用] {}", tool_call.function.name);
+                        let desc = format_tool_call_desc(
+                            &tool_call.function.name,
+                            &tool_call.function.arguments.to_string(),
+                        );
+                        info!("[模型调用] {desc}");
                     }
                     _ => {
                         flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);

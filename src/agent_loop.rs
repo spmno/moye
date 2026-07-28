@@ -42,10 +42,7 @@ impl HitlHook {
         self.waiting.store(true, Ordering::Relaxed);
         let prompt = prompt.to_string();
         let handle = tokio::task::spawn_blocking(move || {
-            let config = rustyline::Config::builder()
-                .bracketed_paste(false)
-                .build();
-            let mut rl = match rustyline::Editor::<(), _>::with_config(config) {
+            let mut rl = match rustyline::Editor::<(), _>::new() {
                 Ok(rl) => rl,
                 Err(_) => return false,
             };

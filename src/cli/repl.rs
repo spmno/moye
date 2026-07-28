@@ -83,10 +83,7 @@ impl ReplCommand {
 }
 
 pub async fn run_repl(ctx: &AppContext) -> anyhow::Result<()> {
-    let config = rustyline::Config::builder()
-        .bracketed_paste(false)
-        .build();
-    let mut rl = Editor::<(), _>::with_config(config)?;
+    let mut rl = Editor::<(), _>::new()?;
     loop {
         let line = match rl.readline("» ") {
             Ok(l) => l,

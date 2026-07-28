@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
     let provider_name = format!("{:?}", providers::current_provider());
     info!(
         "my-agent ready ({provider_name}). model: {}\n\
-         命令: /model <slug> | /evolve | /evolve-code <file> <old> <new> | /add-tool <name> <desc> | /add-skill <name> <desc> | /skills | /quit\n\
+         命令: /model <slug> | /evolve | /evolve-code <file> <old> <new> | /add-tool <name> <desc> | /add-skill <name> <desc> | /skills | /history [n] | /lessons | /help | /quit\n\
          非 `/` 开头的输入会作为任务目标交给 Orchestrator（SDD 管线）执行。",
         ctx.current_model()
     );

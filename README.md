@@ -186,6 +186,9 @@ Commands: model <slug> | evolve | evolve-code | add-tool | add-skill | skills | 
 | `model` | 查看当前模型 | `model` |
 | `add-skill <name> <description>` | 添加新技能（运行时加载） | `add-skill "rust-expert" "Rust 代码审查技能"` |
 | `skills` | 列出所有已注册技能 | `skills` |
+| `history [n]` | 查看最近 n 轮对话记录（默认 10） | `history 5` |
+| `lessons` | 查看已积累的经验教训 | `lessons` |
+| `help` | 显示所有可用命令 | `help` |
 | `evolve` | 触发提示词进化（根据经验优化提示词） | `evolve` |
 | `evolve-code <file> <old> <new>` | 代码进化（替换代码片段） | `evolve-code src/main.rs "旧代码" "新代码"` |
 | `add-tool <name> <desc>` | 扩展工具（运行时注册） | `add-tool "git-commit" "Git 提交工具"` |

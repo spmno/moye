@@ -136,5 +136,36 @@ impl MemoryStore {
         std::fs::write(&self.rules_file, raw)?;
         Ok(())
     }
+
+    /// 加载最近的对话轮次（JSONL 逐行反序列化）。`limit` 为 None 时返回全部，
+    /// 为 Some(n) 时只返回最后 n 轮。跳过无法解析的行（不报错）。
+    pub fn load_turns(&self, limit: Option<usize>) -> Result<Vec<Turn>> {
+        if !self.conversation_file.exists() {
+            return Ok(vec![]);
+        }
+        let raw = std::fs::read_to_string(&self.conversation_file)?;
+        let turns: Vec<Turn> = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let turns = match limit {
+            Some(n) if n < turns.len() => turns[turns.len() - n..].to_vec(),
+            _ => turns,
+        };
+        Ok(turns)
+    }
+
+    /// 加载所有经验教训（JSONL 逐行反序列化）。跳过无法解析的行。
+    pub fn load_lessons(&self) -> Result<Vec<Lesson>> {
+        if !self.lessons_file.exists() {
+            return Ok(vec![]);
+        }
+        let raw = std::fs::read_to_string(&self.lessons_file)?;
+        let lessons: Vec<Lesson> = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        Ok(lessons)
+    }
 }
 

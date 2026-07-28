@@ -150,6 +150,8 @@ pub fn decide_tier(perms: &ToolPerms, tool_name: &str, args: &str) -> Permission
     match tool_name {
         "read_file" => perms.read_file,
         "edit_file" | "write_file" => perms.edit_file,
+        "web_fetch" => perms.web_fetch,
+        "web_search" => perms.web_search,
         "run_bash" => {
             let command = serde_json::from_str::<serde_json::Value>(args)
                 .ok()
@@ -396,6 +398,8 @@ mod tests {
             run_bash_readonly: Permission::Allow,
             run_bash_mutating: Permission::Ask,
             edit_file: Permission::Ask,
+            web_fetch: Permission::Allow,
+            web_search: Permission::Allow,
         }
     }
 

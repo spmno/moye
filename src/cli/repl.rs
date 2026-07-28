@@ -11,6 +11,9 @@ enum ReplCommand {
     AddTool { name: String, description: String },
     AddSkill { name: String, description: String },
     Skills,
+    Help,
+    History { limit: Option<usize> },
+    Lessons,
     Quit,
     Goal(String),
     InvalidUsage(&'static str),
@@ -68,6 +71,11 @@ impl ReplCommand {
                 _ => Self::InvalidUsage("usage: /add-skill <name> <description>"),
             },
             "/skills" => Self::Skills,
+            "/help" | "/h" | "/?" => Self::Help,
+            "/history" | "/hist" => Self::History {
+                limit: rest.first().and_then(|s| s.parse().ok()),
+            },
+            "/lessons" => Self::Lessons,
             "/quit" | "/q" | "/exit" => Self::Quit,
             _ => Self::InvalidUsage("unknown command; type /help for usage"),
         }
@@ -94,6 +102,9 @@ pub async fn run_repl(ctx: &AppContext) -> anyhow::Result<()> {
             ReplCommand::AddTool { name, description } => ctx.cmd_add_tool(&name, &description),
             ReplCommand::AddSkill { name, description } => ctx.cmd_add_skill(&name, &description),
             ReplCommand::Skills => ctx.cmd_list_skills(),
+            ReplCommand::Help => ctx.cmd_help(),
+            ReplCommand::History { limit } => ctx.cmd_history(limit),
+            ReplCommand::Lessons => ctx.cmd_list_lessons(),
             ReplCommand::InvalidUsage(msg) => info!("{msg}"),
         }
     }

@@ -78,6 +78,64 @@ impl AppContext {
         }
     }
 
+    /// `/help` —— 打印所有可用 REPL 命令及简要说明。
+    pub fn cmd_help(&self) {
+        let provider = format!("{:?}", crate::providers::current_provider());
+        info!("my-agent ({provider}) | model: {}", self.current_model());
+        info!("─── 命令 ───");
+        info!("  /model [slug]       查看或切换当前会话模型");
+        info!("  /evolve             触发提示词进化（评估后择优采纳）");
+        info!("  /evolve-code <f> <old> <new>  代码自修改（编译验证 + 回退）");
+        info!("  /add-tool <name> <desc>  生成新工具脚手架（需重新编译生效）");
+        info!("  /add-skill <name> <desc>  添加运行时技能（无需重编译）");
+        info!("  /skills             列出已注册技能");
+        info!("  /history [n]        查看最近 n 轮对话记录（默认 10）");
+        info!("  /lessons            查看已积累的经验教训");
+        info!("  /help               显示本帮助");
+        info!("  /quit               退出程序");
+        info!("─── 用法 ───");
+        info!("  非 `/` 开头的输入 → 作为任务目标交给 Orchestrator（SDD 管线）执行");
+    }
+
+    /// `/history [n]` —— 从记忆文件加载并打印最近的对话轮次。
+    pub fn cmd_history(&self, limit: Option<usize>) {
+        let limit = limit.unwrap_or(10);
+        match self.memory.load_turns(Some(limit)) {
+            Ok(turns) if turns.is_empty() => {
+                info!("（暂无对话记录）");
+            }
+            Ok(turns) => {
+                info!("─── 最近 {} 轮对话 ───", turns.len());
+                for t in &turns {
+                    let role = match t.role.as_str() {
+                        "user" => "用户",
+                        "agent" => "Agent",
+                        other => other,
+                    };
+                    let preview = truncate(&t.content, 200);
+                    info!("  [{role}] {preview}");
+                }
+            }
+            Err(e) => error!("history error: {e}"),
+        }
+    }
+
+    /// `/lessons` —— 从记忆文件加载并打印所有积累的经验教训。
+    pub fn cmd_list_lessons(&self) {
+        match self.memory.load_lessons() {
+            Ok(lessons) if lessons.is_empty() => {
+                info!("（暂无经验记录）");
+            }
+            Ok(lessons) => {
+                info!("─── 经验教训（共 {} 条）───", lessons.len());
+                for (i, l) in lessons.iter().enumerate() {
+                    info!("  {}. {}", i + 1, l.summary);
+                }
+            }
+            Err(e) => error!("lessons error: {e}"),
+        }
+    }
+
     /// 执行用户目标：走 Orchestrator（SDD 管线），完成后记录记忆与经验。
     pub async fn run_goal(&self, goal: &str) {
         match self.orchestrator.handle(goal).await {

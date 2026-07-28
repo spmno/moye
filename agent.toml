@@ -30,6 +30,8 @@ permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
 permissions.run_bash_mutating = "deny"
 permissions.edit_file = "deny"
+permissions.web_fetch = "allow"
+permissions.web_search = "allow"
 
 [agents.planner]
 model = "deepseek-v4-pro"
@@ -38,6 +40,8 @@ permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
 permissions.run_bash_mutating = "deny"
 permissions.edit_file = "deny"
+permissions.web_fetch = "allow"
+permissions.web_search = "allow"
 
 [agents.builder]
 model = "deepseek-v4-pro"
@@ -46,6 +50,8 @@ permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
 permissions.run_bash_mutating = "allow"
 permissions.edit_file = "allow"
+permissions.web_fetch = "allow"
+permissions.web_search = "allow"
 
 [agents.auditor]
 model = "deepseek-v4-pro"
@@ -54,6 +60,8 @@ permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
 permissions.run_bash_mutating = "deny"
 permissions.edit_file = "deny"
+permissions.web_fetch = "deny"
+permissions.web_search = "deny"
 
 [memory]
 # JSONL 记忆存储（v1），可扩展为 sqlite。

@@ -37,6 +37,10 @@ pub struct ToolPerms {
     pub run_bash_mutating: Permission,
     #[serde(default = "default_ask")]
     pub edit_file: Permission,
+    #[serde(default = "default_ask")]
+    pub web_fetch: Permission,
+    #[serde(default = "default_ask")]
+    pub web_search: Permission,
 }
 
 /// 读类工具默认允许（自动执行）。
@@ -55,6 +59,8 @@ impl Default for ToolPerms {
             run_bash_readonly: Permission::Allow,
             run_bash_mutating: Permission::Ask,
             edit_file: Permission::Ask,
+            web_fetch: Permission::Ask,
+            web_search: Permission::Ask,
         }
     }
 }
@@ -209,7 +215,9 @@ impl AgentRegistry {
         let with_tools = rc.permissions.read_file == Permission::Allow
             || rc.permissions.run_bash_readonly == Permission::Allow
             || rc.permissions.run_bash_mutating == Permission::Allow
-            || rc.permissions.edit_file == Permission::Allow;
+            || rc.permissions.edit_file == Permission::Allow
+            || rc.permissions.web_fetch != Permission::Deny
+            || rc.permissions.web_search != Permission::Deny;
         let params = crate::providers::provider_additional_params();
         let max_turns = self.max_turns();
         info!("[build] role={key} model={model} max_turns={max_turns}");

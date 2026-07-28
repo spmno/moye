@@ -42,8 +42,10 @@ impl HitlHook {
         self.waiting.store(true, Ordering::Relaxed);
         let prompt = prompt.to_string();
         let handle = tokio::task::spawn_blocking(move || {
-            use rustyline::DefaultEditor;
-            let mut rl = match DefaultEditor::new() {
+            let config = rustyline::Config::builder()
+                .bracketed_paste(false)
+                .build();
+            let mut rl = match rustyline::Editor::<(), _>::with_config(config) {
                 Ok(rl) => rl,
                 Err(_) => return false,
             };

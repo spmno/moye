@@ -1,4 +1,4 @@
-use rustyline::DefaultEditor;
+use rustyline::Editor;
 use tracing::info;
 
 use crate::cli::context::AppContext;
@@ -83,7 +83,10 @@ impl ReplCommand {
 }
 
 pub async fn run_repl(ctx: &AppContext) -> anyhow::Result<()> {
-    let mut rl = DefaultEditor::new()?;
+    let config = rustyline::Config::builder()
+        .bracketed_paste(false)
+        .build();
+    let mut rl = Editor::<(), _>::with_config(config)?;
     loop {
         let line = match rl.readline("» ") {
             Ok(l) => l,

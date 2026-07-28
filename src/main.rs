@@ -56,7 +56,7 @@ fn init_logging() {
         chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
     );
     let log_file = std::fs::File::create(&log_name).unwrap_or_else(|e| {
-        eprintln!("无法创建日志文件 {log_name}: {e}；回退到仅 stdout");
+        eprintln!("无法创建日志文件 {log_name}: {e}；回退到仅 stderr");
         std::fs::File::create("/dev/null").unwrap()
     });
     let timer = LocalTime::rfc_3339();
@@ -64,14 +64,14 @@ fn init_logging() {
         .with_ansi(false)
         .with_timer(timer.clone())
         .with_writer(log_file);
-    let stdout_layer = tracing_subscriber::fmt::layer()
+    let stderr_layer = tracing_subscriber::fmt::layer()
         .with_timer(timer)
-        .with_writer(std::io::stdout);
+        .with_writer(std::io::stderr);
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new("info,rig_core=off"))
         .with(file_layer)
-        .with(stdout_layer)
+        .with(stderr_layer)
         .init();
 
     info!("[trace] 日志文件: {log_name}");

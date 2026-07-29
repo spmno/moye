@@ -1,22 +1,28 @@
 // 供应商客户端：通过 MY_AGENT_PROVIDER 环境变量选择供应商（deepseek / bailian / moonshot）。
+// Provider client: selects a provider (deepseek / bailian / moonshot) via the MY_AGENT_PROVIDER env var.
 // 均使用 OpenAI 兼容接口，Bailian 百炼平台和 Moonshot Kimi 平台通过自定义 base URL 接入。
+// All providers use the OpenAI-compatible interface; Bailian and Moonshot Kimi connect via custom base URLs.
 use anyhow::Result;
 use rig_core::providers::openai::{self, CompletionsClient};
 use tracing::info;
 
 /// 供应商类型。
+/// Provider type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     DeepSeek,
     Bailian,
     /// Moonshot Kimi 平台（https://platform.kimi.com）。Kimi K3 需要用原生 API。
+    /// Moonshot Kimi platform (https://platform.kimi.com). Kimi K3 needs the native API.
     Moonshot,
     /// 自定义 OpenAI 兼容供应商。通过 MY_AGENT_BASE_URL + MY_AGENT_API_KEY 配置。
+    /// Custom OpenAI-compatible provider. Configured via MY_AGENT_BASE_URL + MY_AGENT_API_KEY.
     Custom,
 }
 
 impl Provider {
     /// 从环境变量 MY_AGENT_PROVIDER 解析；默认 deepseek。
+    /// Parse from the MY_AGENT_PROVIDER env var; defaults to deepseek.
     fn from_env() -> Self {
         match std::env::var("MY_AGENT_PROVIDER")
             .unwrap_or_default()
@@ -31,6 +37,7 @@ impl Provider {
     }
 
     /// API Key 环境变量名。
+    /// The env var name holding the API key.
     fn api_key_env(&self) -> &'static str {
         match self {
             Provider::DeepSeek => "DEEPSEEK_API_KEY",
@@ -41,6 +48,7 @@ impl Provider {
     }
 
     /// OpenAI 兼容 base URL（含 /v1 前缀）。
+    /// OpenAI-compatible base URL (including the /v1 prefix).
     fn base_url(&self) -> String {
         match self {
             Provider::DeepSeek => "https://api.deepseek.com/v1".to_string(),
@@ -52,6 +60,7 @@ impl Provider {
     }
 
     /// 将请求的 temperature 限制在供应商允许的范围内。
+    /// Clamp the requested temperature to the range allowed by the provider.
     pub fn clamp_temperature(desired: f64) -> f64 {
         match Self::from_env() {
             Provider::Moonshot => 1.0,
@@ -61,6 +70,7 @@ impl Provider {
 }
 
 /// 构建当前供应商的 OpenAI 兼容客户端。
+/// Build the OpenAI-compatible client for the current provider.
 pub fn create_client() -> Result<CompletionsClient> {
     let provider = Provider::from_env();
     let api_key = std::env::var(provider.api_key_env())
@@ -87,11 +97,13 @@ pub fn create_client() -> Result<CompletionsClient> {
 }
 
 /// 返回当前生效的供应商。
+/// Return the currently active provider.
 pub fn current_provider() -> Provider {
     Provider::from_env()
 }
 
 /// 返回当前供应商需要的额外请求参数。
+/// Return the extra request parameters required by the current provider.
 pub fn provider_additional_params() -> serde_json::Value {
     match Provider::from_env() {
         Provider::Moonshot => serde_json::json!({}),
@@ -100,4 +112,5 @@ pub fn provider_additional_params() -> serde_json::Value {
 }
 
 /// 对话型 Agent 别名：基于 OpenAI CompletionModel 的 rig Agent（兼容所有供应商）。
+/// Chat Agent alias: a rig Agent based on OpenAI CompletionModel (compatible with all providers).
 pub type ChatAgent = rig_core::agent::Agent<openai::CompletionModel>;

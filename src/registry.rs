@@ -173,14 +173,18 @@ impl RoleAgent {
 pub struct AgentRegistry {
     config: Arc<AgentRegistryConfig>,
     // 整个会话的运行时模型覆盖。一旦设置，所有角色都使用该 slug 而非各自配置的模型，
+    // Runtime model override for the entire session. Once set, all roles use this slug instead of their configured model,
     // 让用户无需改文件即可从 REPL 切换到免费模型（如 tencent/hy3:free）。
+    // letting users switch to a free model (e.g. tencent/hy3:free) from REPL without editing files.
     session_model: Arc<Mutex<Option<String>>>,
 }
 
 impl AgentRegistry {
     pub fn new(config: AgentRegistryConfig) -> Self {
         // MY_AGENT_MODEL 环境变量作为会话级模型覆盖的初始值。
+        // The MY_AGENT_MODEL env var serves as the initial session-level model override.
         // 优先级：/model REPL 命令 > MY_AGENT_MODEL env > agent.toml 各角色配置。
+        // Priority: /model REPL command > MY_AGENT_MODEL env > agent.toml per-role config.
         let session_model = std::env::var("MY_AGENT_MODEL").ok();
         Self {
             config: Arc::new(config),
@@ -189,6 +193,7 @@ impl AgentRegistry {
     }
 
     /// clone 时共享同一份 Arc（配置与模型覆盖都会同步）。
+    /// Shares the same Arc on clone (config and model override stay in sync).
     pub fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
@@ -197,6 +202,7 @@ impl AgentRegistry {
     }
 
     /// 覆盖本会话所有角色使用的模型。
+    /// Overrides the model used by all roles in this session.
     pub fn set_session_model(&self, slug: &str) {
         *self.session_model.lock().unwrap() = Some(slug.to_string());
     }
@@ -206,11 +212,13 @@ impl AgentRegistry {
     }
 
     /// 自主循环的上限轮数，从配置透传。
+    /// The autonomous loop's max turns, passed through from config.
     pub fn max_turns(&self) -> usize {
         self.config.max_turns()
     }
 
     /// 为指定角色构建 Agent（带工具或纯对话，取决于权限）。
+    /// Builds an Agent for the specified role (with tools or pure chat, depending on permissions).
     pub fn build(&self, role: Role) -> anyhow::Result<RoleAgent> {
         let key = format!("{role:?}").to_lowercase();
         let rc = self
@@ -222,8 +230,10 @@ impl AgentRegistry {
         let preamble = std::fs::read_to_string(&rc.preamble)
             .unwrap_or_else(|_| format!("你是 {key} agent。"));
         // 把与角色领域相关的技能指令注入提示词，使模型遵循技能中的步骤。
+        // Injects role-domain skill instructions into the preamble so the model follows the steps in skills.
         let preamble = inject_skills_public(&preamble);
         // 会话级模型覆盖优先于角色各自配置的模型。
+        // Session-level model override takes priority over per-role configured model.
         let model = match *self.session_model.lock().unwrap() {
             Some(ref m) => m.clone(),
             None => rc.model.clone(),
@@ -263,7 +273,9 @@ impl AgentRegistry {
     }
 
     /// 取某角色的按工具权限分级，供自主循环的 HITL（人在环）门控逐次调用决策
+    /// Gets the per-tool permission tiers for a role, for the autonomous loop's HITL (Human-in-the-Loop) gate per-call decisions
     /// （allow / ask / deny）。
+    /// (allow / ask / deny).
     pub fn tool_perms(&self, role: Role) -> ToolPerms {
         let key = format!("{role:?}").to_lowercase();
         self.config
@@ -274,13 +286,16 @@ impl AgentRegistry {
     }
 
     /// 取某角色的配置，供自主循环重建"可运行"的 Agent
+    /// Gets a role's config, for the autonomous loop to rebuild a "runnable" Agent
     /// （循环需要原始 `Agent`，而非 `RoleAgent` 包装）。
+    /// (the loop needs the raw `Agent`, not the `RoleAgent` wrapper).
     pub fn role_config(&self, role: Role) -> Option<&RoleConfig> {
         let key = format!("{role:?}").to_lowercase();
         self.config.roles.get(&key)
     }
 
     /// 解析当前生效的模型：会话覆盖 → [agent].default_model → 各角色配置中的首选模型。
+    /// Resolves the currently effective model: session override -> [agent].default_model -> first role's configured model.
     pub fn effective_model(&self) -> String {
         self.session_model().unwrap_or_else(|| {
             let dm = &self.config.agent.default_model;
@@ -298,6 +313,7 @@ impl AgentRegistry {
 }
 
 /// 把与给定文本相关的技能指令拼接到提示词末尾，供模型遵循。无相关技能时原样返回。
+/// Appends skill instructions relevant to the given text to the end of the preamble for the model to follow. Returns as-is if no relevant skills.
 pub fn inject_skills_public(preamble: &str) -> String {
     let skill_text = crate::skills::relevant_skills(preamble);
     if skill_text.is_empty() {
@@ -308,6 +324,7 @@ pub fn inject_skills_public(preamble: &str) -> String {
 }
 
 /// 意图分类：驱动 SDD 管线路由。
+/// Intent classification: drives SDD pipeline routing.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Intent {
     Implement,
@@ -316,7 +333,9 @@ pub enum Intent {
 }
 
 /// 将用户消息分类为意图，驱动 SDD 管线路由。
+/// Classifies a user message into an intent, driving SDD pipeline routing.
 /// 关键词同时覆盖中文和英文，适配中文模型（DeepSeek/GLM/Kimi）为主的使用场景。
+/// Keywords cover both Chinese and English, adapting to usage scenarios primarily with Chinese models (DeepSeek/GLM/Kimi).
 pub fn classify(message: &str) -> Intent {
     let m = message.to_lowercase();
     let implement_kws = [
@@ -337,9 +356,13 @@ pub fn classify(message: &str) -> Intent {
 }
 
 /// 编排者：先分类意图，再按 SDD 纪律委派给对应的角色 Agent。
+/// Orchestrator: classifies intent first, then delegates to the corresponding role Agent per SDD discipline.
 /// Implement → 规划者拆解 → 构建者执行（工具循环 + HITL）→ 审计者两轮评审。
+/// Implement -> Planner decomposes -> Builder executes (tool loop + HITL) -> Auditor two-round review.
 /// Investigate → 规划者只读探索（工具循环，无编辑权限）。
+/// Investigate -> Planner read-only exploration (tool loop, no edit permission).
 /// Chat → 构建者直接对话（无工具循环）。
+/// Chat -> Builder direct conversation (no tool loop).
 pub struct Orchestrator {
     registry: AgentRegistry,
 }

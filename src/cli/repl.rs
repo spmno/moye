@@ -1,20 +1,56 @@
+/// REPL 命令解析模块：把用户在 TUI 中输入的 `/` 命令或自然语言目标
+/// 解析为 [`ReplCommand`] 枚举，供 `AppContext` 分发执行。
+/// REPL command parsing module: parses the `/` commands or natural-language goals
+/// entered by the user in the TUI into the [`ReplCommand`] enum for `AppContext` to dispatch.
+
 /// REPL 命令枚举。TUI 输入处理复用此 parse 逻辑。
+/// REPL command enum. The TUI input handler reuses this parse logic.
 pub enum ReplCommand {
+    /// `/model [slug]`：查看或切换当前会话模型。
+    /// `/model [slug]`: show or switch the current session model.
     Model { slug: Option<String> },
+    /// `/evolve`：触发提示词进化。
+    /// `/evolve`: trigger prompt evolution.
     Evolve,
+    /// `/evolve-code <file> <old> <new>`：代码自修改（编译验证 + 回退）。
+    /// `/evolve-code <file> <old> <new>`: code self-modification (compile-verified + rollback).
     EvolveCode { file: String, old: String, new: String },
+    /// `/add-tool <name> <desc>`：生成新工具脚手架（需重新编译生效）。
+    /// `/add-tool <name> <desc>`: scaffold a new tool (requires recompile to take effect).
     AddTool { name: String, description: String },
+    /// `/add-skill <name> <desc>`：添加运行时技能（无需重编译）。
+    /// `/add-skill <name> <desc>`: add a runtime skill (no recompile needed).
     AddSkill { name: String, description: String },
+    /// `/skills`：列出已注册技能。
+    /// `/skills`: list registered skills.
     Skills,
+    /// `/help`：显示帮助信息。
+    /// `/help`: show help text.
     Help,
+    /// `/history [n]`：查看最近 n 轮对话记录（默认 10）。
+    /// `/history [n]`: show the last n turns of conversation (default 10).
     History { limit: Option<usize> },
+    /// `/lessons`：查看已积累的经验教训。
+    /// `/lessons`: show accumulated lessons.
     Lessons,
+    /// `/quit`：退出程序。
+    /// `/quit`: quit the program.
     Quit,
+    /// 非 `/` 开头的自然语言输入：作为任务目标交给 Orchestrator 执行。
+    /// Natural-language input not starting with `/`: handed to the Orchestrator as a task goal.
     Goal(String),
+    /// 解析失败（空输入 / 引号不配对 / 未知命令 / 参数缺失）。
+    /// Parse failure (empty input / unbalanced quotes / unknown command / missing args).
     InvalidUsage(&'static str),
 }
 
 impl ReplCommand {
+    /// 把一行原始输入解析为 `ReplCommand`。
+    /// 空输入返回 `InvalidUsage("empty input")`；
+    /// 不以 `/` 开头的输入视为自然语言目标 `Goal`。
+    /// Parse a single raw input line into a `ReplCommand`.
+    /// Empty input returns `InvalidUsage("empty input")`;
+    /// input not starting with `/` is treated as a natural-language `Goal`.
     pub fn parse(line: &str) -> Self {
         let line = line.trim();
         if line.is_empty() {

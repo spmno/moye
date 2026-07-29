@@ -1,9 +1,17 @@
+/// CLI 应用上下文模块：聚合 [`AgentRegistry`]、[`Orchestrator`]、[`MemoryStore`]、
+/// [`PromptEvolver`] 与升级阈值，作为 TUI 命令分发与任务执行的统一入口。
+/// CLI application context module: aggregates [`AgentRegistry`], [`Orchestrator`],
+/// [`MemoryStore`], [`PromptEvolver`] and the escalation threshold, serving as the
+/// single entry point for TUI command dispatch and task execution.
 use crate::event::{AgentEvent, EventSender};
 use crate::evolution::prompt_evolve::PromptEvolver;
 use crate::memory::{Lesson, MemoryStore, Turn};
 use crate::registry::{self, AgentRegistry, Intent, Orchestrator};
 use crate::{evolution, skills};
 
+/// 应用上下文：运行期共享的状态集合，承载所有 `/` 命令分发与任务执行所需依赖。
+/// Application context: the shared runtime state holding all dependencies needed for
+/// `/` command dispatch and task execution.
 pub struct AppContext {
     pub registry: AgentRegistry,
     pub orchestrator: Orchestrator,
@@ -13,6 +21,9 @@ pub struct AppContext {
 }
 
 impl AppContext {
+    /// 返回当前会话生效的模型标识：会话级覆盖 → 默认模型 → `"deepseek-v4-pro"` 兜底。
+    /// Return the model id effective for the current session:
+    /// session-level override → default model → `"deepseek-v4-pro"` fallback.
     pub fn current_model(&self) -> String {
         self.registry
             .session_model()
@@ -20,6 +31,9 @@ impl AppContext {
             .unwrap_or_else(|| "deepseek-v4-pro".to_string())
     }
 
+    /// `/model [slug]`：有 slug 则切换会话模型，无 slug 则保持不变（调用方负责显示）。
+    /// `/model [slug]`: if a slug is given, switch the session model; otherwise leave it
+    /// unchanged (the caller is responsible for displaying the current model).
     pub fn cmd_model(&self, slug: Option<String>) {
         match slug {
             Some(s) => {
@@ -29,6 +43,8 @@ impl AppContext {
         }
     }
 
+    /// `/evolve`：触发提示词进化（评估后择优采纳），返回面向用户的提示文本。
+    /// `/evolve`: trigger prompt evolution (evaluate then adopt the best), returning user-facing text.
     pub async fn cmd_evolve(&self, tx: &EventSender) -> String {
         match self.evolver.evolve(tx).await {
             Ok(msg) => msg,
@@ -36,6 +52,8 @@ impl AppContext {
         }
     }
 
+    /// `/evolve-code <file> <old> <new>`：执行代码自修改（编译验证 + 失败回退）。
+    /// `/evolve-code <file> <old> <new>`: perform code self-modification (compile-verified + rollback on failure).
     pub fn cmd_evolve_code(&self, file: &str, old: &str, new: &str) -> String {
         match evolution::self_modify::evolve_code(file, old, new) {
             Ok(msg) => msg,
@@ -43,6 +61,8 @@ impl AppContext {
         }
     }
 
+    /// `/add-tool <name> <desc>`：生成新工具脚手架（需重新编译才生效）。
+    /// `/add-tool <name> <desc>`: scaffold a new tool (requires recompile to take effect).
     pub fn cmd_add_tool(&self, name: &str, description: &str) -> String {
         match evolution::tool_ext::add_tool(name, description) {
             Ok(msg) => msg,
@@ -50,6 +70,8 @@ impl AppContext {
         }
     }
 
+    /// `/add-skill <name> <desc>`：添加运行时技能（写入 skills/ 下的 Markdown，无需重编译）。
+    /// `/add-skill <name> <desc>`: add a runtime skill (writes a Markdown file under skills/, no recompile needed).
     pub fn cmd_add_skill(&self, name: &str, description: &str) -> String {
         let body = format!(
             "# {}\n\n{}\n\n\u{ff08}\u{5728}\u{6b64}\u{5904}\u{63cf}\u{8ff0}\u{9010}\u{6b65}\u{6307}\u{4ee4}\u{3002}\u{ff09}\n",
@@ -61,6 +83,8 @@ impl AppContext {
         }
     }
 
+    /// `/skills`：列出已注册技能清单；无技能时返回提示文本。
+    /// `/skills`: list registered skills; returns a notice string when none are registered.
     pub fn cmd_list_skills(&self) -> String {
         match skills::SkillManifest::load() {
             Ok(m) => {
@@ -78,6 +102,8 @@ impl AppContext {
         }
     }
 
+    /// `/help`：构造面向用户的帮助文本（含当前供应商、模型与所有命令说明）。
+    /// `/help`: build the user-facing help text (including current provider, model, and all command descriptions).
     pub fn cmd_help(&self) -> String {
         let provider = format!("{:?}", crate::providers::current_provider());
         format!(
@@ -99,6 +125,8 @@ impl AppContext {
         )
     }
 
+    /// `/history [n]`：加载并格式化最近 n 轮对话记录（默认 10）。
+    /// `/history [n]`: load and format the last n turns of conversation (default 10).
     pub fn cmd_history(&self, limit: Option<usize>) -> String {
         let limit = limit.unwrap_or(10);
         match self.memory.load_turns(Some(limit)) {
@@ -122,6 +150,8 @@ impl AppContext {
         }
     }
 
+    /// `/lessons`：加载并格式化已积累的经验教训清单。
+    /// `/lessons`: load and format the list of accumulated lessons.
     pub fn cmd_list_lessons(&self) -> String {
         match self.memory.load_lessons() {
             Ok(lessons) if lessons.is_empty() => {
@@ -138,10 +168,17 @@ impl AppContext {
         }
     }
 
+    /// 在 TUI 中运行一个任务目标：交由 Orchestrator 处理，成功后记录对话轮、
+    /// 提取经验教训，并观察意图模式以决定是否把规则升级写入 AGENTS.md。
+    /// 失败时通过事件通道发送错误。
+    /// Run a task goal in the TUI: hand it to the Orchestrator; on success, record turns,
+    /// extract a lesson, and observe the intent pattern to decide whether to promote a
+    /// rule into AGENTS.md. On failure, send errors via the event channel.
     pub async fn run_goal_tui(&self, goal: &str, tx: &EventSender) {
         match self.orchestrator.handle(goal, tx).await {
             Ok(out) => {
                 // consume_stream already emitted AgentEvent::Agent — only record memory here.
+                // consume_stream 已经发送过 AgentEvent::Agent —— 这里只负责落记忆。
                 let ts = now();
                 let _ = self.memory.append_turn(&Turn {
                     role: "user".into(),
@@ -184,6 +221,10 @@ impl AppContext {
     }
 }
 
+/// 把字符串截断到最多 `max` 个字节，且不会在 UTF-8 字符中间切断；
+/// 超出时追加省略号 `…`。`s.len() <= max` 时原样返回。
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 character;
+/// appends an ellipsis `…` when truncated. Returns `s` unchanged if `s.len() <= max`.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -198,11 +239,15 @@ mod tests {
 
     #[test]
     fn truncate_short_text_unchanged() {
+        // 短文本不应被截断。
+        // Short text should not be truncated.
         assert_eq!(truncate("hello", 500), "hello");
     }
 
     #[test]
     fn truncate_chinese_text_no_panic() {
+        // 中文文本截断不应 panic，且应保留省略号。
+        // Truncating Chinese text must not panic and should keep the ellipsis.
         let s = "\u{4f60}\u{597d}\u{4e16}\u{754c}".repeat(100);
         let result = truncate(&s, 500);
         assert!(result.ends_with('\u{2026}'));
@@ -211,12 +256,16 @@ mod tests {
 
     #[test]
     fn truncate_at_exact_boundary() {
+        // 在字符边界附近截断时不应切断多字节字符。
+        // Truncation near a character boundary must not split a multi-byte character.
         let s = "\u{4f60}\u{597d}\u{4e16}\u{754c}";
         let result = truncate(s, 6);
         assert_eq!(result, "\u{4f60}\u{597d}\u{2026}");
     }
 }
 
+/// 把任务目标映射为用于规则观察的意图模式字符串。
+/// Map a task goal to the intent-pattern string used for rule observation.
 fn intent_pattern(goal: &str) -> String {
     match registry::classify(goal) {
         Intent::Implement => "implement_task".to_string(),
@@ -225,6 +274,8 @@ fn intent_pattern(goal: &str) -> String {
     }
 }
 
+/// 返回当前 Unix 时间戳（秒）。系统时钟异常时退回 0。
+/// Return the current Unix timestamp (seconds). Falls back to 0 if the system clock is unavailable.
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -232,6 +283,10 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// 解析默认模型：优先 `MY_AGENT_MODEL` 环境变量，其次 `agent.toml` 的
+/// `[agent].default_model`；均缺失时返回 `None`。
+/// Resolve the default model: prefer the `MY_AGENT_MODEL` env var, then the
+/// `[agent].default_model` in `agent.toml`; returns `None` when both are absent.
 fn resolve_default_model() -> Option<String> {
     std::env::var("MY_AGENT_MODEL").ok().or_else(|| {
         let raw = std::fs::read_to_string("agent.toml").ok()?;
@@ -244,6 +299,9 @@ fn resolve_default_model() -> Option<String> {
     })
 }
 
+/// 从 `agent.toml` 加载 `[memory]` 段并解析为 [`crate::memory::MemoryConfig`]。
+/// Load and parse the `[memory]` section of `agent.toml` into a
+/// [`crate::memory::MemoryConfig`].
 pub fn load_memory_cfg() -> anyhow::Result<crate::memory::MemoryConfig> {
     let raw = std::fs::read_to_string("agent.toml")?;
     let parsed: toml::Value = toml::from_str(&raw)?;
@@ -254,6 +312,10 @@ pub fn load_memory_cfg() -> anyhow::Result<crate::memory::MemoryConfig> {
     Ok(cfg)
 }
 
+/// 从 `agent.toml` 加载规则升级阈值 `[evolution].rule_escalation_threshold`，
+/// 缺失时默认为 3。
+/// Load the rule escalation threshold `[evolution].rule_escalation_threshold`
+/// from `agent.toml`; defaults to 3 when absent.
 pub fn load_escalation_threshold() -> anyhow::Result<u32> {
     let raw = std::fs::read_to_string("agent.toml")?;
     let parsed: toml::Value = toml::from_str(&raw)?;

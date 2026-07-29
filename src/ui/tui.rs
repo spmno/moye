@@ -21,6 +21,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio::time::interval;
 
 use crate::cli::context::AppContext;
@@ -192,6 +193,9 @@ struct TuiState {
     should_quit: bool,
     provider: String,
     model: String,
+    /// 当前运行中的后台任务句柄。按 Esc 可 abort 中断。
+    /// Handle to the currently running background task. Press Esc to abort.
+    task_handle: Option<JoinHandle<()>>,
 }
 
 impl TuiState {
@@ -209,6 +213,7 @@ impl TuiState {
             should_quit: false,
             provider,
             model,
+            task_handle: None,
         }
     }
 
@@ -388,7 +393,7 @@ pub async fn run_tui(ctx: Arc<AppContext>) -> anyhow::Result<()> {
         state.provider, state.model
     )));
     state.push_event(AgentEvent::Info(
-        "Enter \u{53d1}\u{9001}\u{4efb}\u{52a1} | /help \u{5e2e}\u{52a9} | Ctrl+C \u{9000}\u{51fa}".into(),
+        "Enter \u{53d1}\u{9001}\u{4efb}\u{52a1} | /help \u{5e2e}\u{52a9} | Esc \u{4e2d}\u{65ad}\u{4efb}\u{52a1} | Ctrl+C \u{9000}\u{51fa}".into(),
     ));
 
     let mut events = EventStream::new();
@@ -474,6 +479,27 @@ fn handle_key_event(
             }
             _ => {}
         }
+        return;
+    }
+
+    // Esc: interrupt the running task (only when thinking and not in HITL mode).
+    // Esc：中断正在运行的任务（仅在 thinking 且非 HITL 模式时生效）。
+    if key.code == KeyCode::Esc && state.thinking {
+        // Safety net: clear any HITL prompt that may have arrived after abort
+        // (race condition: HitlPrompt event still in channel buffer).
+        // 安全兜底：清除 abort 后可能到达的 HITL 提示（竞态：HitlPrompt 仍在 channel 缓冲区中）。
+        if let Some(h) = state.hitl.take() {
+            let _ = h.responder.send(false);
+        }
+        if let Some(handle) = state.task_handle.take() {
+            handle.abort();
+        }
+        state.thinking = false;
+        state.streaming.clear();
+        state.streaming_reasoning.clear();
+        state.push_event(AgentEvent::Info(
+            "\u{26a0} \u{4efb}\u{52a1}\u{5df2}\u{4e2d}\u{65ad} (Esc)".into(),
+        ));
         return;
     }
 
@@ -571,10 +597,11 @@ fn handle_command(
 
             let ctx = Arc::clone(ctx);
             let tx = action_tx.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 ctx.run_goal_tui(&goal, &tx).await;
                 let _ = tx.send(AgentEvent::AgentFinished);
             });
+            state.task_handle = Some(handle);
         }
         ReplCommand::Model { slug } => {
             ctx.cmd_model(slug);
@@ -597,11 +624,12 @@ fn handle_command(
             state.thinking = true;
             let ctx = Arc::clone(ctx);
             let tx = action_tx.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let result = ctx.cmd_evolve(&tx).await;
                 let _ = tx.send(AgentEvent::Info(result));
                 let _ = tx.send(AgentEvent::AgentFinished);
             });
+            state.task_handle = Some(handle);
         }
         ReplCommand::EvolveCode { file, old, new } => {
             let msg = ctx.cmd_evolve_code(&file, &old, &new);
@@ -655,6 +683,7 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
         }
         AgentEvent::Error(text) => {
             state.push_event(AgentEvent::Error(text));
+            state.task_handle = None;
             state.thinking = false;
             state.streaming.clear();
             state.streaming_reasoning.clear();
@@ -669,17 +698,26 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
             desc,
             responder,
         } => {
-            state.hitl = Some(HitlState {
-                tool,
-                desc,
-                responder,
-            });
+            // If the task was already aborted (thinking is false), auto-reject
+            // to avoid a dangling HITL overlay with no live task.
+            // 如果任务已被中断（thinking 为 false），自动拒绝，
+            // 避免出现没有活动任务的悬空 HITL 弹窗。
+            if !state.thinking {
+                let _ = responder.send(false);
+            } else {
+                state.hitl = Some(HitlState {
+                    tool,
+                    desc,
+                    responder,
+                });
+            }
         }
         AgentEvent::AgentStarted => {
             state.thinking = true;
             state.spinner = 0;
         }
         AgentEvent::AgentFinished => {
+            state.task_handle = None;
             // Safety net: flush any unflushed streaming.
         // 安全兜底：刷新未刷新的流式文本。
             if !state.streaming.is_empty() {

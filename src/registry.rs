@@ -4,6 +4,7 @@
 // and AgentRegistry for building and managing role Agents. Permission tiers drive autonomous loop HITL (Human-in-the-Loop) control.
 use crate::event::{AgentEvent, EventSender};
 use crate::providers::{create_client, ChatAgent};
+use crate::sandbox::Sandbox;
 use rig_core::client::CompletionClient;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
@@ -365,11 +366,15 @@ pub fn classify(message: &str) -> Intent {
 /// Chat -> Builder direct conversation (no tool loop).
 pub struct Orchestrator {
     registry: AgentRegistry,
+    sandbox: Sandbox,
 }
 
 impl Orchestrator {
     pub fn new(registry: AgentRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            sandbox: Sandbox::new(),
+        }
     }
 
     pub async fn handle(&self, message: &str, tx: &EventSender) -> anyhow::Result<String> {
@@ -377,7 +382,14 @@ impl Orchestrator {
         match intent {
             Intent::Implement => self.run_sdd_pipeline(message, tx).await,
             Intent::Investigate => {
-                crate::agent_loop::run_autonomous(&self.registry, Role::Planner, message, tx).await
+                crate::agent_loop::run_autonomous(
+                    &self.registry,
+                    &self.sandbox,
+                    Role::Planner,
+                    message,
+                    tx,
+                )
+                .await
             }
             Intent::Chat => {
                 let agent = self.registry.build(Role::Builder)?;
@@ -394,6 +406,7 @@ impl Orchestrator {
 
         let built = crate::agent_loop::run_autonomous(
             &self.registry,
+            &self.sandbox,
             Role::Builder,
             &format!("{message}\n\n\u{53c2}\u{8003}\u{8ba1}\u{5212}\u{ff1a}\n{plan}"),
             tx,
@@ -408,7 +421,14 @@ impl Orchestrator {
                 let retry = format!(
                     "\u{4e4b}\u{524d}\u{7684}\u{5c1d}\u{8bd5}\u{88ab}\u{9a73}\u{56de}\u{ff1a}{reason}\n\n\u{539f}\u{59cb}\u{4efb}\u{52a1}\u{ff1a}{message}\n\n\u{53c2}\u{8003}\u{8ba1}\u{5212}\u{ff1a}{plan}"
                 );
-                crate::agent_loop::run_autonomous(&self.registry, Role::Builder, &retry, tx).await
+                crate::agent_loop::run_autonomous(
+                    &self.registry,
+                    &self.sandbox,
+                    Role::Builder,
+                    &retry,
+                    tx,
+                )
+                .await
             }
             crate::reviewer::Verdict::Clarify(q) => {
                 Ok(format!("\u{9700}\u{8981}\u{6f84}\u{6e05}\u{ff1a}{q}\n\n\u{5df2}\u{4ea7}\u{51fa}\u{7684}\u{5de5}\u{4f5c}\u{ff1a}\n{built}"))

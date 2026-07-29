@@ -120,7 +120,8 @@ impl AppContext {
              /help               \u{663e}\u{793a}\u{672c}\u{5e2e}\u{52a9}\n\
              /quit               \u{9000}\u{51fa}\u{7a0b}\u{5e8f}\n\
              \u{2500}\u{2500}\u{2500} \u{7528}\u{6cd5} \u{2500}\u{2500}\u{2500}\n\
-             \u{975e} `/` \u{5f00}\u{5934}\u{7684}\u{8f93}\u{5165} \u{2192} \u{4f5c}\u{4e3a}\u{4efb}\u{52a1}\u{76ee}\u{6807}\u{4ea4}\u{7ed9} Orchestrator\u{ff08}SDD \u{7ba1}\u{7ebf}\u{ff09}\u{6267}\u{884c}",
+             \u{975e} `/` \u{5f00}\u{5934}\u{7684}\u{8f93}\u{5165} \u{2192} \u{4f5c}\u{4e3a}\u{4efb}\u{52a1}\u{76ee}\u{6807}\u{4ea4}\u{7ed9} Orchestrator\u{ff08}SDD \u{7ba1}\u{7ebf}\u{ff09}\u{6267}\u{884c}\n\
+             Esc \u{2192} \u{4e2d}\u{65ad}\u{6b63}\u{5728}\u{8fd0}\u{884c}\u{7684}\u{4efb}\u{52a1}",
             self.current_model()
         )
     }

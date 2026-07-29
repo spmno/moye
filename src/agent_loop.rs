@@ -22,6 +22,7 @@ use tracing::{info, warn};
 
 use crate::event::{AgentEvent, EventSender};
 use crate::registry::{AgentRegistry, Permission, Role, ToolPerms};
+use crate::sandbox::Sandbox;
 use crate::tools::is_readonly_bash;
 
 /// HITL（人在环）门控。实现为 rig 的 `AgentHook`，拦截每一次 `ToolCall` 并按角色的
@@ -44,14 +45,21 @@ pub struct HitlHook {
     perms: Arc<Mutex<ToolPerms>>,
     waiting: Arc<AtomicBool>,
     tx: EventSender,
+    sandbox: Sandbox,
 }
 
 impl HitlHook {
-    pub fn new(perms: ToolPerms, waiting: Arc<AtomicBool>, tx: EventSender) -> Self {
+    pub fn new(
+        perms: ToolPerms,
+        waiting: Arc<AtomicBool>,
+        tx: EventSender,
+        sandbox: Sandbox,
+    ) -> Self {
         Self {
             perms: Arc::new(Mutex::new(perms)),
             waiting,
             tx,
+            sandbox,
         }
     }
 
@@ -85,6 +93,39 @@ impl<M: CompletionModel> AgentHook<M> for HitlHook {
             }
 
             StepEvent::ToolCall { tool_name, args, .. } => {
+                // ── 沙箱检查 ──
+                // 在权限分级检查之前，先检查工具调用是否访问沙箱外的路径。
+                // If the path is outside the sandbox and not yet authorized, prompt the user.
+                // Sandbox check: before the permission tier check, verify that the tool call
+                // doesn't access paths outside the sandbox. If it does and the directory
+                // hasn't been authorized, prompt the user for authorization.
+                if let Some(sandbox_err) = self.sandbox.check_tool(tool_name, args) {
+                    let desc = format!(
+                        "\u{1f512} \u{6c99}\u{7bb1}\u{5916}\u{8bbf}\u{95ee}\u{6388}\u{6743}\n\n{}\n\n\
+                         \u{662f}\u{5426}\u{5141}\u{8bb8}\u{8bbf}\u{95ee}\u{6b64}\u{8def}\u{5f84}\u{ff1f}",
+                        sandbox_err
+                    );
+                    if self.confirm(tool_name, &desc).await {
+                        // 用户授权——将涉及的目录加入授权列表
+                        // User authorized — add the involved directories to the authorized list
+                        self.sandbox.authorize_tool(tool_name, args);
+                        let _ = self.tx.send(AgentEvent::Info(format!(
+                            "  [\u{6c99}\u{7bb1}] \u{5df2}\u{6388}\u{6743}\u{8bbf}\u{95ee}: {sandbox_err}"
+                        )));
+                        // 授权后继续进入权限分级检查
+                        // After authorization, fall through to the permission tier check
+                    } else {
+                        let _ = self.tx.send(AgentEvent::Info(
+                            "  [\u{6c99}\u{7bb1}] \u{8bbf}\u{95ee}\u{88ab}\u{62d2}\u{7edd}".into(),
+                        ));
+                        return Flow::Skip {
+                            reason: format!("\u{6c99}\u{7bb1}\u{62d2}\u{7edd}\u{8bbf}\u{95ee}: {sandbox_err}"),
+                        };
+                    }
+                }
+
+                // ── 权限分级检查（原有逻辑）──
+                // Permission tier check (original logic)
                 let perms = self.perms.lock().unwrap().clone();
                 let tier = decide_tier(&perms, tool_name, args);
                 match tier {
@@ -274,6 +315,7 @@ fn decide_flow(perms: &ToolPerms, tool_name: &str, args: &str) -> Flow {
 /// All user-visible output is sent to the TUI via the `tx` channel.
 pub async fn run_autonomous(
     registry: &AgentRegistry,
+    sandbox: &Sandbox,
     role: Role,
     goal: &str,
     tx: &EventSender,
@@ -294,7 +336,7 @@ pub async fn run_autonomous(
         let perms = registry.tool_perms(role);
         let max_turns = registry.max_turns();
         let hitl_waiting = Arc::new(AtomicBool::new(false));
-        let hook = HitlHook::new(perms, hitl_waiting.clone(), tx.clone());
+        let hook = HitlHook::new(perms, hitl_waiting.clone(), tx.clone(), sandbox.clone());
 
         let agent = build_runner_agent(registry, role)?;
         let stream = agent

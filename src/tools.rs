@@ -37,7 +37,7 @@ impl Tool for ReadFile {
     /// 返回面向 LLM 的工具描述（中文）。
     /// Returns the LLM-facing tool description (Chinese).
     fn description(&self) -> String {
-        "从项目工作树读取一个 UTF-8 文本文件。".to_string()
+        "从项目工作树读取一个 UTF-8 文本文件。仅可访问项目目录及子目录内的文件；访问其它目录需要用户授权。".to_string()
     }
 
     /// 返回 JSON Schema 形式的参数定义。

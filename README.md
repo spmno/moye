@@ -23,6 +23,8 @@ my-agent
 │   │                    # Agent role registry + tool permission tiers
 │   ├── tools.rs         # 内置工具（read_file / edit_file / run_bash / write_file）
 │   │                    # Built-in tools (read_file / edit_file / run_bash / write_file)
+│   ├── sandbox.rs       # 文件系统沙箱（限制访问到项目根目录及子目录）
+│   │                    # Filesystem sandbox (restricts access to project root + subdirs)
 │   ├── skills.rs        # 技能系统（运行时加载，无需重编译）
 │   │                    # Skill system (runtime-loaded, no recompilation)
 │   ├── reviewer.rs      # 审计门控（两阶段评审）
@@ -64,6 +66,7 @@ The domain layer (`agent_loop`, `registry`, `reviewer`, `prompt_evolve`) depends
 | **自我进化 / Self-Evolution** | 提示词进化 + 代码进化 + 工具扩展，通过经验积累提升能力。Prompt evolution + code evolution + tool extension, improving through accumulated experience. |
 | **技能系统 / Skill System** | 运行时加载 Markdown 技能文件，注入提示词，无需重编译。Runtime-loaded Markdown skill files injected into prompts, no recompilation needed. |
 | **事件驱动 / Event-Driven** | Agent 输出通过 `AgentEvent` channel 传递给 TUI，解耦领域层与表示层。Agent output flows to TUI via `AgentEvent` channel, decoupling domain from presentation. |
+| **文件系统沙箱 / Filesystem Sandbox** | Agent 默认只能访问项目根目录及子目录；访问其它目录需用户手动授权。Agent can only access the project root and subdirs by default; accessing other directories requires manual user authorization. |
 
 ---
 
@@ -277,6 +280,45 @@ rules_file = "rules.json"
 [evolution]
 rule_escalation_threshold = 3
 ```
+
+---
+
+## 文件系统沙箱 / Filesystem Sandbox
+
+Agent 默认只能访问**项目根目录（当前工作目录）及其子目录**。访问其它目录时，会暂停并请求用户授权。
+
+The Agent can only access the **project root (current working directory) and its subdirectories** by default. Access to other directories pauses and prompts the user for authorization.
+
+### 工作原理 / How It Works
+
+| 步骤 / Step | 行为 / Behavior |
+|------|------|
+| 1. 工具调用 / Tool call | Agent 调用 `read_file` / `edit_file` / `write_file` / `run_bash` 时，沙箱先检查路径 / Sandbox checks the path before execution |
+| 2. 路径在沙箱内 / Path inside sandbox | 静默放行，继续执行 / Silent pass-through, execution continues |
+| 3. 路径在沙箱外 / Path outside sandbox | 弹出 HITL 确认框，询问用户是否授权 / HITL prompt appears, asking user to authorize |
+| 4. 用户确认 / User confirms | 该目录加入授权列表，后续访问不再询问 / Directory added to allow-list, no future prompts |
+| 5. 用户拒绝 / User denies | 工具调用被跳过，Agent 收到拒绝原因 / Tool call skipped, Agent receives rejection reason |
+
+### 检测的路径模式 / Detected Path Patterns
+
+沙箱从 `run_bash` 命令中提取以下路径模式进行检查 / The sandbox extracts these path patterns from `run_bash` commands:
+
+- 绝对路径（`/etc/passwd`）/ Absolute paths
+- 主目录路径（`~/.config`）/ Home-directory paths
+- 含 `..` 的相对路径（可能逃逸沙箱）/ Relative paths with `..` (may escape sandbox)
+- `cd` / `pushd` 的目标参数 / `cd` / `pushd` target arguments
+- 重定向目标（`> /tmp/file`）/ Redirection targets
+
+### 禁用沙箱 / Disabling the Sandbox
+
+```bash
+# 通过环境变量禁用（不推荐）/ Disable via env var (not recommended)
+export MY_AGENT_SANDBOX=off
+cargo run
+```
+
+> **安全提示**：禁用沙箱后，Agent 可访问文件系统上的任意路径，请仅在受信任的环境中使用。
+> **Security note**: With the sandbox disabled, the Agent can access any path on the filesystem. Use only in trusted environments.
 
 ---
 

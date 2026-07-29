@@ -73,3 +73,17 @@ rules_file = "rules.json"
 [evolution]
 # 自动学习式规则提升：被观察到 >= 阈值次数的规则会被提升到 AGENTS.md。
 rule_escalation_threshold = 3
+
+# ── 沙箱 / Sandbox ──────────────────────────────────────────────────────
+# Agent 默认只能访问项目根目录（当前工作目录）及其子目录。
+# 如果需要访问其它目录（如 /etc、/tmp、~/.config），会暂停并请求用户授权。
+# 用户确认后，该目录被加入授权列表，后续访问不再询问。
+#
+# 通过环境变量 MY_AGENT_SANDBOX=off 可禁用沙箱（不推荐）。
+#
+# The Agent can only access the project root (current working directory) and its
+# subdirectories by default. Access to other directories (e.g. /etc, /tmp,
+# ~/.config) will pause and prompt the user for authorization. Once authorized,
+# the directory is added to the allow-list and subsequent accesses won't prompt.
+#
+# Disable via MY_AGENT_SANDBOX=off (not recommended).

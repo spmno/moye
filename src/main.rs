@@ -8,6 +8,7 @@ mod memory;
 mod providers;
 mod registry;
 mod reviewer;
+mod sandbox;
 mod skills;
 mod tools;
 mod tools_ext;

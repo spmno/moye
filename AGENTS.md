@@ -24,3 +24,7 @@
 ## Escalated rule
 - chat_task
 
+
+## Escalated rule
+- chat_task
+

@@ -2,7 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::{
-    event::{EventStream, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, EventStream, KeyCode, KeyEvent, KeyModifiers,
+        MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -11,7 +14,10 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, Padding, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
+    },
     Frame, Terminal,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -37,7 +43,7 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> anyhow::Result<Self> {
         enable_raw_mode()?;
-        execute!(std::io::stdout(), EnterAlternateScreen)?;
+        execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         Ok(Self)
     }
 }
@@ -45,7 +51,12 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+        let _ = execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
     }
 }
 
@@ -175,6 +186,9 @@ struct TuiState {
     spinner: usize,
     hitl: Option<HitlState>,
     scroll_offset: u16,
+    /// 用户是否手动上翻了消息区。为 true 时，新事件不会自动跳到底部。
+    /// Whether the user has manually scrolled up the message area. When true, new events do NOT auto-jump to the bottom.
+    user_scrolled: bool,
     should_quit: bool,
     provider: String,
     model: String,
@@ -191,6 +205,7 @@ impl TuiState {
             spinner: 0,
             hitl: None,
             scroll_offset: 0,
+            user_scrolled: false,
             should_quit: false,
             provider,
             model,
@@ -216,6 +231,14 @@ impl TuiState {
     fn push_event(&mut self, event: AgentEvent) {
         log_event(&event);
         self.messages.push(event);
+    }
+
+    /// 新事件到达时调用：仅在用户未手动上翻时自动滚到底部。
+    /// Called when a new event arrives: only auto-scrolls to bottom if the user hasn't manually scrolled up.
+    fn reset_scroll(&mut self) {
+        if !self.user_scrolled {
+            self.scroll_offset = 0;
+        }
     }
 }
 
@@ -397,8 +420,14 @@ async fn run_loop(
 
         tokio::select! {
             Some(Ok(event)) = events.next() => {
-                if let crossterm::event::Event::Key(key) = event {
-                    handle_key_event(key, state, ctx, action_tx);
+                match event {
+                    crossterm::event::Event::Key(key) => {
+                        handle_key_event(key, state, ctx, action_tx);
+                    }
+                    crossterm::event::Event::Mouse(mouse) => {
+                        handle_mouse_event(mouse, state);
+                    }
+                    _ => {}
                 }
             }
             Some(action) = action_rx.recv() => {
@@ -495,9 +524,29 @@ fn handle_key_event(
         }
         KeyCode::PageUp => {
             state.scroll_offset = state.scroll_offset.saturating_add(5);
+            state.user_scrolled = true;
         }
         KeyCode::PageDown => {
             state.scroll_offset = state.scroll_offset.saturating_sub(5);
+            if state.scroll_offset == 0 {
+                state.user_scrolled = false;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            state.scroll_offset = state.scroll_offset.saturating_add(3);
+            state.user_scrolled = true;
+        }
+        MouseEventKind::ScrollDown => {
+            state.scroll_offset = state.scroll_offset.saturating_sub(3);
+            if state.scroll_offset == 0 {
+                state.user_scrolled = false;
+            }
         }
         _ => {}
     }
@@ -585,15 +634,15 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
         }
         AgentEvent::ToolCall { name, desc } => {
             state.push_event(AgentEvent::ToolCall { name, desc });
-            state.scroll_offset = 0;
+            state.reset_scroll();
         }
         AgentEvent::ToolResult { name, result, ok } => {
             state.push_event(AgentEvent::ToolResult { name, result, ok });
-            state.scroll_offset = 0;
+            state.reset_scroll();
         }
         AgentEvent::TurnFinished { turn, usage } => {
             state.push_event(AgentEvent::TurnFinished { turn, usage });
-            state.scroll_offset = 0;
+            state.reset_scroll();
         }
         AgentEvent::Agent(text) => {
             // Streaming was a preview of this final output — discard it.
@@ -602,18 +651,18 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
             if !text.is_empty() {
                 state.push_event(AgentEvent::Agent(text));
             }
-            state.scroll_offset = 0;
+            state.reset_scroll();
         }
         AgentEvent::Error(text) => {
             state.push_event(AgentEvent::Error(text));
             state.thinking = false;
             state.streaming.clear();
             state.streaming_reasoning.clear();
-            state.scroll_offset = 0;
+            state.reset_scroll();
         }
         AgentEvent::Info(text) => {
             state.push_event(AgentEvent::Info(text));
-            state.scroll_offset = 0;
+            state.reset_scroll();
         }
         AgentEvent::HitlPrompt {
             tool,
@@ -639,7 +688,7 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
             }
             state.thinking = false;
             state.streaming_reasoning.clear();
-            state.scroll_offset = 0;
+            state.reset_scroll();
         }
         // User and System events are pushed directly by handle_command —
         // they never arrive through the channel.
@@ -691,10 +740,13 @@ fn draw_header(f: &mut Frame, area: Rect, state: &TuiState) {
 
 fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let all_lines = state.all_message_lines();
+
+    let block = Block::default().padding(Padding::horizontal(1));
+    let inner = block.inner(area);
     let total = all_lines.len() as u16;
 
-    let base = if total > area.height {
-        total - area.height
+    let base = if total > inner.height {
+        total - inner.height
     } else {
         0
     };
@@ -703,9 +755,22 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let text = Text::from(all_lines);
     let messages = Paragraph::new(text)
         .scroll((scroll, 0))
-        .block(Block::default().padding(Padding::horizontal(1)));
+        .block(block);
 
     f.render_widget(messages, area);
+
+    if total > inner.height {
+        let mut sb_state = ScrollbarState::default()
+            .content_length(total as usize)
+            .position(scroll as usize);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("\u{2191}"))
+                .end_symbol(Some("\u{2193}")),
+            area,
+            &mut sb_state,
+        );
+    }
 }
 
 fn draw_streaming(f: &mut Frame, area: Rect, state: &mut TuiState) {

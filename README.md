@@ -224,9 +224,13 @@ Type a task for the Agent to complete. It will plan and execute autonomously. St
 | `Enter` | 发送输入 / Submit input |
 | `Ctrl+C` / `Ctrl+D` | 退出 / Quit |
 | `Up` / `Down` | 浏览输入历史 / Browse input history |
-| `PageUp` / `PageDown` | 滚动消息 / Scroll messages |
+| `PageUp` / `PageDown` | 滚动消息（每次 5 行）/ Scroll messages (5 lines per press) |
+| `鼠标滚轮 / Mouse wheel` | 滚动消息（每次 3 行）/ Scroll messages (3 lines per notch) |
 | `Home` / `End` | 光标移至行首/行尾 / Cursor to start/end of line |
 | `y` / `n`（HITL 模式）/ (HITL mode) | 允许/拒绝工具执行 / Allow/deny tool execution |
+
+> **智能上翻**：手动上翻后（PageUp / 鼠标滚轮），新事件不会自动跳到底部；右侧滚动条显示当前位置，按 PageDown 或滚轮回到底部后恢复自动滚动。
+> **Smart scroll**: after scrolling up (PageUp / mouse wheel), new events will NOT auto-jump to the bottom; a scrollbar on the right shows the current position. Press PageDown or scroll back to the bottom to resume auto-scrolling.
 
 ---
 

@@ -1,5 +1,6 @@
 // 注册表模块：定义角色（Role）、按工具的权限分级（ToolPerms / Permission）、
 // 以及构建和管理各角色 Agent 的 AgentRegistry。权限分级驱动自主循环的 HITL（人在环）控制。
+use crate::event::{AgentEvent, EventSender};
 use crate::providers::{create_client, ChatAgent};
 use rig_core::client::CompletionClient;
 use serde::Deserialize;
@@ -120,36 +121,34 @@ pub struct RoleAgent {
 
 impl RoleAgent {
     /// 用该角色 Agent 直接执行一次任务（用于 Planner/Auditor 等不需要工具循环的角色）。
-    /// 流式输出模型文本到 stdout。
-    pub async fn run(&self, task: &str) -> anyhow::Result<String> {
+    /// 流式输出通过 `tx` channel 发送给 TUI。
+    pub async fn run(&self, task: &str, tx: &EventSender) -> anyhow::Result<String> {
         const MAX_RETRIES: usize = 3;
 
         for attempt in 0..=MAX_RETRIES {
             let prompt = if attempt == 0 {
                 task.to_string()
             } else {
-                format!("{task}\n\n[系统提示] 上次因 SSE 连接中断，请重新生成。")
+                format!("{task}\n\n[\u{7cfb}\u{7edf}\u{63d0}\u{793a}] \u{4e0a}\u{6b21}\u{56e0} SSE \u{8fde}\u{63a5}\u{4e2d}\u{65ad}\u{ff0c}\u{8bf7}\u{91cd}\u{65b0}\u{751f}\u{6210}\u{3002}")
             };
 
-            info!("[{:?}] 执行任务（尝试 {}/{}）", self.role, attempt + 1, MAX_RETRIES + 1);
+            info!("[{:?}] \u{6267}\u{884c}\u{4efb}\u{52a1}\u{ff08}\u{5c1d}\u{8bd5} {}/{}\u{ff09}", self.role, attempt + 1, MAX_RETRIES + 1);
             let stream = self.agent.runner(&prompt).stream().await;
 
-            match crate::agent_loop::consume_stream(stream, None).await {
+            match crate::agent_loop::consume_stream(stream, None, tx).await {
                 Ok(output) => return Ok(output),
                 Err(e) if crate::agent_loop::is_stream_error(&e) && attempt < MAX_RETRIES => {
-                    info!(
-                        "[重试] {:?} 第 {}/{} 次：SSE 连接中断",
-                        self.role,
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
+                    let _ = tx.send(AgentEvent::Info(format!(
+                        "[\u{91cd}\u{8bd5}] {:?} \u{7b2c} {}/{} \u{6b21}\u{ff1a}SSE \u{8fde}\u{63a5}\u{4e2d}\u{65ad}",
+                        self.role, attempt + 1, MAX_RETRIES
+                    )));
                     continue;
                 }
                 Err(e) => return Err(e),
             }
         }
 
-        Err(anyhow::anyhow!("{:?} 重试 {MAX_RETRIES} 次后仍失败", self.role))
+        Err(anyhow::anyhow!("{:?} \u{91cd}\u{8bd5} {MAX_RETRIES} \u{6b21}\u{540e}\u{4ecd}\u{5931}\u{8d25}", self.role))
     }
 }
 
@@ -333,47 +332,46 @@ impl Orchestrator {
         Self { registry }
     }
 
-    pub async fn handle(&self, message: &str) -> anyhow::Result<String> {
+    pub async fn handle(&self, message: &str, tx: &EventSender) -> anyhow::Result<String> {
         let intent = classify(message);
         match intent {
-            Intent::Implement => self.run_sdd_pipeline(message).await,
+            Intent::Implement => self.run_sdd_pipeline(message, tx).await,
             Intent::Investigate => {
-                crate::agent_loop::run_autonomous(&self.registry, Role::Planner, message).await
+                crate::agent_loop::run_autonomous(&self.registry, Role::Planner, message, tx).await
             }
             Intent::Chat => {
                 let agent = self.registry.build(Role::Builder)?;
-                agent.run(message).await
+                agent.run(message, tx).await
             }
         }
     }
 
-    /// SDD 管线：规划者拆解 → 构建者执行 → 审计者两轮评审。
-    /// 审计不通过时带反馈重试一次（避免无限循环）。
-    async fn run_sdd_pipeline(&self, message: &str) -> anyhow::Result<String> {
+    async fn run_sdd_pipeline(&self, message: &str, tx: &EventSender) -> anyhow::Result<String> {
         let planner = self.registry.build(Role::Planner)?;
         let plan = planner
-            .run(&format!("任务：{message}\n\n请拆解为相互独立、可执行的步骤。"))
+            .run(&format!("{message}\n\n\u{8bf7}\u{62c6}\u{89e3}\u{4e3a}\u{76f8}\u{4e92}\u{72ec}\u{7acb}\u{3001}\u{53ef}\u{6267}\u{884c}\u{7684}\u{6b65}\u{9aa4}\u{3002}"), tx)
             .await?;
 
         let built = crate::agent_loop::run_autonomous(
             &self.registry,
             Role::Builder,
-            &format!("{message}\n\n参考计划：\n{plan}"),
+            &format!("{message}\n\n\u{53c2}\u{8003}\u{8ba1}\u{5212}\u{ff1a}\n{plan}"),
+            tx,
         )
         .await?;
 
         let gate = crate::reviewer::ReviewGate::new(self.registry.clone());
-        match gate.review(message, &built).await? {
+        match gate.review(message, &built, tx).await? {
             crate::reviewer::Verdict::Approve => Ok(built),
             crate::reviewer::Verdict::Reject(reason) => {
-                info!("[SDD] 审计驳回，带反馈重试一次：{reason}");
+                let _ = tx.send(AgentEvent::Info(format!("[SDD] \u{5ba1}\u{8ba1}\u{9a73}\u{56de}\u{ff0c}\u{5e26}\u{53cd}\u{9988}\u{91cd}\u{8bd5}\u{4e00}\u{6b21}\u{ff1a}{reason}")));
                 let retry = format!(
-                    "之前的尝试被驳回：{reason}\n\n原始任务：{message}\n\n参考计划：{plan}"
+                    "\u{4e4b}\u{524d}\u{7684}\u{5c1d}\u{8bd5}\u{88ab}\u{9a73}\u{56de}\u{ff1a}{reason}\n\n\u{539f}\u{59cb}\u{4efb}\u{52a1}\u{ff1a}{message}\n\n\u{53c2}\u{8003}\u{8ba1}\u{5212}\u{ff1a}{plan}"
                 );
-                crate::agent_loop::run_autonomous(&self.registry, Role::Builder, &retry).await
+                crate::agent_loop::run_autonomous(&self.registry, Role::Builder, &retry, tx).await
             }
             crate::reviewer::Verdict::Clarify(q) => {
-                Ok(format!("需要澄清：{q}\n\n已产出的工作：\n{built}"))
+                Ok(format!("\u{9700}\u{8981}\u{6f84}\u{6e05}\u{ff1a}{q}\n\n\u{5df2}\u{4ea7}\u{51fa}\u{7684}\u{5de5}\u{4f5c}\u{ff1a}\n{built}"))
             }
         }
     }

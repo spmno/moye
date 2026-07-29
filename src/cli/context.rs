@@ -1,8 +1,8 @@
+use crate::event::{AgentEvent, EventSender};
 use crate::evolution::prompt_evolve::PromptEvolver;
 use crate::memory::{Lesson, MemoryStore, Turn};
 use crate::registry::{self, AgentRegistry, Intent, Orchestrator};
 use crate::{evolution, skills};
-use tracing::{error, info};
 
 pub struct AppContext {
     pub registry: AgentRegistry,
@@ -24,123 +24,124 @@ impl AppContext {
         match slug {
             Some(s) => {
                 self.registry.set_session_model(&s);
-                info!("model set to: {s} (applies to all roles this session)");
             }
-            None => info!("current model: {}", self.current_model()),
+            None => {}
         }
     }
 
-    pub async fn cmd_evolve(&self) {
-        match self.evolver.evolve().await {
-            Ok(msg) => info!("{msg}"),
-            Err(e) => error!("evolve error: {e}"),
+    pub async fn cmd_evolve(&self, tx: &EventSender) -> String {
+        match self.evolver.evolve(tx).await {
+            Ok(msg) => msg,
+            Err(e) => format!("evolve error: {e}"),
         }
     }
 
-    pub fn cmd_evolve_code(&self, file: &str, old: &str, new: &str) {
+    pub fn cmd_evolve_code(&self, file: &str, old: &str, new: &str) -> String {
         match evolution::self_modify::evolve_code(file, old, new) {
-            Ok(msg) => info!("{msg}"),
-            Err(e) => error!("evolve-code error: {e}"),
+            Ok(msg) => msg,
+            Err(e) => format!("evolve-code error: {e}"),
         }
     }
 
-    pub fn cmd_add_tool(&self, name: &str, description: &str) {
+    pub fn cmd_add_tool(&self, name: &str, description: &str) -> String {
         match evolution::tool_ext::add_tool(name, description) {
-            Ok(msg) => info!("{msg}"),
-            Err(e) => error!("add-tool error: {e}"),
+            Ok(msg) => msg,
+            Err(e) => format!("add-tool error: {e}"),
         }
     }
 
-    pub fn cmd_add_skill(&self, name: &str, description: &str) {
+    pub fn cmd_add_skill(&self, name: &str, description: &str) -> String {
         let body = format!(
-            "# {}\n\n{}\n\n（在此处描述逐步指令。）\n",
+            "# {}\n\n{}\n\n\u{ff08}\u{5728}\u{6b64}\u{5904}\u{63cf}\u{8ff0}\u{9010}\u{6b65}\u{6307}\u{4ee4}\u{3002}\u{ff09}\n",
             name, description
         );
         match skills::add_skill(name, description, &body) {
-            Ok(msg) => info!("{msg}"),
-            Err(e) => error!("add-skill error: {e}"),
+            Ok(msg) => msg,
+            Err(e) => format!("add-skill error: {e}"),
         }
     }
 
-    pub fn cmd_list_skills(&self) {
+    pub fn cmd_list_skills(&self) -> String {
         match skills::SkillManifest::load() {
             Ok(m) => {
                 let list = m.list();
                 if list.is_empty() {
-                    info!("no skills registered");
+                    "no skills registered".to_string()
                 } else {
-                    for n in list {
-                        info!("- {n}");
-                    }
+                    list.iter()
+                        .map(|n| format!("- {n}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 }
             }
-            Err(e) => error!("skills error: {e}"),
+            Err(e) => format!("skills error: {e}"),
         }
     }
 
-    /// `/help` —— 打印所有可用 REPL 命令及简要说明。
-    pub fn cmd_help(&self) {
+    pub fn cmd_help(&self) -> String {
         let provider = format!("{:?}", crate::providers::current_provider());
-        info!("my-agent ({provider}) | model: {}", self.current_model());
-        info!("─── 命令 ───");
-        info!("  /model [slug]       查看或切换当前会话模型");
-        info!("  /evolve             触发提示词进化（评估后择优采纳）");
-        info!("  /evolve-code <f> <old> <new>  代码自修改（编译验证 + 回退）");
-        info!("  /add-tool <name> <desc>  生成新工具脚手架（需重新编译生效）");
-        info!("  /add-skill <name> <desc>  添加运行时技能（无需重编译）");
-        info!("  /skills             列出已注册技能");
-        info!("  /history [n]        查看最近 n 轮对话记录（默认 10）");
-        info!("  /lessons            查看已积累的经验教训");
-        info!("  /help               显示本帮助");
-        info!("  /quit               退出程序");
-        info!("─── 用法 ───");
-        info!("  非 `/` 开头的输入 → 作为任务目标交给 Orchestrator（SDD 管线）执行");
+        format!(
+            "my-agent ({provider}) | model: {}\n\
+             \u{2500}\u{2500}\u{2500} \u{547d}\u{4ee4} \u{2500}\u{2500}\u{2500}\n\
+             /model [slug]       \u{67e5}\u{770b}\u{6216}\u{5207}\u{6362}\u{5f53}\u{524d}\u{4f1a}\u{8bdd}\u{6a21}\u{578b}\n\
+             /evolve             \u{89e6}\u{53d1}\u{63d0}\u{793a}\u{8bcd}\u{8fdb}\u{5316}\u{ff08}\u{8bc4}\u{4f30}\u{540e}\u{62e9}\u{4f18}\u{91c7}\u{7eb3}\u{ff09}\n\
+             /evolve-code <f> <old> <new>  \u{4ee3}\u{7801}\u{81ea}\u{4fee}\u{6539}\u{ff08}\u{7f16}\u{8bd1}\u{9a8c}\u{8bc1} + \u{56de}\u{9000}\u{ff09}\n\
+             /add-tool <name> <desc>  \u{751f}\u{6210}\u{65b0}\u{5de5}\u{5177}\u{811a}\u{624b}\u{67b6}\u{ff08}\u{9700}\u{91cd}\u{65b0}\u{7f16}\u{8bd1}\u{751f}\u{6548}\u{ff09}\n\
+             /add-skill <name> <desc>  \u{6dfb}\u{52a0}\u{8fd0}\u{884c}\u{65f6}\u{6280}\u{80fd}\u{ff08}\u{65e0}\u{9700}\u{91cd}\u{7f16}\u{8bd1}\u{ff09}\n\
+             /skills             \u{5217}\u{51fa}\u{5df2}\u{6ce8}\u{518c}\u{6280}\u{80fd}\n\
+             /history [n]        \u{67e5}\u{770b}\u{6700}\u{8fd1} n \u{8f6e}\u{5bf9}\u{8bdd}\u{8bb0}\u{5f55}\u{ff08}\u{9ed8}\u{8ba4} 10\u{ff09}\n\
+             /lessons            \u{67e5}\u{770b}\u{5df2}\u{79ef}\u{7d2f}\u{7684}\u{7ecf}\u{9a8c}\u{6559}\u{8bad}\n\
+             /help               \u{663e}\u{793a}\u{672c}\u{5e2e}\u{52a9}\n\
+             /quit               \u{9000}\u{51fa}\u{7a0b}\u{5e8f}\n\
+             \u{2500}\u{2500}\u{2500} \u{7528}\u{6cd5} \u{2500}\u{2500}\u{2500}\n\
+             \u{975e} `/` \u{5f00}\u{5934}\u{7684}\u{8f93}\u{5165} \u{2192} \u{4f5c}\u{4e3a}\u{4efb}\u{52a1}\u{76ee}\u{6807}\u{4ea4}\u{7ed9} Orchestrator\u{ff08}SDD \u{7ba1}\u{7ebf}\u{ff09}\u{6267}\u{884c}",
+            self.current_model()
+        )
     }
 
-    /// `/history [n]` —— 从记忆文件加载并打印最近的对话轮次。
-    pub fn cmd_history(&self, limit: Option<usize>) {
+    pub fn cmd_history(&self, limit: Option<usize>) -> String {
         let limit = limit.unwrap_or(10);
         match self.memory.load_turns(Some(limit)) {
             Ok(turns) if turns.is_empty() => {
-                info!("（暂无对话记录）");
+                "\u{ff08}\u{6682}\u{65e0}\u{5bf9}\u{8bdd}\u{8bb0}\u{5f55}\u{ff09}".to_string()
             }
             Ok(turns) => {
-                info!("─── 最近 {} 轮对话 ───", turns.len());
+                let mut out = format!("\u{2500}\u{2500}\u{2500} \u{6700}\u{8fd1} {} \u{8f6e}\u{5bf9}\u{8bdd} \u{2500}\u{2500}\u{2500}", turns.len());
                 for t in &turns {
                     let role = match t.role.as_str() {
-                        "user" => "用户",
+                        "user" => "\u{7528}\u{6237}",
                         "agent" => "Agent",
                         other => other,
                     };
                     let preview = truncate(&t.content, 200);
-                    info!("  [{role}] {preview}");
+                    out.push_str(&format!("\n  [{role}] {preview}"));
                 }
+                out
             }
-            Err(e) => error!("history error: {e}"),
+            Err(e) => format!("history error: {e}"),
         }
     }
 
-    /// `/lessons` —— 从记忆文件加载并打印所有积累的经验教训。
-    pub fn cmd_list_lessons(&self) {
+    pub fn cmd_list_lessons(&self) -> String {
         match self.memory.load_lessons() {
             Ok(lessons) if lessons.is_empty() => {
-                info!("（暂无经验记录）");
+                "\u{ff08}\u{6682}\u{65e0}\u{7ecf}\u{9a8c}\u{8bb0}\u{5f55}\u{ff09}".to_string()
             }
             Ok(lessons) => {
-                info!("─── 经验教训（共 {} 条）───", lessons.len());
+                let mut out = format!("\u{2500}\u{2500}\u{2500} \u{7ecf}\u{9a8c}\u{6559}\u{8bad}\u{ff08}\u{5171} {} \u{6761}\u{ff09}\u{2500}\u{2500}\u{2500}", lessons.len());
                 for (i, l) in lessons.iter().enumerate() {
-                    info!("  {}. {}", i + 1, l.summary);
+                    out.push_str(&format!("\n  {}. {}", i + 1, l.summary));
                 }
+                out
             }
-            Err(e) => error!("lessons error: {e}"),
+            Err(e) => format!("lessons error: {e}"),
         }
     }
 
-    /// 执行用户目标：走 Orchestrator（SDD 管线），完成后记录记忆与经验。
-    pub async fn run_goal(&self, goal: &str) {
-        match self.orchestrator.handle(goal).await {
+    pub async fn run_goal_tui(&self, goal: &str, tx: &EventSender) {
+        match self.orchestrator.handle(goal, tx).await {
             Ok(out) => {
-                info!("{out}");
+                // consume_stream already emitted AgentEvent::Agent — only record memory here.
                 let ts = now();
                 let _ = self.memory.append_turn(&Turn {
                     role: "user".into(),
@@ -153,7 +154,7 @@ impl AppContext {
                     ts,
                 });
 
-                let summary = format!("任务: {goal} → 产出: {}", truncate(&out, 200));
+                let summary = format!("\u{4efb}\u{52a1}: {goal} \u{2192} \u{4ea7}\u{51fa}: {}", truncate(&out, 200));
                 let _ = self.memory.record_lesson(&Lesson { summary, ts });
 
                 let pattern = intent_pattern(goal);
@@ -162,18 +163,22 @@ impl AppContext {
                         if let Err(e) =
                             self.memory.promote_rule_to_agents_md(&pattern, "AGENTS.md")
                         {
-                            error!("promote_rule error: {e}");
+                            let _ = tx.send(AgentEvent::Error(format!("promote_rule error: {e}")));
                         } else {
-                            info!("[进化] 规则升级到 AGENTS.md：{pattern}");
+                            let _ = tx.send(AgentEvent::Info(format!(
+                                "[\u{8fdb}\u{5316}] \u{89c4}\u{5219}\u{5347}\u{7ea7}\u{5230} AGENTS.md\u{ff1a}{pattern}"
+                            )));
                         }
                     }
                     Ok(false) => {}
-                    Err(e) => error!("observe_rule error: {e}"),
+                    Err(e) => {
+                        let _ = tx.send(AgentEvent::Error(format!("observe_rule error: {e}")));
+                    }
                 }
             }
             Err(e) => {
-                error!("orchestrator error: {e}");
-                error!("  detail: {e:?}");
+                let _ = tx.send(AgentEvent::Error(format!("orchestrator error: {e}")));
+                let _ = tx.send(AgentEvent::Error(format!("  detail: {e:?}")));
             }
         }
     }
@@ -183,7 +188,7 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..s.floor_char_boundary(max)])
+        format!("{}\u{2026}", &s[..s.floor_char_boundary(max)])
     }
 }
 
@@ -198,18 +203,17 @@ mod tests {
 
     #[test]
     fn truncate_chinese_text_no_panic() {
-        let s = "你好世界".repeat(100);
+        let s = "\u{4f60}\u{597d}\u{4e16}\u{754c}".repeat(100);
         let result = truncate(&s, 500);
-        assert!(result.ends_with('…'));
+        assert!(result.ends_with('\u{2026}'));
         assert!(result.len() < 500 + 10);
     }
 
     #[test]
     fn truncate_at_exact_boundary() {
-        // 3-byte chars, boundary at byte 6
-        let s = "你好世界";
+        let s = "\u{4f60}\u{597d}\u{4e16}\u{754c}";
         let result = truncate(s, 6);
-        assert_eq!(result, "你好…");
+        assert_eq!(result, "\u{4f60}\u{597d}\u{2026}");
     }
 }
 

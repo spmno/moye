@@ -1,6 +1,12 @@
 // 自主循环模块：用 rig 的 AgentRunner 驱动一个自我驱动的 Agent 循环（上限 max_turns），
+// Autonomous loop module: drives a self-driven Agent loop via rig's AgentRunner (capped at max_turns),
 // 并通过 HitlHook（rig AgentHook）在每次工具调用时按权限分级做 HITL（人在环）门控。
-use std::io::Write;
+// and gates each tool call by permission tier for HITL (Human-in-the-Loop) via HitlHook (rig AgentHook).
+//
+// 在 TUI 模式下，所有用户可见输出通过 `AgentEvent` channel 发送给 TUI 事件循环，
+// In TUI mode, all user-visible output is sent to the TUI event loop via the `AgentEvent` channel,
+// 而不是直接 print 到 stdout。内部日志仍走 tracing（仅文件）。
+// instead of printing directly to stdout. Internal logs still go through tracing (file only).
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,50 +17,55 @@ use rig_core::client::CompletionClient;
 use rig_core::completion::{CompletionModel, Usage};
 use rig_core::providers::openai::CompletionModel as OpenAiModel;
 use rig_core::tool::ToolDyn;
+use tokio::sync::oneshot;
 use tracing::{info, warn};
 
+use crate::event::{AgentEvent, EventSender};
 use crate::registry::{AgentRegistry, Permission, Role, ToolPerms};
 use crate::tools::is_readonly_bash;
 
 /// HITL（人在环）门控。实现为 rig 的 `AgentHook`，拦截每一次 `ToolCall` 并按角色的
+/// HITL (Human-in-the-Loop) gate. Implemented as rig's `AgentHook`, intercepts every `ToolCall` by role,
 /// 按工具权限分级处理：
+/// handles by tool permission tier:
 /// - `Allow` -> 静默执行（不询问）。像 `ls` 这样的琐碎步骤直接通过。
-/// - `Ask`   -> 在终端暂停询问用户；yes 执行，no 跳过。
+/// - `Allow` -> execute silently (no prompt). Trivial steps like `ls` pass through directly.
+/// - `Ask`   -> 通过 channel 向 TUI 发送 `HitlPrompt`，等待用户按键确认。
+/// - `Ask`   -> sends a `HitlPrompt` to the TUI via channel, waits for user keypress confirmation.
 /// - `Deny`  -> 跳过调用并向模型说明原因。
+/// - `Deny`  -> skips the call and explains the reason to the model.
 ///
 /// 仅对 `ToolCall` 事件做门控；模型的回合、结果、增量事件原样通过。
+/// Only gates `ToolCall` events; model turn, result, and delta events pass through unchanged.
 /// 权限分级在循环启动时即已捕获。
+/// Permission tiers are captured at loop startup.
 #[derive(Clone)]
 pub struct HitlHook {
     perms: Arc<Mutex<ToolPerms>>,
     waiting: Arc<AtomicBool>,
+    tx: EventSender,
 }
 
 impl HitlHook {
-    pub fn new(perms: ToolPerms, waiting: Arc<AtomicBool>) -> Self {
+    pub fn new(perms: ToolPerms, waiting: Arc<AtomicBool>, tx: EventSender) -> Self {
         Self {
             perms: Arc::new(Mutex::new(perms)),
             waiting,
+            tx,
         }
     }
 
-    async fn confirm(&self, prompt: &str) -> bool {
+    /// 向 TUI 发送 HITL 确认请求，等待用户按键。
+    /// Sends a HITL confirmation request to the TUI, waits for user keypress.
+    async fn confirm(&self, tool_name: &str, desc: &str) -> bool {
         self.waiting.store(true, Ordering::Relaxed);
-        let prompt = prompt.to_string();
-        let handle = tokio::task::spawn_blocking(move || {
-            let mut rl = match rustyline::Editor::<(), _>::new() {
-                Ok(rl) => rl,
-                Err(_) => return false,
-            };
-            match rl.readline(&prompt) {
-                Ok(line) => {
-                    let a = line.trim().to_lowercase();
-                    a == "y" || a == "yes"
-                }
-                Err(_) => false,
-            }
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let _ = self.tx.send(AgentEvent::HitlPrompt {
+            tool: tool_name.to_string(),
+            desc: desc.to_string(),
+            responder: resp_tx,
         });
-        let result = handle.await.unwrap_or(false);
+        let result = resp_rx.await.unwrap_or(false);
         self.waiting.store(false, Ordering::Relaxed);
         result
     }
@@ -63,69 +74,81 @@ impl HitlHook {
 impl<M: CompletionModel> AgentHook<M> for HitlHook {
     async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
         match event {
-            // 流式模式下文本增量由 stream consumer 直接 print 到 stdout，
-            // hook 不再重复打印。
             StepEvent::TextDelta { .. } => Flow::Continue,
-            // 模型回合完成：仅打印轮次标记与用量（文本已由流式增量输出）。
+
             StepEvent::ModelTurnFinished { turn, usage, .. } => {
-                info!("\n--- 轮次 {turn} 完成 ---");
-                print_usage(&usage);
+                let usage_str = format_usage(&usage);
+                let _ = self
+                    .tx
+                    .send(AgentEvent::TurnFinished { turn, usage: usage_str });
                 Flow::Continue
             }
-            // 工具调用：打印调用信息，然后按权限分级做 HITL 决策。
+
             StepEvent::ToolCall { tool_name, args, .. } => {
-                let desc = format_tool_call_desc(tool_name, args);
-                info!("[调用工具] {desc}");
                 let perms = self.perms.lock().unwrap().clone();
                 let tier = decide_tier(&perms, tool_name, args);
                 match tier {
                     Permission::Allow => {
-                        info!("  [HITL] 自动允许");
+                        let _ = self.tx.send(AgentEvent::Info(
+                            "  [HITL] \u{81ea}\u{52a8}\u{5141}\u{8bb8}".into(),
+                        ));
                         Flow::Continue
                     }
                     Permission::Deny => {
-                        info!("  [HITL] 已拒绝（安全策略）");
+                        let _ = self.tx.send(AgentEvent::Info(
+                            "  [HITL] \u{5df2}\u{62d2}\u{7edd}\u{ff08}\u{5b89}\u{5168}\u{7b56}\u{7565}\u{ff09}".into(),
+                        ));
                         Flow::Skip {
-                            reason: format!("工具 `{tool_name}` 被当前角色的安全策略禁止"),
+                            reason: format!(
+                                "\u{5de5}\u{5177} `{tool_name}` \u{88ab}\u{5f53}\u{524d}\u{89d2}\u{8272}\u{7684}\u{5b89}\u{5168}\u{7b56}\u{7565}\u{7981}\u{6b62}"
+                            ),
                         }
                     }
                     Permission::Ask => {
-                        let prompt =
-                            format!("  [HITL] 允许执行 `{tool_name}`？[y/N] ");
-                        if self.confirm(&prompt).await {
+                        let desc = format_tool_call_desc(tool_name, args);
+                        if self.confirm(tool_name, &desc).await {
                             Flow::Continue
                         } else {
                             Flow::Skip {
                                 reason: format!(
-                                    "用户拒绝了 `{tool_name}` 的执行"
+                                    "\u{7528}\u{6237}\u{62d2}\u{7edd}\u{4e86} `{tool_name}` \u{7684}\u{6267}\u{884c}"
                                 ),
                             }
                         }
                     }
                 }
             }
-            // 工具结果：打印执行结果。
-            StepEvent::ToolResult { tool_name, result, .. } => {
-                let truncated = if result.len() > 500 {
-                    format!("{}…(截断，共 {} 字节)", &result[..result.floor_char_boundary(500)], result.len())
-                } else {
-                    result.to_string()
-                };
-                info!("[工具结果] {tool_name}:\n{truncated}");
+
+            StepEvent::ToolResult {
+                tool_name, result, ..
+            } => {
+                let _ = self.tx.send(AgentEvent::ToolResult {
+                    name: tool_name.to_string(),
+                    result: result.to_string(),
+                    ok: true,
+                });
                 Flow::Continue
             }
-            // 未知工具名：打印警告。
+
             StepEvent::InvalidToolCall(ctx) => {
-                warn!("[未知工具] {}", ctx.tool_name);
+                warn!("[\u{672a}\u{77e5}\u{5de5}\u{5177}] {}", ctx.tool_name);
+                let _ = self.tx.send(AgentEvent::ToolResult {
+                    name: ctx.tool_name.to_string(),
+                    result: "unknown tool".to_string(),
+                    ok: false,
+                });
                 Flow::Continue
             }
+
             _ => Flow::Continue,
         }
     }
 }
 
 /// 将工具调用参数格式化为人类可读的描述。
+/// Formats tool call arguments into a human-readable description.
 /// 例如 `read_file` 打印读取的文件路径，`run_bash` 打印执行的命令。
+/// For example, `read_file` prints the file path being read, `run_bash` prints the command being executed.
 fn format_tool_call_desc(tool_name: &str, args: &str) -> String {
     let parsed = serde_json::from_str::<serde_json::Value>(args).ok();
     let get_str = |key: &str| -> Option<String> {
@@ -138,14 +161,14 @@ fn format_tool_call_desc(tool_name: &str, args: &str) -> String {
     match tool_name {
         "read_file" => {
             let path = get_str("path").unwrap_or_default();
-            format!("read_file → 读取文件: {path}")
+            format!("read_file \u{2192} \u{8bfb}\u{53d6}\u{6587}\u{4ef6}: {path}")
         }
         "edit_file" => {
             let path = get_str("path").unwrap_or_default();
             let old = get_str("old").unwrap_or_default();
             let new = get_str("new").unwrap_or_default();
             format!(
-                "edit_file → 编辑文件: {path}\n  替换: {old}\n  替换为: {new}"
+                "edit_file \u{2192} \u{7f16}\u{8f91}\u{6587}\u{4ef6}: {path}\n  \u{66ff}\u{6362}: {old}\n  \u{66ff}\u{6362}\u{4e3a}: {new}"
             )
         }
         "write_file" => {
@@ -156,46 +179,49 @@ fn format_tool_call_desc(tool_name: &str, args: &str) -> String {
                 .and_then(|v| v.as_str())
                 .map(|s| s.len())
                 .unwrap_or(0);
-            format!("write_file → 写入文件: {path} ({content_len} 字节)")
+            format!("write_file \u{2192} \u{5199}\u{5165}\u{6587}\u{4ef6}: {path} ({content_len} \u{5b57}\u{8282})")
         }
         "run_bash" => {
             let command = get_str("command").unwrap_or_default();
-            format!("run_bash → 执行命令: {command}")
+            format!("run_bash \u{2192} \u{6267}\u{884c}\u{547d}\u{4ee4}: {command}")
         }
         "web_fetch" => {
             let url = get_str("url").unwrap_or_default();
-            format!("web_fetch → 抓取网页: {url}")
+            format!("web_fetch \u{2192} \u{6293}\u{53d6}\u{7f51}\u{9875}: {url}")
         }
         "web_search" => {
             let query = get_str("query").unwrap_or_default();
-            format!("web_search → 搜索: {query}")
+            format!("web_search \u{2192} \u{641c}\u{7d22}: {query}")
         }
         _ => format!("{tool_name}({args})"),
     }
 }
 
-/// 打印 token 用量摘要。
-fn print_usage(usage: &Usage) {
+/// 格式化 token 用量摘要为字符串。
+/// Formats token usage summary into a string.
+fn format_usage(usage: &Usage) -> String {
     let input = usage.input_tokens;
     let output = usage.output_tokens;
     let cached = usage.cached_input_tokens;
     let reasoning = usage.reasoning_tokens;
     if input == 0 && output == 0 {
-        return;
+        return String::new();
     }
-    let mut parts = vec![format!("输入={input}")];
+    let mut parts = vec![format!("\u{8f93}\u{5165}={input}")];
     if cached > 0 {
-        parts.push(format!("缓存={cached}"));
+        parts.push(format!("\u{7f13}\u{5b58}={cached}"));
     }
-    parts.push(format!("输出={output}"));
+    parts.push(format!("\u{8f93}\u{51fa}={output}"));
     if reasoning > 0 {
-        parts.push(format!("推理={reasoning}"));
+        parts.push(format!("\u{63a8}\u{7406}={reasoning}"));
     }
-    info!("[用量] {}", parts.join("，"));
+    parts.join("\u{ff0c}")
 }
 
 /// 纯函数形式的权限分级解析，可不依赖 hook 包装单独测试。`args` 为 JSON 形式的
+/// Pure-function permission tier resolution, can be tested independently without hook wrapping. `args` is the JSON-form
 /// 工具调用参数（用于从 `run_bash` 中提取 `command`）。
+/// tool call arguments (used to extract `command` from `run_bash`).
 pub fn decide_tier(perms: &ToolPerms, tool_name: &str, args: &str) -> Permission {
     match tool_name {
         "read_file" => perms.read_file,
@@ -218,8 +244,11 @@ pub fn decide_tier(perms: &ToolPerms, tool_name: &str, args: &str) -> Permission
 }
 
 /// 纯函数形式的流程决策。仅用于单元测试，保证确定性与无 IO 依赖。
+/// Pure-function flow decision. Used only for unit tests, ensuring determinism and no IO dependency.
 /// `Ask` 在此解析为 `Flow::Skip`；线上 hook 应改用 `on_event` 中
-/// 的 match tier 分支，对 `Ask` 通过 `confirm()` 进行终端交互询问。
+/// `Ask` is resolved as `Flow::Skip` here; the production hook should use the
+/// 的 match tier 分支，对 `Ask` 通过 `confirm()` 进行终端交互。
+/// match tier branch in `on_event`, which handles `Ask` via `confirm()` for terminal interaction.
 #[cfg(test)]
 fn decide_flow(perms: &ToolPerms, tool_name: &str, args: &str) -> Flow {
     match decide_tier(perms, tool_name, args) {
@@ -234,13 +263,20 @@ fn decide_flow(perms: &ToolPerms, tool_name: &str, args: &str) -> Flow {
 }
 
 /// 针对 `goal` 驱动自主 Agent 循环。指定角色的 Agent 自行规划并执行，调用工具；
+/// Drives the autonomous Agent loop for a given `goal`. The role's Agent plans and executes on its own, calling tools;
 /// `HitlHook` 门控关键决策。模型结束或达到 max_turns 时停止。
+/// `HitlHook` gates critical decisions. Stops when the model finishes or max_turns is reached.
 ///
 /// SSE 断连时自动重试最多 3 次，每次告知模型已完成的工作让其继续。
+/// On SSE disconnect, auto-retries up to 3 times, each time telling the model what's done so it can continue.
+///
+/// 所有用户可见输出通过 `tx` channel 发送给 TUI。
+/// All user-visible output is sent to the TUI via the `tx` channel.
 pub async fn run_autonomous(
     registry: &AgentRegistry,
     role: Role,
     goal: &str,
+    tx: &EventSender,
 ) -> anyhow::Result<String> {
     const MAX_RETRIES: usize = 3;
 
@@ -250,15 +286,15 @@ pub async fn run_autonomous(
         } else {
             format!(
                 "{goal}\n\n\
-                 [系统提示] 上次执行因 SSE 连接中断（第 {attempt} 次重试）。\
-                 请用 `ls -R .` 检查已创建的文件，跳过已完成的步骤，继续未完成的部分。"
+                 [\u{7cfb}\u{7edf}\u{63d0}\u{793a}] \u{4e0a}\u{6b21}\u{6267}\u{884c}\u{56e0} SSE \u{8fde}\u{63a5}\u{4e2d}\u{65ad}\u{ff08}\u{7b2c} {attempt} \u{6b21}\u{91cd}\u{8bd5}\u{ff09}\u{3002}\
+                 \u{8bf7}\u{7528} `ls -R .` \u{68c0}\u{67e5}\u{5df2}\u{521b}\u{5efa}\u{7684}\u{6587}\u{4ef6}\u{ff0c}\u{8df3}\u{8fc7}\u{5df2}\u{5b8c}\u{6210}\u{7684}\u{6b65}\u{9aa4}\u{ff0c}\u{7ee7}\u{7eed}\u{672a}\u{5b8c}\u{6210}\u{7684}\u{90e8}\u{5206}\u{3002}"
             )
         };
 
         let perms = registry.tool_perms(role);
         let max_turns = registry.max_turns();
         let hitl_waiting = Arc::new(AtomicBool::new(false));
-        let hook = HitlHook::new(perms, hitl_waiting.clone());
+        let hook = HitlHook::new(perms, hitl_waiting.clone(), tx.clone());
 
         let agent = build_runner_agent(registry, role)?;
         let stream = agent
@@ -269,67 +305,57 @@ pub async fn run_autonomous(
             .stream()
             .await;
 
-        match consume_stream(stream, Some(hitl_waiting)).await {
+        match consume_stream(stream, Some(hitl_waiting), tx).await {
             Ok(output) => return Ok(output),
             Err(e) if is_stream_error(&e) && attempt < MAX_RETRIES => {
-                info!(
-                    "[重试] {role:?} 第 {}/{} 次：SSE 连接中断，重新调用",
+                let _ = tx.send(AgentEvent::Info(format!(
+                    "[\u{91cd}\u{8bd5}] {role:?} \u{7b2c} {}/{} \u{6b21}\u{ff1a}SSE \u{8fde}\u{63a5}\u{4e2d}\u{65ad}\u{ff0c}\u{91cd}\u{65b0}\u{8c03}\u{7528}",
                     attempt + 1,
                     MAX_RETRIES
-                );
+                )));
                 continue;
             }
             Err(e) => return Err(e),
         }
     }
 
-    Err(anyhow::anyhow!("{role:?} 重试 {MAX_RETRIES} 次后仍失败"))
+    Err(anyhow::anyhow!(
+        "{role:?} \u{91cd}\u{8bd5} {MAX_RETRIES} \u{6b21}\u{540e}\u{4ecd}\u{5931}\u{8d25}"
+    ))
 }
 
 /// 判断错误是否为 SSE 流式断连（可安全重试）。
+/// Determines whether an error is an SSE stream disconnect (safe to retry).
 pub fn is_stream_error(e: &anyhow::Error) -> bool {
     let msg = e.to_string();
     msg.contains("error decoding response body")
         || msg.contains("SSE error")
         || msg.contains("Reset(StreamId")
-        || msg.contains("流式错误")
-        || msg.contains("空闲超时")
+        || msg.contains("\u{6d41}\u{5f0f}\u{9519}\u{8bef}")
+        || msg.contains("\u{7a7a}\u{95f2}\u{8d85}\u{65f6}")
 }
 
-/// 消费流式输出：文本增量直接 print 到 stdout，reasoning 缓冲后整块输出。
+/// 消费流式输出：文本增量通过 channel 发送给 TUI，reasoning 实时发送。
+/// Consumes streaming output: text deltas are sent to the TUI via channel, reasoning sent in real time.
 /// 供 `run_autonomous` 和 `RoleAgent::run` 共用。
+/// Shared by `run_autonomous` and `RoleAgent::run`.
 ///
 /// 当模型将全部内容放在 reasoning 通道（content 字段为空）时，
+/// When the model puts all content in the reasoning channel (content field is empty),
 /// 用累积的 reasoning 内容作为输出回退，避免下游收到空计划。
+/// the accumulated reasoning content is used as output fallback, avoiding empty plans downstream.
 pub async fn consume_stream<R>(
     mut stream: rig_core::agent::StreamingResult<R>,
     hitl_waiting: Option<Arc<AtomicBool>>,
+    tx: &EventSender,
 ) -> anyhow::Result<String> {
     use rig_core::agent::MultiTurnStreamItem;
     use rig_core::streaming::StreamedAssistantContent;
 
     const CHUNK_TIMEOUT: Duration = Duration::from_secs(120);
-    const THINK_HINT_DELAY: Duration = Duration::from_secs(5);
 
     let mut output = String::new();
-    let mut reasoning_buf = String::new();
     let mut all_reasoning = String::new();
-    let mut reasoning_start: Option<std::time::Instant> = None;
-    let mut thinking_hint_shown = false;
-
-    let flush_reasoning = |buf: &mut String, all: &mut String, hint: &mut bool| {
-        if !buf.is_empty() {
-            if *hint {
-                println!();
-                std::io::stdout().flush().ok();
-                *hint = false;
-            }
-            info!("[思考] {}", buf.trim());
-            all.push_str(buf.trim());
-            all.push('\n');
-            buf.clear();
-        }
-    };
 
     loop {
         let next = match &hitl_waiting {
@@ -337,9 +363,8 @@ pub async fn consume_stream<R>(
             _ => match tokio::time::timeout(CHUNK_TIMEOUT, stream.next()).await {
                 Ok(item) => item,
                 Err(_) => {
-                    flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);
                     return Err(anyhow::anyhow!(
-                        "SSE 空闲超时（{}秒无数据），可能连接已断开",
+                        "SSE \u{7a7a}\u{95f2}\u{8d85}\u{65f6}\u{ff08}{}\u{79d2}\u{65e0}\u{6570}\u{636e}\u{ff09}\u{ff0c}\u{53ef}\u{80fd}\u{8fde}\u{63a5}\u{5df2}\u{65ad}\u{5f00}",
                         CHUNK_TIMEOUT.as_secs()
                     ));
                 }
@@ -349,70 +374,55 @@ pub async fn consume_stream<R>(
         let Some(item) = next else { break };
 
         match item {
-            Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => {
-                match content {
-                    StreamedAssistantContent::Text(t) => {
-                        flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);
-                        if !t.text.is_empty() {
-                            print!("{}", t.text);
-                            std::io::stdout().flush().ok();
-                        }
-                    }
-                    StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
-                        if reasoning_start.is_none() {
-                            reasoning_start = Some(std::time::Instant::now());
-                        }
-                        if !thinking_hint_shown {
-                            if let Some(start) = &reasoning_start {
-                                if start.elapsed() >= THINK_HINT_DELAY {
-                                    print!("思考中");
-                                    std::io::stdout().flush().ok();
-                                    thinking_hint_shown = true;
-                                }
-                            }
-                        }
-                        reasoning_buf.push_str(&reasoning);
-                    }
-                    StreamedAssistantContent::ToolCall { tool_call, .. } => {
-                        flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);
-                        let desc = format_tool_call_desc(
-                            &tool_call.function.name,
-                            &tool_call.function.arguments.to_string(),
-                        );
-                        info!("[模型调用] {desc}");
-                    }
-                    _ => {
-                        flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);
+            Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => match content {
+                StreamedAssistantContent::Text(t) => {
+                    if !t.text.is_empty() {
+                        let _ = tx.send(AgentEvent::TextDelta(t.text));
                     }
                 }
-            }
+                StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+                    let _ = tx.send(AgentEvent::ReasoningDelta(reasoning.clone()));
+                    all_reasoning.push_str(&reasoning);
+                }
+                StreamedAssistantContent::ToolCall { tool_call, .. } => {
+                    let desc = format_tool_call_desc(
+                        &tool_call.function.name,
+                        &tool_call.function.arguments.to_string(),
+                    );
+                    let _ = tx.send(AgentEvent::ToolCall {
+                        name: tool_call.function.name.clone(),
+                        desc,
+                    });
+                }
+                _ => {}
+            },
             Ok(MultiTurnStreamItem::FinalResponse(resp)) => {
-                flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);
                 output = resp.output;
             }
             Err(e) => {
-                flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);
-                return Err(anyhow::anyhow!("流式错误: {e}"));
+                return Err(anyhow::anyhow!(
+                    "\u{6d41}\u{5f0f}\u{9519}\u{8bef}: {e}"
+                ));
             }
-            _ => {
-                flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);
-            }
+            _ => {}
         }
     }
 
-    flush_reasoning(&mut reasoning_buf, &mut all_reasoning, &mut thinking_hint_shown);
     if output.is_empty() {
         if !all_reasoning.is_empty() {
             output = all_reasoning;
         } else {
-            output.push_str("(无输出)");
+            output.push_str("(\u{65e0}\u{8f93}\u{51fa})");
         }
     }
+    let _ = tx.send(AgentEvent::Agent(output.clone()));
     Ok(output)
 }
 
 /// 为某角色构建"可运行"的 rig `Agent`（带工具），并遵循会话级模型覆盖。
+/// Builds a "runnable" rig `Agent` (with tools) for a role, respecting session-level model override.
 /// 与 `AgentRegistry::build` 类似，但返回原始 `Agent`，以便附加 runner 与 hook。
+/// Similar to `AgentRegistry::build`, but returns the raw `Agent` so runner and hooks can be attached.
 fn build_runner_agent(
     registry: &AgentRegistry,
     role: Role,
@@ -422,8 +432,7 @@ fn build_runner_agent(
         .ok_or_else(|| anyhow::anyhow!("no config for role {role:?}"))?;
     let client = crate::providers::create_client()?;
     let preamble = std::fs::read_to_string(&rc.preamble)
-        .unwrap_or_else(|_| format!("你是 {role:?} agent。"));
-    // 与 registry 的 build 一致：把相关技能指令注入提示词。
+        .unwrap_or_else(|_| format!("\u{4f60}\u{662f} {role:?} agent\u{3002}"));
     let preamble = crate::registry::inject_skills_public(&preamble);
     let model = registry.session_model().unwrap_or_else(|| rc.model.clone());
     let max_turns = registry.max_turns();
@@ -475,7 +484,6 @@ mod tests {
 
     #[test]
     fn mutating_bash_asks() {
-        // 纯函数决策中 Ask 分级解析为 Skip（线上 hook 会改为交互询问）。
         assert!(matches!(
             decide_flow(&perms(), "run_bash", r#"{"command":"rm -rf x"}"#),
             Flow::Skip { .. }

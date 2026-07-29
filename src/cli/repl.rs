@@ -1,10 +1,5 @@
-use rustyline::Editor;
-use tracing::info;
-
-use crate::cli::context::AppContext;
-
-/// REPL 命令——显式枚举，编译器强制 match 穷尽。
-enum ReplCommand {
+/// REPL 命令枚举。TUI 输入处理复用此 parse 逻辑。
+pub enum ReplCommand {
     Model { slug: Option<String> },
     Evolve,
     EvolveCode { file: String, old: String, new: String },
@@ -20,7 +15,7 @@ enum ReplCommand {
 }
 
 impl ReplCommand {
-    fn parse(line: &str) -> Self {
+    pub fn parse(line: &str) -> Self {
         let line = line.trim();
         if line.is_empty() {
             return Self::InvalidUsage("empty input");
@@ -31,7 +26,6 @@ impl ReplCommand {
             _ => {}
         }
 
-        // `/` 前缀 = 命令；否则 = goal。消除 evolve/evolve-code 顺序依赖。
         if !line.starts_with('/') {
             return Self::Goal(line.to_owned());
         }
@@ -80,33 +74,4 @@ impl ReplCommand {
             _ => Self::InvalidUsage("unknown command; type /help for usage"),
         }
     }
-}
-
-pub async fn run_repl(ctx: &AppContext) -> anyhow::Result<()> {
-    let mut rl = Editor::<(), _>::new()?;
-    loop {
-        let line = match rl.readline("» ") {
-            Ok(l) => l,
-            Err(rustyline::error::ReadlineError::Interrupted) => break,
-            Err(rustyline::error::ReadlineError::Eof) => break,
-            Err(e) => return Err(e.into()),
-        };
-        let _ = rl.add_history_entry(line.as_str());
-
-        match ReplCommand::parse(&line) {
-            ReplCommand::Quit => break,
-            ReplCommand::Goal(goal) => ctx.run_goal(&goal).await,
-            ReplCommand::Model { slug } => ctx.cmd_model(slug),
-            ReplCommand::Evolve => ctx.cmd_evolve().await,
-            ReplCommand::EvolveCode { file, old, new } => ctx.cmd_evolve_code(&file, &old, &new),
-            ReplCommand::AddTool { name, description } => ctx.cmd_add_tool(&name, &description),
-            ReplCommand::AddSkill { name, description } => ctx.cmd_add_skill(&name, &description),
-            ReplCommand::Skills => ctx.cmd_list_skills(),
-            ReplCommand::Help => ctx.cmd_help(),
-            ReplCommand::History { limit } => ctx.cmd_history(limit),
-            ReplCommand::Lessons => ctx.cmd_list_lessons(),
-            ReplCommand::InvalidUsage(msg) => info!("{msg}"),
-        }
-    }
-    Ok(())
 }

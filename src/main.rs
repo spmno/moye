@@ -1,5 +1,8 @@
+// 程序入口：日志初始化、上下文构建、TUI 启动。
+// Program entry point: logging initialization, context construction, TUI launch.
 mod agent_loop;
 mod cli;
+mod event;
 mod evolution;
 mod memory;
 mod providers;
@@ -8,6 +11,9 @@ mod reviewer;
 mod skills;
 mod tools;
 mod tools_ext;
+mod ui;
+
+use std::sync::Arc;
 
 use anyhow::Result;
 use cli::context::AppContext;
@@ -26,29 +32,21 @@ async fn main() -> Result<()> {
     let memory = memory::MemoryStore::new(&cli::context::load_memory_cfg()?)?;
     let rule_threshold = cli::context::load_escalation_threshold()?;
 
-    let ctx = AppContext {
+    let ctx = Arc::new(AppContext {
         registry,
         orchestrator,
         memory,
         evolver,
         rule_threshold,
-    };
+    });
 
-    let provider_name = format!("{:?}", providers::current_provider());
-    info!(
-        "my-agent ready ({provider_name}). model: {}\n\
-         命令: /model <slug> | /evolve | /evolve-code <file> <old> <new> | /add-tool <name> <desc> | /add-skill <name> <desc> | /skills | /history [n] | /lessons | /help | /quit\n\
-         非 `/` 开头的输入会作为任务目标交给 Orchestrator（SDD 管线）执行。",
-        ctx.current_model()
-    );
-
-    cli::repl::run_repl(&ctx).await
+    ui::tui::run_tui(ctx).await
 }
 
 fn init_logging() {
+    use tracing_subscriber::fmt::time::LocalTime;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
-    use tracing_subscriber::fmt::time::LocalTime;
 
     std::fs::create_dir_all("logs").ok();
     let log_name = format!(
@@ -56,23 +54,21 @@ fn init_logging() {
         chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
     );
     let log_file = std::fs::File::create(&log_name).unwrap_or_else(|e| {
-        eprintln!("无法创建日志文件 {log_name}: {e}；回退到仅 stderr");
+        eprintln!(
+            "\u{65e0}\u{6cd5}\u{521b}\u{5efa}\u{65e5}\u{5fd7}\u{6587}\u{4ef6} {log_name}: {e}\u{ff1b}\u{56de}\u{9000}\u{5230}\u{4ec5} stderr"
+        );
         std::fs::File::create("/dev/null").unwrap()
     });
-    let timer = LocalTime::rfc_3339();
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_timer(timer.clone())
-        .with_writer(log_file);
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_timer(timer)
-        .with_writer(std::io::stderr);
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new("info,rig_core=off"))
-        .with(file_layer)
-        .with(stderr_layer)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_timer(LocalTime::rfc_3339())
+                .with_writer(log_file),
+        )
         .init();
 
-    info!("[trace] 日志文件: {log_name}");
+    info!("[trace] \u{65e5}\u{5fd7}\u{6587}\u{4ef6}: {log_name}");
 }

@@ -1,5 +1,7 @@
 // 注册表模块：定义角色（Role）、按工具的权限分级（ToolPerms / Permission）、
+// Registry module: defines roles (Role), per-tool permission tiers (ToolPerms / Permission),
 // 以及构建和管理各角色 Agent 的 AgentRegistry。权限分级驱动自主循环的 HITL（人在环）控制。
+// and AgentRegistry for building and managing role Agents. Permission tiers drive autonomous loop HITL (Human-in-the-Loop) control.
 use crate::event::{AgentEvent, EventSender};
 use crate::providers::{create_client, ChatAgent};
 use rig_core::client::CompletionClient;
@@ -8,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use tracing::info;
 
 /// Agent 角色：编排者 / 规划者 / 构建者 / 审计者。
+/// Agent roles: Orchestrator / Planner / Builder / Auditor.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -18,6 +21,7 @@ pub enum Role {
 }
 
 /// 单个角色的运行时配置：模型、preamble（提示词）文件、权限分级。
+/// Runtime config for a single role: model, preamble (prompt) file, permission tiers.
 #[derive(Debug, Deserialize, Clone)]
 pub struct RoleConfig {
     pub model: String,
@@ -27,7 +31,9 @@ pub struct RoleConfig {
 }
 
 // 自主循环 HITL（人在环）门控所用的按工具权限分级：
+// Per-tool permission tiers used by the autonomous loop HITL (Human-in-the-Loop) gate:
 // `allow` = 自动执行不询问；`ask` = 暂停请人类确认；`deny` = 拦截调用并向模型说明原因。
+// `allow` = auto-execute without prompt; `ask` = pause for human confirmation; `deny` = block call and explain reason to model.
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct ToolPerms {
     #[serde(default = "default_allow")]
@@ -45,10 +51,12 @@ pub struct ToolPerms {
 }
 
 /// 读类工具默认允许（自动执行）。
+/// Read-type tools default to Allow (auto-execute).
 fn default_allow() -> Permission {
     Permission::Allow
 }
 /// 会改变状态的工具默认需询问人类。
+/// State-changing tools default to Ask (require human confirmation).
 fn default_ask() -> Permission {
     Permission::Ask
 }
@@ -67,6 +75,7 @@ impl Default for ToolPerms {
 }
 
 /// 单条权限：允许 / 需询问 / 拒绝。
+/// A single permission: Allow / Ask / Deny.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Permission {
@@ -77,6 +86,7 @@ pub enum Permission {
 }
 
 /// `[agent]` 子节：默认模型与循环上限。
+/// `[agent]` subsection: default model and loop limit.
 #[derive(Debug, Deserialize, Default)]
 pub struct AgentSection {
     #[serde(default)]
@@ -86,6 +96,7 @@ pub struct AgentSection {
 }
 
 /// 注册表顶层配置：来自 agent.toml，包含循环上限与各角色配置。
+/// Registry top-level config: from agent.toml, includes loop limit and per-role configs.
 #[derive(Debug, Deserialize)]
 pub struct AgentRegistryConfig {
     #[serde(default)]
@@ -96,6 +107,7 @@ pub struct AgentRegistryConfig {
 
 impl AgentRegistryConfig {
     /// 从 agent.toml 加载配置。
+    /// Loads config from agent.toml.
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)?;
         let cfg: AgentRegistryConfig = toml::from_str(&raw)?;
@@ -103,6 +115,7 @@ impl AgentRegistryConfig {
     }
 
     /// 返回循环上限；为 0 时回退到默认 20 轮。
+    /// Returns the loop limit; falls back to default 20 turns when 0.
     pub fn max_turns(&self) -> usize {
         let turns = self.agent.max_turns;
         if turns == 0 {
@@ -114,6 +127,7 @@ impl AgentRegistryConfig {
 }
 
 /// 绑定到某个角色的 Agent：模型 + preamble（提示词，从 .md 文件加载）。
+/// An Agent bound to a role: model + preamble (prompt, loaded from .md file).
 pub struct RoleAgent {
     role: Role,
     agent: ChatAgent,
@@ -121,7 +135,9 @@ pub struct RoleAgent {
 
 impl RoleAgent {
     /// 用该角色 Agent 直接执行一次任务（用于 Planner/Auditor 等不需要工具循环的角色）。
+    /// Executes a task once directly with this role's Agent (for roles like Planner/Auditor that don't need tool loops).
     /// 流式输出通过 `tx` channel 发送给 TUI。
+    /// Streaming output is sent to the TUI via the `tx` channel.
     pub async fn run(&self, task: &str, tx: &EventSender) -> anyhow::Result<String> {
         const MAX_RETRIES: usize = 3;
 
@@ -153,6 +169,7 @@ impl RoleAgent {
 }
 
 /// Agent 注册表：持有共享配置，并为各角色构建 Agent；同时保存会话级的模型覆盖。
+/// Agent registry: holds shared config, builds Agents per role; also stores session-level model override.
 pub struct AgentRegistry {
     config: Arc<AgentRegistryConfig>,
     // 整个会话的运行时模型覆盖。一旦设置，所有角色都使用该 slug 而非各自配置的模型，

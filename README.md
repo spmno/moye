@@ -191,12 +191,31 @@ cargo run
 启动后进入全屏 TUI 界面 / Launches a fullscreen TUI interface:
 
 ```
- my-agent (DeepSeek) | model: kimi-k3 
-─────────────────────────────────────────
-Enter 发送任务 | /help 帮助 | Ctrl+C 退出
-─────────────────────────────────────────
-» _
+ my-agent (DeepSeek) | model: kimi-k3                    │ Provider
+Enter 发送任务 | /help 帮助 | Ctrl+C 退出                │   DeepSeek
+                                                         │
+» _                                                      │ Model
+                                                         │   kimi-k3
+                                                         │
+                                                         │ Context
+                                                         │   0 tok
+                                                         │
+                                                         │ Progress
+                                                         │   [░░░░░░░░░░] 0/20
+                                                         │   ✓ ready
+                                                         │
+                                                         │ Tools (6)
+                                                         │   • read_file
+                                                         │   • edit_file
+                                                         │   • write_file
+                                                         │   • run_bash
+                                                         │   • web_fetch
+                                                         │   • web_search
 ```
+
+右侧侧边栏实时显示：供应商、模型、累计 token 用量及上次消耗明细、回合进度条、运行状态（thinking / HITL / ready）、全部工具名称列表、已注册技能列表。无背景色，以左边框与主区域分隔。
+
+The right sidebar shows: provider, model, cumulative token usage with last-call breakdown, turn progress bar, runtime status (thinking / HITL / ready), full tool name list, and registered skill list. No background color; separated from the main area by a left border.
 
 ### 输入自然语言目标 / Input a Natural-Language Goal
 

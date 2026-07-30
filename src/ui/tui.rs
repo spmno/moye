@@ -193,13 +193,19 @@ struct TuiState {
     should_quit: bool,
     provider: String,
     model: String,
+    max_turns: usize,
+    current_turn: usize,
+    total_tokens: u64,
+    last_usage: String,
+    tool_names: Vec<String>,
+    skill_names: Vec<String>,
     /// 当前运行中的后台任务句柄。按 Esc 可 abort 中断。
     /// Handle to the currently running background task. Press Esc to abort.
     task_handle: Option<JoinHandle<()>>,
 }
 
 impl TuiState {
-    fn new(provider: String, model: String) -> Self {
+    fn new(provider: String, model: String, max_turns: usize, tool_names: Vec<String>, skill_names: Vec<String>) -> Self {
         Self {
             messages: Vec::new(),
             input: InputState::new(),
@@ -213,6 +219,12 @@ impl TuiState {
             should_quit: false,
             provider,
             model,
+            max_turns,
+            current_turn: 0,
+            total_tokens: 0,
+            last_usage: String::new(),
+            tool_names,
+            skill_names,
             task_handle: None,
         }
     }
@@ -380,6 +392,11 @@ fn render_event(event: &AgentEvent) -> Vec<Line<'static>> {
 pub async fn run_tui(ctx: Arc<AppContext>) -> anyhow::Result<()> {
     let provider = format!("{:?}", crate::providers::current_provider());
     let model = ctx.current_model();
+    let max_turns = ctx.registry.max_turns();
+    let tool_names: Vec<String> = crate::tools::tool_names().iter().map(|s| s.to_string()).collect();
+    let skill_names: Vec<String> = crate::skills::SkillManifest::load()
+        .map(|m| m.list())
+        .unwrap_or_default();
 
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(std::io::stdout());
@@ -387,7 +404,7 @@ pub async fn run_tui(ctx: Arc<AppContext>) -> anyhow::Result<()> {
 
     let (action_tx, mut action_rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    let mut state = TuiState::new(provider, model);
+    let mut state = TuiState::new(provider, model, max_turns, tool_names, skill_names);
     state.push_event(AgentEvent::System(format!(
         "my-agent ({}) | model: {}",
         state.provider, state.model
@@ -669,6 +686,9 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
             state.reset_scroll();
         }
         AgentEvent::TurnFinished { turn, usage } => {
+            state.current_turn = turn;
+            state.total_tokens += parse_usage_tokens(&usage);
+            state.last_usage = usage.clone();
             state.push_event(AgentEvent::TurnFinished { turn, usage });
             state.reset_scroll();
         }
@@ -742,38 +762,28 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
 fn draw(f: &mut Frame, state: &mut TuiState) {
     let area = f.area();
 
-    let chunks = Layout::default()
+    let h_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(28)])
+        .split(area);
+
+    let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
             Constraint::Min(1),
             Constraint::Length(3),
             Constraint::Length(3),
         ])
-        .split(area);
+        .split(h_chunks[0]);
 
-    draw_header(f, chunks[0], state);
-    draw_messages(f, chunks[1], state);
-    draw_streaming(f, chunks[2], state);
-    draw_input(f, chunks[3], state);
+    draw_messages(f, v_chunks[0], state);
+    draw_streaming(f, v_chunks[1], state);
+    draw_input(f, v_chunks[2], state);
+    draw_sidebar(f, h_chunks[1], state);
 
     if state.hitl.is_some() {
         draw_hitl_overlay(f, state);
     }
-}
-
-fn draw_header(f: &mut Frame, area: Rect, state: &TuiState) {
-    let header = Paragraph::new(format!(
-        " my-agent ({}) | model: {} ",
-        state.provider, state.model
-    ))
-    .style(theme::header())
-    .block(
-        Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(theme::border()),
-    );
-    f.render_widget(header, area);
 }
 
 fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
@@ -872,6 +882,95 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
         let cy = area.y + 1;
         f.set_cursor_position((cx, cy));
     }
+}
+
+fn parse_usage_tokens(usage: &str) -> u64 {
+    usage
+        .split('\u{ff0c}')
+        .filter_map(|part| part.split('=').nth(1))
+        .filter_map(|s| s.trim().parse::<u64>().ok())
+        .sum()
+}
+
+fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(theme::border())
+        .padding(Padding::horizontal(1));
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::styled("Provider", theme::status_dim()));
+    lines.push(Line::styled(format!(" {}", state.provider), theme::status_model()));
+    lines.push(Line::default());
+
+    lines.push(Line::styled("Model", theme::status_dim()));
+    lines.push(Line::styled(format!(" {}", state.model), theme::status_model()));
+    lines.push(Line::default());
+
+    lines.push(Line::styled("Context", theme::status_dim()));
+    lines.push(Line::styled(
+        format!(" {} tok", state.total_tokens),
+        theme::status_usage(),
+    ));
+    if !state.last_usage.is_empty() {
+        lines.push(Line::styled(
+            format!(" {}", state.last_usage),
+            theme::status_dim(),
+        ));
+    }
+    lines.push(Line::default());
+
+    lines.push(Line::styled("Progress", theme::status_dim()));
+    let bar_w = 10usize;
+    let max = state.max_turns.max(1);
+    let filled = (bar_w * state.current_turn / max).min(bar_w);
+    let bar: String = "\u{2588}".repeat(filled) + &"\u{2591}".repeat(bar_w - filled);
+    lines.push(Line::styled(
+        format!("[{bar}] {}/{}", state.current_turn, state.max_turns),
+        theme::status_turn(),
+    ));
+
+    let (status_text, status_style) = if state.hitl.is_some() {
+        ("\u{26a0} HITL".to_string(), theme::status_hitl())
+    } else if state.thinking {
+        let sp = SPINNER_FRAMES[state.spinner];
+        (format!("{sp} thinking"), theme::status_thinking())
+    } else {
+        ("\u{2713} ready".to_string(), theme::status_ready())
+    };
+    lines.push(Line::styled(status_text, status_style));
+    lines.push(Line::default());
+
+    lines.push(Line::styled(
+        format!("Tools ({})", state.tool_names.len()),
+        theme::status_dim(),
+    ));
+    for name in &state.tool_names {
+        lines.push(Line::raw(format!(" \u{2022} {name}")));
+    }
+    lines.push(Line::default());
+
+    if !state.skill_names.is_empty() {
+        lines.push(Line::styled(
+            format!("Skills ({})", state.skill_names.len()),
+            theme::status_dim(),
+        ));
+        for name in &state.skill_names {
+            lines.push(Line::raw(format!(" \u{2022} {name}")));
+        }
+        lines.push(Line::default());
+    }
+
+    if state.user_scrolled && state.scroll_offset > 0 {
+        lines.push(Line::styled(
+            format!("\u{2191} {} lines", state.scroll_offset),
+            theme::status_scroll(),
+        ));
+    }
+
+    let sidebar = Paragraph::new(lines).block(block);
+    f.render_widget(sidebar, area);
 }
 
 fn draw_hitl_overlay(f: &mut Frame, state: &mut TuiState) {

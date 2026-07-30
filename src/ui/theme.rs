@@ -34,13 +34,6 @@ pub fn border() -> Style {
     Style::new().fg(Color::DarkGray)
 }
 
-pub fn header() -> Style {
-    Style::new()
-        .fg(Color::White)
-        .bg(Color::DarkGray)
-        .add_modifier(Modifier::BOLD)
-}
-
 pub fn input_prompt() -> Style {
     Style::new().fg(Color::LightCyan).add_modifier(Modifier::BOLD)
 }
@@ -89,4 +82,39 @@ pub fn strong() -> Style {
 
 pub fn usage() -> Style {
     Style::new().fg(Color::DarkGray)
+}
+
+// ===== 状态栏样式 =====
+// ===== Status bar styles =====
+
+pub fn status_model() -> Style {
+    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+}
+
+pub fn status_dim() -> Style {
+    Style::new().fg(Color::Gray)
+}
+
+pub fn status_turn() -> Style {
+    Style::new().fg(Color::Yellow)
+}
+
+pub fn status_usage() -> Style {
+    Style::new().fg(Color::Green)
+}
+
+pub fn status_scroll() -> Style {
+    Style::new().fg(Color::LightBlue)
+}
+
+pub fn status_thinking() -> Style {
+    Style::new().fg(Color::LightYellow)
+}
+
+pub fn status_ready() -> Style {
+    Style::new().fg(Color::Green)
+}
+
+pub fn status_hitl() -> Style {
+    Style::new().fg(Color::LightRed).add_modifier(Modifier::BOLD)
 }

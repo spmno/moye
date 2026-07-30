@@ -577,6 +577,12 @@ pub fn is_readonly_bash(command: &str) -> bool {
     true
 }
 
+/// 内置工具名称列表（供侧边栏显示）。
+/// Built-in tool name list (for sidebar display).
+pub fn tool_names() -> Vec<&'static str> {
+    vec!["read_file", "edit_file", "write_file", "run_bash", "web_fetch", "web_search"]
+}
+
 /// 内置工具集合 + 动态工具（tools_ext）。
 /// Built-in tool set + dynamic tools (tools_ext).
 /// 动态工具由 /add-tool 命令生成，需重新 cargo build 后生效。

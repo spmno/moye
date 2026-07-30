@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, EventStream, KeyCode, KeyEvent, KeyModifiers,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+        EnableMouseCapture, EventStream, KeyCode, KeyEvent, KeyModifiers,
         MouseEvent, MouseEventKind,
     },
     execute,
@@ -44,7 +45,12 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> anyhow::Result<Self> {
         enable_raw_mode()?;
-        execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(
+            std::io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )?;
         Ok(Self)
     }
 }
@@ -55,6 +61,7 @@ impl Drop for TerminalGuard {
         let _ = execute!(
             std::io::stdout(),
             DisableMouseCapture,
+            DisableBracketedPaste,
             LeaveAlternateScreen,
             crossterm::cursor::Show
         );
@@ -75,6 +82,7 @@ struct HitlState {
 
 struct InputState {
     buffer: String,
+    pasted: Option<String>,
     cursor: usize,
     history: Vec<String>,
     history_idx: Option<usize>,
@@ -84,10 +92,29 @@ impl InputState {
     fn new() -> Self {
         Self {
             buffer: String::new(),
+            pasted: None,
             cursor: 0,
             history: Vec::new(),
             history_idx: None,
         }
+    }
+
+    fn paste_prefix(&self) -> String {
+        if let Some(pasted) = &self.pasted {
+            let lines = pasted.lines().count();
+            if lines > 1 {
+                format!("[paste {} lines] ", lines)
+            } else {
+                let chars = pasted.chars().count();
+                format!("[paste {} chars] ", chars)
+            }
+        } else {
+            String::new()
+        }
+    }
+
+    fn display_text(&self) -> String {
+        format!("{}{}", self.paste_prefix(), self.buffer)
     }
 
     fn insert_char(&mut self, c: char) {
@@ -100,6 +127,8 @@ impl InputState {
             let prev = self.buffer.floor_char_boundary(self.cursor - 1);
             self.buffer.remove(prev);
             self.cursor = prev;
+        } else if self.pasted.is_some() {
+            self.pasted = None;
         }
     }
 
@@ -144,6 +173,7 @@ impl InputState {
             Some(i) => Some(i),
         };
         if let Some(idx) = self.history_idx {
+            self.pasted = None;
             self.buffer = self.history[idx].clone();
             self.cursor = self.buffer.len();
         }
@@ -153,9 +183,11 @@ impl InputState {
         if let Some(idx) = self.history_idx {
             if idx + 1 < self.history.len() {
                 self.history_idx = Some(idx + 1);
+                self.pasted = None;
                 self.buffer = self.history[idx + 1].clone();
             } else {
                 self.history_idx = None;
+                self.pasted = None;
                 self.buffer.clear();
             }
             self.cursor = self.buffer.len();
@@ -163,15 +195,22 @@ impl InputState {
     }
 
     fn take_submitted(&mut self) -> Option<String> {
-        let trimmed = self.buffer.trim().to_string();
-        if trimmed.is_empty() {
+        let pasted = self.pasted.take().unwrap_or_default();
+        let typed = self.buffer.trim().to_string();
+        let combined = if pasted.is_empty() && typed.is_empty() {
             return None;
-        }
-        self.history.push(trimmed.clone());
+        } else if pasted.is_empty() {
+            typed
+        } else if typed.is_empty() {
+            pasted.trim().to_string()
+        } else {
+            format!("{}\n{}", pasted.trim(), typed)
+        };
+        self.history.push(combined.clone());
         self.history_idx = None;
         self.buffer.clear();
         self.cursor = 0;
-        Some(trimmed)
+        Some(combined)
     }
 }
 
@@ -459,6 +498,17 @@ async fn run_loop(
                     }
                     crossterm::event::Event::Mouse(mouse) => {
                         handle_mouse_event(mouse, state);
+                    }
+                    crossterm::event::Event::Paste(text) => {
+                        if !state.thinking && state.hitl.is_none() {
+                            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                            if let Some(existing) = &mut state.input.pasted {
+                                existing.push('\n');
+                                existing.push_str(&text);
+                            } else {
+                                state.input.pasted = Some(text);
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -808,6 +858,24 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
 // ===== Rendering =====
 // ===== 渲染 =====
 
+fn estimate_input_lines(buffer: &str, area_width: u16) -> u16 {
+    let inner_width = (area_width.saturating_sub(2)).max(1) as usize;
+    if buffer.is_empty() {
+        return 1;
+    }
+    let mut total: usize = 0;
+    for (i, line) in buffer.lines().enumerate() {
+        let avail = if i == 0 { inner_width.saturating_sub(2) } else { inner_width };
+        let avail = avail.max(1);
+        let mut width: usize = 0;
+        for c in line.chars() {
+            width += if c.is_ascii() { 1 } else { 2 };
+        }
+        total += ((width + avail - 1) / avail).max(1);
+    }
+    total as u16
+}
+
 fn draw(f: &mut Frame, state: &mut TuiState) {
     let area = f.area();
 
@@ -816,12 +884,16 @@ fn draw(f: &mut Frame, state: &mut TuiState) {
         .constraints([Constraint::Min(1), Constraint::Length(28)])
         .split(area);
 
+    let display = state.input.display_text();
+    let input_lines = estimate_input_lines(&display, h_chunks[0].width);
+    let input_height = (input_lines + 2).max(3).min(area.height / 2);
+
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(3),
-            Constraint::Length(3),
+            Constraint::Length(input_height),
         ])
         .split(h_chunks[0]);
 
@@ -908,11 +980,12 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let prompt = if state.thinking {
         "\u{2026}".to_string()
     } else {
-        format!("\u{00bb} {}", state.input.buffer)
+        format!("\u{00bb} {}", state.input.display_text())
     };
 
     let input = Paragraph::new(prompt)
         .style(theme::input_prompt())
+        .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::TOP)
@@ -923,12 +996,28 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
     f.render_widget(input, area);
 
     if !state.thinking {
-        let display_width: usize = state.input.buffer[..state.input.cursor]
-            .chars()
-            .map(|c| if c.is_ascii() { 1 } else { 2 })
-            .sum();
-        let cx = area.x + 3 + display_width as u16;
-        let cy = area.y + 1;
+        let inner_width = (area.width.saturating_sub(2)).max(1) as usize;
+        let paste_prefix = state.input.paste_prefix();
+        let paste_width: usize = paste_prefix.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+        let mut x: usize = 2 + paste_width;
+        let mut y: u16 = 0;
+        for c in state.input.buffer[..state.input.cursor].chars() {
+            if c == '\n' {
+                y += 1;
+                x = 0;
+            } else {
+                let w = if c.is_ascii() { 1 } else { 2 };
+                if x + w > inner_width {
+                    y += 1;
+                    x = w;
+                } else {
+                    x += w;
+                }
+            }
+        }
+        let cx = area.x + 1 + x as u16;
+        let max_y = area.y + area.height.saturating_sub(1);
+        let cy = (area.y + 1 + y).min(max_y);
         f.set_cursor_position((cx, cy));
     }
 }

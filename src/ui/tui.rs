@@ -877,18 +877,40 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
 fn draw_hitl_overlay(f: &mut Frame, state: &mut TuiState) {
     let area = f.area();
     let dw = 60u16.min(area.width.saturating_sub(4));
-    let dh = 7u16;
-    let dx = (area.width.saturating_sub(dw)) / 2;
-    let dy = (area.height.saturating_sub(dh)) / 2;
-    let dialog_area = Rect::new(dx, dy, dw, dh);
-
-    f.render_widget(Clear, dialog_area);
 
     let h = state.hitl.as_ref().unwrap();
     let content = format!(
         "\u{26a0} \u{786e}\u{8ba4}\u{6267}\u{884c}\n\n{}\n\n[y] \u{5141}\u{8bb8}  [n] \u{62d2}\u{7edd}",
         h.desc
     );
+
+    // ── Dynamic dialog height ──
+    // The old fixed height of 7 was too small: with borders (2) + padding (2)
+    // only 3 content lines were visible, so the "[y] 允许  [n] 拒绝" prompt was
+    // clipped whenever the description occupied more than one line.  Calculate
+    // the needed height from the content, accounting for wrapping and CJK width.
+    // 动态弹窗高度：旧固定值 7 太小——减去边框(2)+内边距(2)后仅 3 行可见，
+    // 描述超过一行时 "[y] 允许  [n] 拒绝" 提示被截断，用户看不到该按什么键。
+    let inner_width = (dw.saturating_sub(4)).max(1) as usize; // 2 borders + 2 padding
+    let est_lines: u16 = content
+        .lines()
+        .map(|line| {
+            // Estimate display width: ASCII = 1 col, CJK = 2 cols.
+            let display_width: usize = line.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+            if display_width == 0 {
+                1u16
+            } else {
+                (((display_width + inner_width - 1) / inner_width) as u16).max(1)
+            }
+        })
+        .sum();
+    let dh = (est_lines + 4).min(area.height.saturating_sub(4)).max(7);
+
+    let dx = (area.width.saturating_sub(dw)) / 2;
+    let dy = (area.height.saturating_sub(dh)) / 2;
+    let dialog_area = Rect::new(dx, dy, dw, dh);
+
+    f.render_widget(Clear, dialog_area);
 
     let dialog = Paragraph::new(content)
         .style(theme::hitl_prompt())

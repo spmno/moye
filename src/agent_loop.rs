@@ -66,16 +66,41 @@ impl HitlHook {
     /// 向 TUI 发送 HITL 确认请求，等待用户按键。
     /// Sends a HITL confirmation request to the TUI, waits for user keypress.
     async fn confirm(&self, tool_name: &str, desc: &str) -> bool {
-        self.waiting.store(true, Ordering::Relaxed);
+        // Use a guard so `waiting` is always reset — even if this future is
+        // dropped (cancelled) while awaiting the user's response.  Without
+        // this, a cancelled `confirm()` would leave `waiting = true` forever,
+        // causing `consume_stream` to skip the timeout on every subsequent
+        // iteration.
+        // 使用 guard 确保 `waiting` 总是被重置——即使此 future 在等待用户
+        // 响应时被丢弃（取消）。否则，被取消的 `confirm()` 会永远留下
+        // `waiting = true`，导致 `consume_stream` 在后续每次迭代中跳过超时。
+        let _guard = WaitingGuard::new(self.waiting.clone());
         let (resp_tx, resp_rx) = oneshot::channel();
         let _ = self.tx.send(AgentEvent::HitlPrompt {
             tool: tool_name.to_string(),
             desc: desc.to_string(),
             responder: resp_tx,
         });
-        let result = resp_rx.await.unwrap_or(false);
-        self.waiting.store(false, Ordering::Relaxed);
-        result
+        resp_rx.await.unwrap_or(false)
+    }
+}
+
+/// RAII guard that sets `waiting` to `true` on creation and `false` on drop.
+/// RAII 守卫：创建时设置 `waiting` 为 `true`，销毁时重置为 `false`。
+struct WaitingGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl WaitingGuard {
+    fn new(flag: Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::Relaxed);
+        Self { flag }
+    }
+}
+
+impl Drop for WaitingGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Relaxed);
     }
 
     async fn maybe_run_interactive(&self, tool_name: &str, args: &str) -> Option<Flow> {
@@ -442,11 +467,37 @@ pub async fn consume_stream<R>(
     let mut all_reasoning = String::new();
 
     loop {
+        // When a HITL prompt is active the stream is blocked inside the hook's
+        // `confirm()` future awaiting the user's keypress.  The `hitl_waiting`
+        // flag is set *during* `stream.next()` (inside `confirm()`), so it may
+        // be false on entry but become true mid-call.  If the 120-second
+        // timeout fires while HITL is active the stream future is dropped,
+        // which cancels `confirm()` and orphans the oneshot responder still
+        // held by the TUI.  To avoid this we retry without a timeout when the
+        // flag is set.
+        // 当 HITL 确认处于活动状态时，流被阻塞在 hook 的 `confirm()` future 中
+        // 等待用户按键。`hitl_waiting` 标志是在 `stream.next()` 期间（在
+        // `confirm()` 内部）设置的，因此进入时可能为 false 但中途变为 true。
+        // 如果 120 秒超时在 HITL 活动期间触发，流 future 被丢弃，会取消
+        // `confirm()` 并使 TUI 仍持有的 oneshot responder 成为孤儿。为避免
+        // 此问题，当标志被设置时无超时重试。
         let next = match &hitl_waiting {
             Some(flag) if flag.load(Ordering::Relaxed) => stream.next().await,
             _ => match tokio::time::timeout(CHUNK_TIMEOUT, stream.next()).await {
                 Ok(item) => item,
                 Err(_) => {
+                    // Check whether HITL started during the timed wait.
+                    // 检查 HITL 是否在超时等待期间开始。
+                    if let Some(flag) = &hitl_waiting {
+                        if flag.load(Ordering::Relaxed) {
+                            // HITL became active mid-timeout — retry without
+                            // a deadline so the user has unlimited time to
+                            // respond.
+                            // HITL 在超时期间变为活动——无截止时间重试，
+                            // 让用户有无限时间响应。
+                            continue;
+                        }
+                    }
                     return Err(anyhow::anyhow!(
                         "SSE \u{7a7a}\u{95f2}\u{8d85}\u{65f6}\u{ff08}{}\u{79d2}\u{65e0}\u{6570}\u{636e}\u{ff09}\u{ff0c}\u{53ef}\u{80fd}\u{8fde}\u{63a5}\u{5df2}\u{65ad}\u{5f00}",
                         CHUNK_TIMEOUT.as_secs()

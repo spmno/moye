@@ -358,7 +358,7 @@ fn log_event(event: &AgentEvent) {
 fn render_event(event: &AgentEvent) -> Vec<Line<'static>> {
     match event {
         AgentEvent::User(text) => {
-            let mut v = vec![Line::styled(format!("\u{00bb} {text}"), theme::user_msg())];
+            let mut v = vec![Line::styled(format!("\u{276f} {text}"), theme::user_msg())];
             v.push(Line::default());
             v
         }
@@ -986,7 +986,7 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let prompt = if state.thinking {
         "\u{2026}".to_string()
     } else {
-        format!("\u{00bb} {}", state.input.display_text())
+        state.input.display_text()
     };
 
     let input = Paragraph::new(prompt)
@@ -1005,7 +1005,7 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
         let inner_width = (area.width.saturating_sub(2)).max(1) as usize;
         let paste_prefix = state.input.paste_prefix();
         let paste_width: usize = paste_prefix.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
-        let mut x: usize = 2 + paste_width;
+        let mut x: usize = paste_width;
         let mut y: u16 = 0;
         for c in state.input.buffer[..state.input.cursor].chars() {
             if c == '\n' {

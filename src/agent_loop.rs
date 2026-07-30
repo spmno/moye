@@ -77,6 +77,27 @@ impl HitlHook {
         self.waiting.store(false, Ordering::Relaxed);
         result
     }
+
+    async fn maybe_run_interactive(&self, tool_name: &str, args: &str) -> Option<Flow> {
+        if tool_name != "run_bash" {
+            return None;
+        }
+        let parsed = serde_json::from_str::<serde_json::Value>(args).ok()?;
+        let cmd = parsed.get("command")?.as_str()?;
+        if !needs_interactive_terminal(cmd) {
+            return None;
+        }
+        let _ = self.tx.send(AgentEvent::Info(
+            format!("  [\u{1f501}] \u{4ea4}\u{4e92}\u{5f0f}\u{547d}\u{4ee4}\u{ff0c}\u{6682}\u{505c} TUI: {cmd}"),
+        ));
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let _ = self.tx.send(AgentEvent::SuspendTui {
+            command: cmd.to_string(),
+            responder: resp_tx,
+        });
+        let output = resp_rx.await.unwrap_or_default();
+        Some(Flow::Skip { reason: output })
+    }
 }
 
 impl<M: CompletionModel> AgentHook<M> for HitlHook {
@@ -133,6 +154,9 @@ impl<M: CompletionModel> AgentHook<M> for HitlHook {
                         let _ = self.tx.send(AgentEvent::Info(
                             "  [HITL] \u{81ea}\u{52a8}\u{5141}\u{8bb8}".into(),
                         ));
+                        if let Some(flow) = self.maybe_run_interactive(tool_name, args).await {
+                            return flow;
+                        }
                         Flow::Continue
                     }
                     Permission::Deny => {
@@ -148,6 +172,9 @@ impl<M: CompletionModel> AgentHook<M> for HitlHook {
                     Permission::Ask => {
                         let desc = format_tool_call_desc(tool_name, args);
                         if self.confirm(tool_name, &desc).await {
+                            if let Some(flow) = self.maybe_run_interactive(tool_name, args).await {
+                                return flow;
+                            }
                             Flow::Continue
                         } else {
                             Flow::Skip {
@@ -190,6 +217,21 @@ impl<M: CompletionModel> AgentHook<M> for HitlHook {
 /// Formats tool call arguments into a human-readable description.
 /// 例如 `read_file` 打印读取的文件路径，`run_bash` 打印执行的命令。
 /// For example, `read_file` prints the file path being read, `run_bash` prints the command being executed.
+fn needs_interactive_terminal(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    if words.contains(&"sudo") && !words.contains(&"-n") {
+        return true;
+    }
+    if words.contains(&"su") {
+        return true;
+    }
+    if words.contains(&"passwd") {
+        return true;
+    }
+    false
+}
+
 fn format_tool_call_desc(tool_name: &str, args: &str) -> String {
     let parsed = serde_json::from_str::<serde_json::Value>(args).ok();
     let get_str = |key: &str| -> Option<String> {

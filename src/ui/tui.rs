@@ -202,6 +202,7 @@ struct TuiState {
     /// 当前运行中的后台任务句柄。按 Esc 可 abort 中断。
     /// Handle to the currently running background task. Press Esc to abort.
     task_handle: Option<JoinHandle<()>>,
+    needs_full_redraw: bool,
 }
 
 impl TuiState {
@@ -226,6 +227,7 @@ impl TuiState {
             tool_names,
             skill_names,
             task_handle: None,
+            needs_full_redraw: false,
         }
     }
 
@@ -300,6 +302,9 @@ fn log_event(event: &AgentEvent) {
         }
         AgentEvent::HitlPrompt { tool, desc, .. } => {
             info!("[TUI] HITL 确认请求: {tool} | {desc}");
+        }
+        AgentEvent::SuspendTui { command, .. } => {
+            info!("[TUI] \u{6682}\u{505c} TUI \u{8fd0}\u{884c}\u{4ea4}\u{4e92}\u{5f0f}\u{547d}\u{4ee4}: {command}");
         }
         // 瞬态流式事件不单独记录（最终 Agent 输出已覆盖）
         AgentEvent::TextDelta(_) | AgentEvent::ReasoningDelta(_) => {}
@@ -438,6 +443,12 @@ async fn run_loop(
     tick: &mut tokio::time::Interval,
 ) -> anyhow::Result<()> {
     loop {
+        if state.needs_full_redraw {
+            if let Ok(size) = terminal.size() {
+                let _ = terminal.resize(Rect::new(0, 0, size.width, size.height));
+            }
+            state.needs_full_redraw = false;
+        }
         terminal.draw(|f| draw(f, state))?;
 
         tokio::select! {
@@ -731,6 +742,44 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
                     responder,
                 });
             }
+        }
+        AgentEvent::SuspendTui { command, responder } => {
+            let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+
+            println!("\n--- \u{4ea4}\u{4e92}\u{5f0f}\u{547d}\u{4ee4} / Interactive command ---");
+            println!("$ {}\n", command);
+
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .output();
+
+            let output = match out {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let msg = format!("exit={}\nstdout:\n{}\nstderr:\n{}",
+                        out.status.code().unwrap_or(-1), stdout, stderr);
+                    println!("\n{}", msg);
+                    msg
+                }
+                Err(e) => {
+                    let msg = format!("Error: {}", e);
+                    println!("\n{}", msg);
+                    msg
+                }
+            };
+
+            println!("\n--- \u{6309} Enter \u{8fd4}\u{56de} TUI / Press Enter to return to TUI ---");
+            let mut input = String::new();
+            let _ = std::io::stdin().read_line(&mut input);
+
+            let _ = enable_raw_mode();
+            let _ = execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture);
+
+            state.needs_full_redraw = true;
+            let _ = responder.send(output);
         }
         AgentEvent::AgentStarted => {
             state.thinking = true;

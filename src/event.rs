@@ -51,6 +51,13 @@ pub enum AgentEvent {
         desc: String,
         responder: oneshot::Sender<bool>,
     },
+    /// 暂停 TUI 以运行交互式命令（如 sudo），完成后恢复 TUI 并返回输出。
+    /// Suspend the TUI to run an interactive command (e.g., sudo), resume after completion
+    /// and return the captured stdout+stderr to the agent loop.
+    SuspendTui {
+        command: String,
+        responder: oneshot::Sender<String>,
+    },
 
     // ===== 持久：存入消息历史 =====
     // ===== Persistent: stored in message history =====

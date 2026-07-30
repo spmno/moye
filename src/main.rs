@@ -2,6 +2,7 @@
 // Program entry point: logging initialization, context construction, TUI launch.
 mod agent_loop;
 mod cli;
+mod context;
 mod event;
 mod evolution;
 mod memory;

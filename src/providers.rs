@@ -3,7 +3,7 @@
 // 均使用 OpenAI 兼容接口，Bailian 百炼平台和 Moonshot Kimi 平台通过自定义 base URL 接入。
 // All providers use the OpenAI-compatible interface; Bailian and Moonshot Kimi connect via custom base URLs.
 use anyhow::Result;
-use rig_core::providers::openai::{self, CompletionsClient};
+pub use rig_core::providers::openai::{self, CompletionsClient};
 use tracing::info;
 
 /// 供应商类型。
@@ -114,3 +114,72 @@ pub fn provider_additional_params() -> serde_json::Value {
 /// 对话型 Agent 别名：基于 OpenAI CompletionModel 的 rig Agent（兼容所有供应商）。
 /// Chat Agent alias: a rig Agent based on OpenAI CompletionModel (compatible with all providers).
 pub type ChatAgent = rig_core::agent::Agent<openai::CompletionModel>;
+
+impl Provider {
+    /// 该供应商的默认上下文窗口大小（tokens）。
+    /// Default context window size (tokens) for this provider.
+    pub fn context_limit(&self) -> usize {
+        match self {
+            Provider::DeepSeek => 128_000,
+            Provider::Bailian => 128_000,
+            Provider::Moonshot => 256_000,
+            Provider::Custom => 128_000,
+        }
+    }
+}
+
+/// 根据模型 slug 解析上下文窗口大小。无法识别时回退到当前供应商默认值。
+/// Resolve context window size by model slug. Falls back to the current provider default
+/// when the model is unrecognized.
+pub fn context_limit_for_model(model: &str) -> usize {
+    let provider = Provider::from_env();
+    let lower = model.to_lowercase();
+    // 模型特定的覆盖 / Model-specific overrides
+    if lower.contains("kimi") {
+        return 256_000;
+    }
+    if lower.contains("deepseek") {
+        return 128_000;
+    }
+    if lower.contains("qwen-max") {
+        return 32_000;
+    }
+    if lower.contains("qwen-plus") {
+        return 128_000;
+    }
+    // 回退到供应商默认值 / Fall back to provider default
+    provider.context_limit()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deepseek_provider_context_limit() {
+        assert_eq!(Provider::DeepSeek.context_limit(), 128_000);
+    }
+
+    #[test]
+    fn moonshot_provider_context_limit() {
+        assert_eq!(Provider::Moonshot.context_limit(), 256_000);
+    }
+
+    #[test]
+    fn context_limit_for_kimi_model() {
+        assert_eq!(context_limit_for_model("kimi-k3"), 256_000);
+    }
+
+    #[test]
+    fn context_limit_for_deepseek_model() {
+        assert_eq!(context_limit_for_model("deepseek-v4-pro"), 128_000);
+    }
+
+    #[test]
+    fn context_limit_for_unknown_falls_back() {
+        // 未知模型应回退到供应商默认值，不 panic。
+        // Unknown model should fall back to provider default, no panic.
+        let limit = context_limit_for_model("unknown-model-xyz");
+        assert!(limit > 0);
+    }
+}

@@ -12,9 +12,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
-use rig_core::agent::{AgentHook, Flow, HookContext, StepEvent};
+use rig_core::agent::{
+    AgentHook, Flow, HookContext, RequestPatch, StepEvent, StepEventKind,
+};
 use rig_core::client::CompletionClient;
-use rig_core::completion::{CompletionModel, Usage};
+use rig_core::completion::{CompletionModel, Message, Usage};
 use rig_core::providers::openai::CompletionModel as OpenAiModel;
 use rig_core::tool::ToolDyn;
 use tokio::sync::oneshot;
@@ -83,25 +85,6 @@ impl HitlHook {
         });
         resp_rx.await.unwrap_or(false)
     }
-}
-
-/// RAII guard that sets `waiting` to `true` on creation and `false` on drop.
-/// RAII 守卫：创建时设置 `waiting` 为 `true`，销毁时重置为 `false`。
-struct WaitingGuard {
-    flag: Arc<AtomicBool>,
-}
-
-impl WaitingGuard {
-    fn new(flag: Arc<AtomicBool>) -> Self {
-        flag.store(true, Ordering::Relaxed);
-        Self { flag }
-    }
-}
-
-impl Drop for WaitingGuard {
-    fn drop(&mut self) {
-        self.flag.store(false, Ordering::Relaxed);
-    }
 
     async fn maybe_run_interactive(&self, tool_name: &str, args: &str) -> Option<Flow> {
         if tool_name != "run_bash" {
@@ -122,6 +105,25 @@ impl Drop for WaitingGuard {
         });
         let output = resp_rx.await.unwrap_or_default();
         Some(Flow::Skip { reason: output })
+    }
+}
+
+/// RAII guard that sets `waiting` to `true` on creation and `false` on drop.
+/// RAII 守卫：创建时设置 `waiting` 为 `true`，销毁时重置为 `false`。
+struct WaitingGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl WaitingGuard {
+    fn new(flag: Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::Relaxed);
+        Self { flag }
+    }
+}
+
+impl Drop for WaitingGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Relaxed);
     }
 }
 
@@ -235,6 +237,193 @@ impl<M: CompletionModel> AgentHook<M> for HitlHook {
 
             _ => Flow::Continue,
         }
+    }
+}
+
+/// 上下文管理 Hook：在每轮 API 调用前检测 token 溢出，溢出时压缩旧对话历史。
+/// Context management Hook: detects token overflow before each API call,
+/// compacting old conversation history when the threshold is exceeded.
+///
+/// 利用 rig 的 `Flow::PatchRequest` + `RequestPatch::history()`，
+/// Uses rig's `Flow::PatchRequest` + `RequestPatch::history()`,
+/// 替换当轮发送给 API 的历史（不影响 rig 内部持久化的真实历史）。
+/// replacing the history sent to the API for this turn only (without modifying
+/// rig's internally persisted real history).
+///
+/// 同时在 `ModelTurnFinished` 时记录 API 返回的实际 token 用量，
+/// Also records actual token usage from the API on `ModelTurnFinished`,
+/// 用于校准溢出检测。
+/// calibrating overflow detection.
+pub struct ContextHook {
+    budget: Arc<Mutex<crate::context::TokenBudget>>,
+    config: crate::context::ContextConfig,
+    client: crate::providers::CompletionsClient,
+    model: String,
+    tx: EventSender,
+    /// 缓存：(压缩时的历史长度, 压缩后的历史)。历史未变时复用。
+    /// Cache: (history length at compaction, compacted history). Reused when history unchanged.
+    compaction_cache: Arc<Mutex<Option<(usize, Vec<Message>)>>>,
+}
+
+impl ContextHook {
+    /// 创建上下文管理 Hook。
+    /// Create a context management hook.
+    pub fn new(
+        context_limit: usize,
+        config: crate::context::ContextConfig,
+        client: crate::providers::CompletionsClient,
+        model: String,
+        tx: EventSender,
+    ) -> Self {
+        let budget = crate::context::TokenBudget::new(context_limit, config.max_output_tokens);
+        Self {
+            budget: Arc::new(Mutex::new(budget)),
+            config,
+            client,
+            model,
+            tx,
+            compaction_cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// 检测溢出并在必要时压缩历史，返回 `Flow::PatchRequest` 或 `Flow::Continue`。
+    /// Detect overflow and compact if needed, returning `Flow::PatchRequest` or `Flow::Continue`.
+    async fn handle_completion_call(&self, history: &[Message], _turn: usize) -> Flow {
+        let estimated = crate::context::estimate_history_tokens(history);
+        let is_overflow = {
+            let budget = self.budget.lock().unwrap();
+            if budget.last_input_tokens() > 0 {
+                budget.is_near_overflow(
+                    budget.last_input_tokens() as usize,
+                    self.config.compaction_threshold,
+                )
+            } else {
+                budget.is_near_overflow(estimated, self.config.compaction_threshold)
+            }
+        };
+
+        if !is_overflow {
+            return Flow::Continue;
+        }
+
+        // 检查缓存：历史长度未变时复用上次的压缩结果。
+        // Check cache: reuse last compaction when history length is unchanged.
+        {
+            let cache = self.compaction_cache.lock().unwrap();
+            if let Some((cached_len, ref cached_history)) = *cache {
+                if cached_len == history.len() {
+                    info!(
+                        cached_len,
+                        "reusing cached compaction"
+                    );
+                    return Flow::patch_request(
+                        RequestPatch::new().history(cached_history.clone()),
+                    );
+                }
+            }
+        }
+
+        // 切分历史：旧消息（待压缩）+ 近期消息（保留）。
+        // Split history: old messages (to compact) + recent messages (to keep).
+        let (old, recent) =
+            crate::context::split_history(history, self.config.keep_recent_turns);
+        if old.is_empty() {
+            return Flow::Continue;
+        }
+
+        // 通过 LLM 摘要旧消息。
+        // Summarize old messages via LLM.
+        let summary_prompt = crate::context::format_messages_for_summary(&old);
+        let summary = match self.compact_via_llm(&summary_prompt).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("compaction LLM call failed: {e}");
+                // 回退：用截断的旧消息文本作为摘要。
+                // Fallback: use truncated old message text as summary.
+                crate::context::format_messages_for_summary(&old)
+            }
+        };
+
+        // 构建压缩后的历史：[摘要 system 消息, ...近期消息]。
+        // Build compacted history: [summary system message, ...recent messages].
+        let summary_msg = Message::system(format!(
+            "[对话历史摘要 / Conversation Summary]\n{summary}"
+        ));
+        let compacted: Vec<Message> = std::iter::once(summary_msg)
+            .chain(recent.iter().cloned())
+            .collect();
+
+        let new_tokens = crate::context::estimate_history_tokens(&compacted);
+
+        // 缓存结果。
+        // Cache the result.
+        *self.compaction_cache.lock().unwrap() =
+            Some((history.len(), compacted.clone()));
+
+        let _ = self.tx.send(AgentEvent::ContextCompacted {
+            old_tokens: estimated,
+            new_tokens,
+        });
+        let _ = self.tx.send(AgentEvent::Info(format!(
+            "  [上下文压缩 / context compacted] {estimated} → {new_tokens} tokens"
+        )));
+
+        Flow::patch_request(RequestPatch::new().history(compacted))
+    }
+
+    /// 调用 LLM 生成对话历史摘要。
+    /// Call the LLM to generate a conversation history summary.
+    async fn compact_via_llm(&self, prompt: &str) -> anyhow::Result<String> {
+        let agent = self
+            .client
+            .agent(&self.model)
+            .preamble(crate::context::COMPACTION_PREAMBLE)
+            .temperature(0.0)
+            .build();
+        let resp = agent
+            .runner(prompt)
+            .max_turns(1)
+            .run()
+            .await
+            .map_err(|e| anyhow::anyhow!("compaction failed: {e}"))?;
+        Ok(resp.output)
+    }
+
+    /// 记录 API 返回的实际 token 用量。
+    /// Record actual token usage from the API response.
+    fn handle_model_turn_finished(&self, usage: &Usage) {
+        let mut budget = self.budget.lock().unwrap();
+        budget.record_usage(usage);
+        info!(
+            input = usage.input_tokens,
+            output = usage.output_tokens,
+            accumulated_input = budget.accumulated_input(),
+            "token usage recorded"
+        );
+    }
+}
+
+impl<M: CompletionModel> AgentHook<M> for ContextHook {
+    async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
+        match event {
+            StepEvent::CompletionCall { history, turn, .. } => {
+                self.handle_completion_call(history, turn).await
+            }
+            StepEvent::ModelTurnFinished { usage, .. } => {
+                self.handle_model_turn_finished(&usage);
+                Flow::Continue
+            }
+            _ => Flow::Continue,
+        }
+    }
+
+    /// 只观察低频事件，跳过高频 delta 事件以提升性能。
+    /// Observe only low-frequency events, skipping high-frequency deltas for performance.
+    fn observes(&self, kind: StepEventKind) -> bool {
+        matches!(
+            kind,
+            StepEventKind::CompletionCall | StepEventKind::ModelTurnFinished
+        )
     }
 }
 
@@ -405,12 +594,28 @@ pub async fn run_autonomous(
         let hitl_waiting = Arc::new(AtomicBool::new(false));
         let hook = HitlHook::new(perms, hitl_waiting.clone(), tx.clone(), sandbox.clone());
 
+        let model = registry
+            .session_model()
+            .or_else(|| registry.role_config(role).map(|c| c.model.clone()))
+            .unwrap_or_else(|| registry.effective_model());
+        let context_limit = crate::providers::context_limit_for_model(&model);
+        let context_config = registry.context_config().clone();
+        let context_client = crate::providers::create_client()?;
+        let context_hook = ContextHook::new(
+            context_limit,
+            context_config,
+            context_client,
+            model,
+            tx.clone(),
+        );
+
         let agent = build_runner_agent(registry, role)?;
         let stream = agent
             .runner(&prompt)
             .max_turns(max_turns)
             .max_invalid_tool_call_retries(3)
             .add_hook(hook)
+            .add_hook(context_hook)
             .stream()
             .await;
 
@@ -572,7 +777,7 @@ fn build_runner_agent(
     let model = registry.session_model().unwrap_or_else(|| rc.model.clone());
     let max_turns = registry.max_turns();
     info!("[runner] role={role:?} model={model} max_turns={max_turns}");
-    let tools: Vec<Box<dyn ToolDyn>> = crate::tools::builtin_tools()?;
+    let tools: Vec<Box<dyn ToolDyn>> = crate::tools::builtin_tools(registry.context_config())?;
     let params = crate::providers::provider_additional_params();
     let agent = client
         .agent(&model)

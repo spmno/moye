@@ -345,8 +345,10 @@ fn log_event(event: &AgentEvent) {
         AgentEvent::SuspendTui { command, .. } => {
             info!("[TUI] \u{6682}\u{505c} TUI \u{8fd0}\u{884c}\u{4ea4}\u{4e92}\u{5f0f}\u{547d}\u{4ee4}: {command}");
         }
-        // 瞬态流式事件不单独记录（最终 Agent 输出已覆盖）
         AgentEvent::TextDelta(_) | AgentEvent::ReasoningDelta(_) => {}
+        AgentEvent::ContextCompacted { old_tokens, new_tokens } => {
+            info!("[TUI] 上下文压缩: {old_tokens} → {new_tokens} tokens");
+        }
     }
 }
 
@@ -852,6 +854,10 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
         // User 和 System 事件由 handle_command 直接 push——
         // 它们不经过 channel 传递。
         AgentEvent::User(_) | AgentEvent::System(_) => {}
+        AgentEvent::ContextCompacted { old_tokens, new_tokens } => {
+            state.push_event(AgentEvent::ContextCompacted { old_tokens, new_tokens });
+            state.reset_scroll();
+        }
     }
 }
 

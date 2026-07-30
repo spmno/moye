@@ -18,6 +18,13 @@ default_model = "deepseek-v4-pro"
 # 自主循环上限：agent 最多执行的轮数。
 max_turns = 20
 
+[context]
+max_output_tokens = 4096
+compaction_threshold = 0.75
+keep_recent_turns = 6
+max_bash_output_chars = 20000
+max_read_lines = 500
+
 # 各角色选择自己的模型与提示词文件。可用 REPL 命令 model <slug> 全局覆盖。
 # 按工具的 HITL（人在环）权限分级：
 #   allow = 自动执行不询问；ask = 暂停请人类确认；deny = 拦截调用并说明原因。

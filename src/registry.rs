@@ -104,6 +104,8 @@ pub struct AgentRegistryConfig {
     pub agent: AgentSection,
     #[serde(rename = "agents")]
     pub roles: std::collections::HashMap<String, RoleConfig>,
+    #[serde(default)]
+    pub context: crate::context::ContextConfig,
 }
 
 impl AgentRegistryConfig {
@@ -218,6 +220,12 @@ impl AgentRegistry {
         self.config.max_turns()
     }
 
+    /// 上下文管理配置（token 预算、压缩阈值、截断限制）。
+    /// Context management config (token budget, compaction threshold, truncation limits).
+    pub fn context_config(&self) -> &crate::context::ContextConfig {
+        &self.config.context
+    }
+
     /// 为指定角色构建 Agent（带工具或纯对话，取决于权限）。
     /// Builds an Agent for the specified role (with tools or pure chat, depending on permissions).
     pub fn build(&self, role: Role) -> anyhow::Result<RoleAgent> {
@@ -249,7 +257,7 @@ impl AgentRegistry {
         let max_turns = self.max_turns();
         info!("[build] role={key} model={model} max_turns={max_turns}");
         let agent = if with_tools {
-            let tools = crate::tools::builtin_tools()?;
+            let tools = crate::tools::builtin_tools(self.context_config())?;
             client
                 .agent(&model)
                 .preamble(&preamble)

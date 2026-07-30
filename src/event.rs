@@ -86,6 +86,12 @@ pub enum AgentEvent {
     /// 信息性消息。
     /// Informational message.
     Info(String),
+    /// 上下文压缩完成——旧消息被摘要替代以适应 token 预算。
+    /// Context compacted — old messages were summarized to fit within the token budget.
+    ContextCompacted {
+        old_tokens: usize,
+        new_tokens: usize,
+    },
 }
 
 /// 事件 channel 发送端。

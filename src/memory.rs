@@ -1,8 +1,14 @@
-// 核心记忆/经验存储模块：会话 Turn + 教训 Lesson + 规则 Rule。
-// Core memory/experience store module: conversation Turn + Lesson + Rule.
+// 核心记忆/经验存储模块：会话 Turn + 教训 Lesson。
+// Core memory/experience store module: conversation Turn + Lesson.
 // 被 AppContext（cli/context.rs）在每次任务完成后调用：
 // Called by AppContext (cli/context.rs) after each task completes:
-// append_turn → record_lesson → observe_rule → promote_rule_to_agents_md。
+// append_turn → record_lesson。
+// 教训积累后，由 PromptEvolver（evolution/prompt_evolve.rs）在 /evolve 时
+// 汇总注入元 Agent 的提案提示词，驱动 benchmark 门控的提示词进化——
+// 而非直接向 AGENTS.md 追加低质量自动文本。
+// Lessons are aggregated by PromptEvolver during /evolve, injected into the
+// meta-agent's proposal prompt to drive benchmark-gated prompt evolution—
+// rather than crudely auto-appending to AGENTS.md.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -25,15 +31,6 @@ pub struct Lesson {
     pub ts: u64,
 }
 
-/// 一条被反复观察到的行为规则，count 达到阈值后会被提升进 AGENTS.md。
-/// A repeatedly observed behavior rule; once `count` reaches the threshold it is promoted into AGENTS.md.
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Rule {
-    pub text: String,
-    pub count: u32,
-    pub written_to: bool,
-}
-
 /// 记忆存储的路径配置（来自 agent.toml 的 [memory] 段）。
 /// Path configuration for the memory store (from the `[memory]` section of agent.toml).
 #[derive(Debug, Deserialize)]
@@ -41,15 +38,13 @@ pub struct MemoryConfig {
     pub dir: PathBuf,
     pub conversation_file: String,
     pub lessons_file: String,
-    pub rules_file: String,
 }
 
-/// 记忆存储：管理会话、经验、规则的 JSONL / JSON 文件读写。
-/// Memory store: manages read/write of conversation, lesson, and rule JSONL/JSON files.
+/// 记忆存储：管理会话与经验的 JSONL 文件读写。
+/// Memory store: manages read/write of conversation and lesson JSONL files.
 pub struct MemoryStore {
     conversation_file: PathBuf,
     lessons_file: PathBuf,
-    rules_file: PathBuf,
 }
 
 impl MemoryStore {
@@ -60,7 +55,6 @@ impl MemoryStore {
         Ok(Self {
             conversation_file: cfg.dir.join(&cfg.conversation_file),
             lessons_file: cfg.dir.join(&cfg.lessons_file),
-            rules_file: cfg.dir.join(&cfg.rules_file),
         })
     }
 
@@ -87,73 +81,6 @@ impl MemoryStore {
             .append(true)
             .open(&self.lessons_file)?;
         writeln!(f, "{line}")?;
-        Ok(())
-    }
-
-    /// 记录一条被观察到的行为规则。返回 true 表示它刚刚跨过升级阈值，
-    /// 应当被提升写入 AGENTS.md。
-    /// Record an observed behavior rule. Returns true if it just crossed the escalation threshold
-    /// and should be promoted into AGENTS.md.
-    pub fn observe_rule(&self, text: &str, threshold: u32) -> Result<bool> {
-        let mut rules = self.load_rules()?;
-        let existing = rules.iter().position(|r| r.text == text);
-        match existing {
-            Some(idx) => {
-                rules[idx].count += 1;
-                let crossed = rules[idx].count >= threshold && !rules[idx].written_to;
-                if crossed {
-                    rules[idx].written_to = true;
-                }
-                self.save_rules(&rules)?;
-                Ok(crossed)
-            }
-            None => {
-                rules.push(Rule {
-                    text: text.to_string(),
-                    count: 1,
-                    written_to: false,
-                });
-                let crossed = 1 >= threshold;
-                if crossed {
-                    rules.last_mut().unwrap().written_to = true;
-                }
-                self.save_rules(&rules)?;
-                Ok(crossed)
-            }
-        }
-    }
-
-    /// 加载所有规则；规则文件不存在时返回空 Vec。
-    /// Load all rules; returns an empty Vec when the rules file does not exist.
-    pub fn load_rules(&self) -> Result<Vec<Rule>> {
-        if !self.rules_file.exists() {
-            return Ok(vec![]);
-        }
-        let raw = std::fs::read_to_string(&self.rules_file)?;
-        let rules: Vec<Rule> = serde_json::from_str(&raw)?;
-        Ok(rules)
-    }
-
-    /// 把已升级的规则追加到 AGENTS.md，使其成为持久的行为指令。
-    /// 返回实际写入的新段落文本。
-    /// Append an escalated rule to AGENTS.md so it becomes a persistent behavior directive.
-    /// Returns the section text that was actually written.
-    pub fn promote_rule_to_agents_md(&self, rule: &str, path: &str) -> Result<String> {
-        let section = format!("\n## Escalated rule\n- {rule}\n");
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        writeln!(f, "{section}")?;
-        Ok(section)
-    }
-
-    /// 持久化全部规则到 rules JSON 文件（pretty-printed）。
-    /// Persist all rules to the rules JSON file (pretty-printed).
-    fn save_rules(&self, rules: &[Rule]) -> Result<()> {
-        let raw = serde_json::to_string_pretty(rules)?;
-        std::fs::write(&self.rules_file, raw)?;
         Ok(())
     }
 

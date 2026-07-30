@@ -1,8 +1,8 @@
 /// CLI 应用上下文模块：聚合 [`AgentRegistry`]、[`Orchestrator`]、[`MemoryStore`]、
-/// [`PromptEvolver`] 与升级阈值，作为 TUI 命令分发与任务执行的统一入口。
+/// [`PromptEvolver`]，作为 TUI 命令分发与任务执行的统一入口。
 /// CLI application context module: aggregates [`AgentRegistry`], [`Orchestrator`],
-/// [`MemoryStore`], [`PromptEvolver`] and the escalation threshold, serving as the
-/// single entry point for TUI command dispatch and task execution.
+/// [`MemoryStore`], [`PromptEvolver`], serving as the single entry point for
+/// TUI command dispatch and task execution.
 use crate::event::{AgentEvent, EventSender};
 use crate::evolution::prompt_evolve::PromptEvolver;
 use crate::memory::{Lesson, MemoryStore, Turn};
@@ -17,7 +17,7 @@ pub struct AppContext {
     pub orchestrator: Orchestrator,
     pub memory: MemoryStore,
     pub evolver: PromptEvolver,
-    pub rule_threshold: u32,
+    pub rule_threshold: usize,
 }
 
 impl AppContext {
@@ -43,10 +43,11 @@ impl AppContext {
         }
     }
 
-    /// `/evolve`：触发提示词进化（评估后择优采纳），返回面向用户的提示文本。
-    /// `/evolve`: trigger prompt evolution (evaluate then adopt the best), returning user-facing text.
+    /// `/evolve`：触发提示词进化（注入经验教训 → 评估后择优采纳），返回面向用户的提示文本。
+    /// `/evolve`: trigger prompt evolution (inject lessons → evaluate → adopt best), returning user-facing text.
     pub async fn cmd_evolve(&self, tx: &EventSender) -> String {
-        match self.evolver.evolve(tx).await {
+        let lessons = self.memory.load_lessons().unwrap_or_default();
+        match self.evolver.evolve(&lessons, tx).await {
             Ok(msg) => msg,
             Err(e) => format!("evolve error: {e}"),
         }
@@ -169,12 +170,10 @@ impl AppContext {
         }
     }
 
-    /// 在 TUI 中运行一个任务目标：交由 Orchestrator 处理，成功后记录对话轮、
-    /// 提取经验教训，并观察意图模式以决定是否把规则升级写入 AGENTS.md。
-    /// 失败时通过事件通道发送错误。
-    /// Run a task goal in the TUI: hand it to the Orchestrator; on success, record turns,
-    /// extract a lesson, and observe the intent pattern to decide whether to promote a
-    /// rule into AGENTS.md. On failure, send errors via the event channel.
+    /// 在 TUI 中运行一个任务目标：交由 Orchestrator 处理，成功后记录对话轮与
+    /// 经验教训。失败时通过事件通道发送错误。
+    /// Run a task goal in the TUI: hand it to the Orchestrator; on success, record turns
+    /// and extract a lesson. On failure, send errors via the event channel.
     pub async fn run_goal_tui(&self, goal: &str, tx: &EventSender) {
         match self.orchestrator.handle(goal, tx).await {
             Ok(out) => {
@@ -194,25 +193,6 @@ impl AppContext {
 
                 let summary = format!("\u{4efb}\u{52a1}: {goal} \u{2192} \u{4ea7}\u{51fa}: {}", truncate(&out, 200));
                 let _ = self.memory.record_lesson(&Lesson { summary, ts });
-
-                let pattern = intent_pattern(goal);
-                match self.memory.observe_rule(&pattern, self.rule_threshold) {
-                    Ok(true) => {
-                        if let Err(e) =
-                            self.memory.promote_rule_to_agents_md(&pattern, "AGENTS.md")
-                        {
-                            let _ = tx.send(AgentEvent::Error(format!("promote_rule error: {e}")));
-                        } else {
-                            let _ = tx.send(AgentEvent::Info(format!(
-                                "[\u{8fdb}\u{5316}] \u{89c4}\u{5219}\u{5347}\u{7ea7}\u{5230} AGENTS.md\u{ff1a}{pattern}"
-                            )));
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        let _ = tx.send(AgentEvent::Error(format!("observe_rule error: {e}")));
-                    }
-                }
             }
             Err(e) => {
                 let _ = tx.send(AgentEvent::Error(format!("orchestrator error: {e}")));
@@ -265,16 +245,6 @@ mod tests {
     }
 }
 
-/// 把任务目标映射为用于规则观察的意图模式字符串。
-/// Map a task goal to the intent-pattern string used for rule observation.
-fn intent_pattern(goal: &str) -> String {
-    match registry::classify(goal) {
-        Intent::Implement => "implement_task".to_string(),
-        Intent::Investigate => "investigate_task".to_string(),
-        Intent::Chat => "chat_task".to_string(),
-    }
-}
-
 /// 返回当前 Unix 时间戳（秒）。系统时钟异常时退回 0。
 /// Return the current Unix timestamp (seconds). Falls back to 0 if the system clock is unavailable.
 fn now() -> u64 {
@@ -313,17 +283,15 @@ pub fn load_memory_cfg() -> anyhow::Result<crate::memory::MemoryConfig> {
     Ok(cfg)
 }
 
-/// 从 `agent.toml` 加载规则升级阈值 `[evolution].rule_escalation_threshold`，
-/// 缺失时默认为 3。
-/// Load the rule escalation threshold `[evolution].rule_escalation_threshold`
-/// from `agent.toml`; defaults to 3 when absent.
-pub fn load_escalation_threshold() -> anyhow::Result<u32> {
+/// 从 `agent.toml` 加载 `[evolution].rule_escalation_threshold`，默认 3。
+/// Load `[evolution].rule_escalation_threshold` from `agent.toml`, default 3.
+pub fn load_escalation_threshold() -> anyhow::Result<usize> {
     let raw = std::fs::read_to_string("agent.toml")?;
     let parsed: toml::Value = toml::from_str(&raw)?;
-    let t = parsed
+    let threshold = parsed
         .get("evolution")
         .and_then(|e| e.get("rule_escalation_threshold"))
         .and_then(|v| v.as_integer())
-        .unwrap_or(3);
-    Ok(t as u32)
+        .unwrap_or(3) as usize;
+    Ok(threshold)
 }

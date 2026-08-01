@@ -203,11 +203,20 @@ impl Tool for RunBash {
     /// 执行工具：通过 `sh -c` 运行命令，收集退出码与输出，截断到 20000 字符。
     /// Executes the tool: runs the command via `sh -c`, collecting exit code and output,
     /// truncating combined stdout+stderr to 20000 chars.
+    ///
+    /// 用 tokio::process 而非 std::process：阻塞式 Command 会卡住整个 async runtime
+    /// （长命令期间 TUI 无法重绘、无法响应 Esc）。kill_on_drop 确保任务被 abort（Esc）
+    /// 时子进程一并被杀，而不是成为孤儿进程继续运行。
+    /// Uses tokio::process instead of std::process: a blocking Command stalls the whole
+    /// async runtime (no TUI redraw, no Esc response during long commands). kill_on_drop
+    /// ensures aborting the task (Esc) also kills the child instead of orphaning it.
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let out = std::process::Command::new("sh")
+        let out = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(&args.command)
+            .kill_on_drop(true)
             .output()
+            .await
             .map_err(|e| ToolError(e.to_string()))?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -570,7 +579,17 @@ pub fn is_readonly_bash(command: &str) -> bool {
         "ls", "cat", "head", "tail", "grep", "git status", "git log", "git diff", "git show",
         "pwd", "echo", "find", "wc", "tree", "which", "readlink",
     ];
-    for segment in command.split(|c| c == '|' || c == ';' || c == '&' || c == '\n') {
+    // 命令替换（$(...) / 反引号）可在只读前缀内部执行任意命令——例如
+    // `ls $(rm -rf ~)` 首 token 是只读的 `ls`，但实际会删除用户主目录。
+    // 只要存在命令替换，一律视为会改变状态，交给 HITL 询问。
+    // Command substitution ($(...) / backticks) can run arbitrary commands inside a
+    // read-only prefix — e.g. `ls $(rm -rf ~)` starts with the read-only `ls` but
+    // actually deletes the user's home directory. Any command substitution means the
+    // command must be treated as mutating and routed to HITL.
+    if command.contains("$(") || command.contains('`') {
+        return false;
+    }
+    for segment in command.split(['|', ';', '&', '\n']) {
         let s = segment.trim();
         if s.is_empty() {
             return false;
@@ -578,6 +597,23 @@ pub fn is_readonly_bash(command: &str) -> bool {
         // Redirection / appending writes to a file: mutating, not read-only.
         // 重定向 / 追加写入文件：会改变状态，非只读。
         if s.contains('>') || s.contains("2>") {
+            return false;
+        }
+        // `find` 的 -delete / -exec / -execdir 可删除或执行文件；-fprint 系列会写文件。
+        // 仅当分段以 find 开头时检查，避免误伤其它含这些子串的命令。
+        // `find` flags like -delete / -exec / -execdir can delete or execute files;
+        // -fprint variants write files. Only check when the segment starts with find
+        // to avoid false positives on other commands.
+        if s.starts_with("find")
+            && (s.contains(" -delete")
+                || s.contains(" -exec")
+                || s.contains(" -execdir")
+                || s.contains(" -ok")
+                || s.contains(" -okdir")
+                || s.contains(" -fprint")
+                || s.contains(" -fprintf")
+                || s.contains(" -fls"))
+        {
             return false;
         }
         if !READONLY_PREFIXES.iter().any(|p| s.starts_with(p)) {
@@ -643,5 +679,25 @@ mod tests {
         assert!(!is_readonly_bash("ls && rm x"));
         assert!(!is_readonly_bash("echo hi > file"));
         assert!(!is_readonly_bash(""));
+    }
+
+    /// 命令替换可绕过首 token 检查（`ls $(rm -rf ~)`），必须视为会改变状态。
+    /// Command substitution can bypass the first-token check (`ls $(rm -rf ~)`);
+    /// must be classified as mutating.
+    #[test]
+    fn command_substitution_not_readonly() {
+        assert!(!is_readonly_bash("ls $(rm -rf ~)"));
+        assert!(!is_readonly_bash("echo $(rm -rf .)"));
+        assert!(!is_readonly_bash("cat `rm -rf x`"));
+        assert!(!is_readonly_bash("grep -r x . $(sudo rm -rf /)"));
+    }
+
+    /// find 的破坏性标志应使其归类为会改变状态。
+    /// Destructive find flags should make the command mutating.
+    #[test]
+    fn find_destructive_flags_not_readonly() {
+        assert!(!is_readonly_bash("find . -delete"));
+        assert!(!is_readonly_bash("find / -name x -exec rm {} \\;"));
+        assert!(!is_readonly_bash("find . -execdir chmod 777 {} +"));
     }
 }

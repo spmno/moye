@@ -280,18 +280,32 @@ fn expand_tilde(path: &str) -> String {
 /// 从 bash 命令中提取所有路径类 token。
 /// Extracts all path-like tokens from a bash command.
 ///
-/// 按 shell 管道符/分号/换行分割为独立命令段，再按空白分词。
-/// Splits the command into segments by shell pipe/semicolon/newline, then tokenizes by whitespace.
+/// 先剥离命令替换（`$(...)` / 反引号），把内部命令当作独立命令递归检查，
+/// 再检查外层命令的路径类 token。这能捕获 `ls $(rm -rf ~)` 这类绕过——
+/// 旧实现只 tokenize 外层，`~)` 和 `$(rm` 都不被识别，导致沙箱放行。
+/// First strips command substitutions ($(...) / backticks) and recursively checks
+/// their inner commands as standalone commands, then checks path-like tokens of the
+/// outer command. This catches bypasses like `ls $(rm -rf ~)` — the old
+/// implementation only tokenized the outer layer, so neither `~)` nor `$(rm` was
+/// recognized and the sandbox let it through.
+///
 /// 识别以下模式：
 /// Recognizes the following patterns:
 /// - 绝对路径（以 `/` 开头）/ Absolute paths (starting with `/`)
-/// - 主目录路径（以 `~/` 开头）/ Home-directory paths (starting with `~/`)
+/// - 主目录路径（`~`、`~/`）/ Home-directory paths (`~`, `~/`)
 /// - 含 `..` 的相对路径（可能逃逸沙箱）/ Relative paths containing `..` (may escape the sandbox)
 /// - `cd` / `pushd` 的目标参数 / The target argument of `cd` / `pushd`
+/// - 环境变量展开（`$HOME`、`${HOME}/x`、`$HOME/.zshrc`）/ Env-var expansion (`$HOME`, `${HOME}/x`, `$HOME/.zshrc`)
 fn extract_paths_from_command(command: &str) -> Vec<String> {
     let mut paths = Vec::new();
+    extract_paths_from_command_inner(command, &mut paths);
+    paths
+}
 
-    for segment in command.split(|c| c == '|' || c == ';' || c == '&' || c == '\n') {
+fn extract_paths_from_command_inner(command: &str, paths: &mut Vec<String>) {
+    let outer = strip_command_substitutions(command, paths);
+
+    for segment in outer.split(['|', ';', '&', '\n']) {
         let segment = segment.trim();
         if segment.is_empty() {
             continue;
@@ -319,27 +333,115 @@ fn extract_paths_from_command(command: &str) -> Vec<String> {
 
             let cleaned = clean_token(token);
 
-            // 绝对路径
-            // Absolute paths
-            if cleaned.starts_with('/') {
-                paths.push(cleaned.to_string());
-            }
-            // 主目录路径
-            // Home-directory paths
-            else if cleaned.starts_with("~/") || cleaned == "~" {
-                paths.push(cleaned.to_string());
-            }
-            // 含 .. 的相对路径（可能逃逸沙箱）
-            // Relative paths with .. (may escape the sandbox)
-            else if cleaned.contains("..") {
-                paths.push(cleaned.to_string());
+            let candidate = if cleaned.starts_with('/')
+                || cleaned.starts_with("~/")
+                || cleaned == "~"
+                || cleaned.contains("..")
+            {
+                Some(cleaned.to_string())
+            } else if cleaned.starts_with('$') {
+                expand_env_var_token(cleaned)
+            } else {
+                None
+            };
+            if let Some(p) = candidate {
+                paths.push(p);
             }
 
             i += 1;
         }
     }
+}
 
-    paths
+/// 剥离命令替换并把内部命令递归送入路径检查。返回移除替换后的外层命令
+/// （替换处留空格，避免 token 粘连误判）。不匹配闭合时按无替换处理。
+/// Strips command substitutions, recursively feeding inner commands into path
+/// checking. Returns the outer command with substitutions removed (replaced by a
+/// space so tokens don't glue together). Unclosed substitutions are left as-is.
+fn strip_command_substitutions(command: &str, paths: &mut Vec<String>) -> String {
+    let chars: Vec<char> = command.chars().collect();
+    let mut out = String::with_capacity(command.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() && chars[i + 1] == '(' {
+            let mut depth = 1usize;
+            let mut j = i + 2;
+            while j < chars.len() {
+                if chars[j] == '$' && j + 1 < chars.len() && chars[j + 1] == '(' {
+                    depth += 1;
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            let inner: String = chars[i + 2..j].iter().collect();
+            extract_paths_from_command_inner(&inner, paths);
+            out.push(' ');
+            i = j + 1;
+            continue;
+        }
+        if chars[i] == '`' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j] != '`' {
+                j += 1;
+            }
+            let inner: String = chars[i + 1..j].iter().collect();
+            extract_paths_from_command_inner(&inner, paths);
+            out.push(' ');
+            i = j + 1;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// 展开环境变量 token（$HOME、${HOME}、$HOME/.zshrc、${HOME}/x）。
+/// 已知变量用进程环境展开；PATH 类冒号分隔列表跳过以免误报；
+/// 未知变量仅在带路径后缀时保守标记（触发沙箱询问）。
+/// Expands an env-var token ($HOME, ${HOME}, $HOME/.zshrc, ${HOME}/x).
+/// Known vars are expanded from the process environment; colon-separated lists
+/// like $PATH are skipped to avoid false positives; unknown vars are conservatively
+/// flagged only when followed by a path-like suffix.
+fn expand_env_var_token(token: &str) -> Option<String> {
+    if token == "$" {
+        return None;
+    }
+    let rest = &token[1..];
+    let (name, suffix) = if let Some(rest2) = rest.strip_prefix('{') {
+        rest2.split_once('}')?
+    } else {
+        let idx = rest
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
+        rest.split_at(idx)
+    };
+    if name.is_empty() {
+        return None;
+    }
+    if let Ok(val) = std::env::var(name) {
+        if val.is_empty() {
+            return None;
+        }
+        let expanded = format!("{val}{suffix}");
+        if expanded.contains(':') {
+            return None;
+        }
+        Some(expanded)
+    } else {
+        if suffix.is_empty() {
+            None
+        } else {
+            Some(format!("/${{{name}}}{suffix}"))
+        }
+    }
 }
 
 /// 清理 token：去除 shell 重定向操作符和引号。
@@ -418,6 +520,58 @@ mod tests {
         assert!(paths.contains(&"/tmp/copy".to_string()));
     }
 
+    /// 命令替换内的路径应被提取（`ls $(rm -rf ~)` 中的 `~`）。
+    /// Paths inside command substitutions should be extracted (the `~` in
+    /// `ls $(rm -rf ~)`).
+    #[test]
+    fn extract_paths_in_command_substitution() {
+        let paths = extract_paths_from_command("ls $(rm -rf ~)");
+        assert!(paths.contains(&"~".to_string()));
+    }
+
+    /// 嵌套命令替换内的路径应被提取。
+    /// Paths inside nested command substitutions should be extracted.
+    #[test]
+    fn extract_paths_in_nested_substitution() {
+        let paths = extract_paths_from_command("echo $(cat $(ls /etc))");
+        assert!(paths.contains(&"/etc".to_string()));
+    }
+
+    /// 反引号命令替换内的路径应被提取。
+    /// Paths inside backtick command substitutions should be extracted.
+    #[test]
+    fn extract_paths_in_backticks() {
+        let paths = extract_paths_from_command("ls `cat /tmp/x`");
+        assert!(paths.contains(&"/tmp/x".to_string()));
+    }
+
+    /// `$HOME` 环境变量展开的路径应被提取。
+    /// Paths expanded from the $HOME env var should be extracted.
+    #[test]
+    fn extract_home_env_var_path() {
+        let paths = extract_paths_from_command("cat $HOME/.zshrc");
+        let home = std::env::var("HOME").expect("HOME must be set in test env");
+        assert!(paths.iter().any(|p| p.starts_with(&format!("{home}/"))));
+    }
+
+    /// 裸 `$HOME` 应被提取。
+    /// A bare $HOME should be extracted.
+    #[test]
+    fn extract_home_env_var_bare() {
+        let paths = extract_paths_from_command("ls $HOME");
+        let home = std::env::var("HOME").expect("HOME must be set in test env");
+        assert!(paths.iter().any(|p| p == &home));
+    }
+
+    /// `${HOME}` 花括号形式应被提取。
+    /// The ${HOME} brace form should be extracted.
+    #[test]
+    fn extract_braced_env_var_path() {
+        let paths = extract_paths_from_command("cat ${HOME}/.config/app.toml");
+        let home = std::env::var("HOME").expect("HOME must be set in test env");
+        assert!(paths.iter().any(|p| p.starts_with(&format!("{home}/"))));
+    }
+
     /// 项目内相对路径不应触发沙箱拒绝。
     /// Relative paths within the project should not trigger a sandbox rejection.
     #[test]
@@ -474,6 +628,17 @@ mod tests {
         assert!(sb.check_bash("cat /etc/passwd").is_err());
         assert!(sb.check_bash("cd /tmp && ls").is_err());
         assert!(sb.check_bash("ls src/").is_ok());
+    }
+
+    /// 命令替换与环境变量绕过应在沙箱层被检测（而非仅 HITL 层）。
+    /// Command-substitution and env-var bypasses should be caught at the sandbox
+    /// layer, not just at the HITL layer.
+    #[test]
+    fn bash_bypass_detected() {
+        let sb = Sandbox::new();
+        assert!(sb.check_bash("ls $(rm -rf ~)").is_err());
+        assert!(sb.check_bash("cat $HOME/.zshrc").is_err());
+        assert!(sb.check_bash("ls `cat /tmp/x`").is_err());
     }
 
     /// check_tool 应正确提取文件工具的路径参数。

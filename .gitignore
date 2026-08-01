@@ -3,5 +3,6 @@ memory/
 *.log
 .env
 .omo/
-
+logs/
 .sisyphus/
+result/

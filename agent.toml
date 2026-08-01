@@ -14,7 +14,7 @@ api_key_env = "AUTO"  # 代码自动根据供应商选择
 # Bailian: kimi/kimi-k3 / qwen-plus / qwen-max
 # Moonshot: kimi-k3 / kimi-k2.7-code-highspeed
 # 切换模型用 REPL 命令：model <slug>
-default_model = "deepseek-v4-pro"
+default_model = "deepseek-v4-flash"
 # 自主循环上限：agent 最多执行的轮数。
 max_turns = 20
 
@@ -31,7 +31,7 @@ max_read_lines = 500
 #   read_file / run_bash_readonly 默认自动执行（如 ls, cat, git status）；
 #   run_bash_mutating / edit_file 默认需询问。
 [agents.orchestrator]
-model = "deepseek-v4-pro"
+model = "deepseek-v4-flash"
 preamble = "AGENTS.md"
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
@@ -41,7 +41,7 @@ permissions.web_fetch = "allow"
 permissions.web_search = "allow"
 
 [agents.planner]
-model = "deepseek-v4-pro"
+model = "deepseek-v4-flash"
 preamble = "prompts/planner.md"
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
@@ -51,7 +51,7 @@ permissions.web_fetch = "allow"
 permissions.web_search = "allow"
 
 [agents.builder]
-model = "deepseek-v4-pro"
+model = "deepseek-v4-flash"
 preamble = "prompts/builder.md"
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
@@ -61,7 +61,7 @@ permissions.web_fetch = "allow"
 permissions.web_search = "allow"
 
 [agents.auditor]
-model = "deepseek-v4-pro"
+model = "deepseek-v4-flash"
 preamble = "prompts/auditor.md"
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"

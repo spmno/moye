@@ -3,10 +3,21 @@
 # API Key 从供应商对应的环境变量读取（DEEPSEEK / DASHSCOPE / MOONSHOT）。
 
 [provider]
-# 当前供应商（由 MY_AGENT_PROVIDER 环境变量控制，默认 deepseek）
-# 示例：export MY_AGENT_PROVIDER=moonshot
-#       export MOONSHOT_API_KEY=sk-xxx
-api_key_env = "AUTO"  # 代码自动根据供应商选择
+# 默认供应商（deepseek / bailian / moonshot / custom）。
+# 优先级：MY_AGENT_PROVIDER 环境变量（或 .env）> 此处配置 > deepseek。
+# 推荐：把配置写进项目根的 .env 文件（参考 .env.example），启动时自动加载。
+# Priority: MY_AGENT_PROVIDER env (or .env) > this config > deepseek.
+provider = "deepseek"
+
+# 可选：全局覆盖 OpenAI 兼容 base URL。
+# 优先级：MY_AGENT_BASE_URL 环境变量 > 此处配置 > 供应商默认。
+# Optional: global OpenAI-compatible base URL override.
+# Priority: MY_AGENT_BASE_URL env > this config > provider default.
+# base_url = "https://api.example.com/v1"
+
+# 可选：自定义 API key 环境变量名（默认按供应商自动选择）。
+# Optional: custom API key env var name (defaults to the provider's standard name).
+# api_key_env = "MY_CUSTOM_KEY"
 
 [agent]
 # 默认模型：需与供应商匹配。

@@ -111,6 +111,7 @@ impl AppContext {
             "my-agent ({provider}) | model: {}\n\
              \u{2500}\u{2500}\u{2500} \u{547d}\u{4ee4} \u{2500}\u{2500}\u{2500}\n\
              /model [slug]       \u{67e5}\u{770b}\u{6216}\u{5207}\u{6362}\u{5f53}\u{524d}\u{4f1a}\u{8bdd}\u{6a21}\u{578b}\n\
+             /models             \u{6253}\u{5f00}\u{4ea4}\u{4e92}\u{5f0f}\u{6a21}\u{578b}\u{9009}\u{62e9}\u{5668}\n\
              /evolve             \u{89e6}\u{53d1}\u{63d0}\u{793a}\u{8bcd}\u{8fdb}\u{5316}\u{ff08}\u{8bc4}\u{4f30}\u{540e}\u{62e9}\u{4f18}\u{91c7}\u{7eb3}\u{ff09}\n\
              /evolve-code <f> <old> <new>  \u{4ee3}\u{7801}\u{81ea}\u{4fee}\u{6539}\u{ff08}\u{7f16}\u{8bd1}\u{9a8c}\u{8bc1} + \u{56de}\u{9000}\u{ff09}\n\
              /add-tool <name> <desc>  \u{751f}\u{6210}\u{65b0}\u{5de5}\u{5177}\u{811a}\u{624b}\u{67b6}\u{ff08}\u{9700}\u{91cd}\u{65b0}\u{7f16}\u{8bd1}\u{751f}\u{6548}\u{ff09}\n\
@@ -254,44 +255,17 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
-/// 解析默认模型：优先 `MY_AGENT_MODEL` 环境变量，其次 `agent.toml` 的
+/// 解析默认模型：优先 `MY_AGENT_MODEL` 环境变量，其次统一配置中
 /// `[agent].default_model`；均缺失时返回 `None`。
 /// Resolve the default model: prefer the `MY_AGENT_MODEL` env var, then the
-/// `[agent].default_model` in `agent.toml`; returns `None` when both are absent.
+/// `[agent].default_model` from the unified config; returns `None` when both are absent.
 fn resolve_default_model() -> Option<String> {
     std::env::var("MY_AGENT_MODEL").ok().or_else(|| {
-        let raw = std::fs::read_to_string("agent.toml").ok()?;
-        let parsed: toml::Value = toml::from_str(&raw).ok()?;
-        parsed
-            .get("agent")?
-            .get("default_model")?
-            .as_str()
-            .map(|s| s.to_string())
+        let dm = &crate::config::config()?.agent.default_model;
+        if dm.is_empty() {
+            None
+        } else {
+            Some(dm.clone())
+        }
     })
-}
-
-/// 从 `agent.toml` 加载 `[memory]` 段并解析为 [`crate::memory::MemoryConfig`]。
-/// Load and parse the `[memory]` section of `agent.toml` into a
-/// [`crate::memory::MemoryConfig`].
-pub fn load_memory_cfg() -> anyhow::Result<crate::memory::MemoryConfig> {
-    let raw = std::fs::read_to_string("agent.toml")?;
-    let parsed: toml::Value = toml::from_str(&raw)?;
-    let m = parsed
-        .get("memory")
-        .ok_or_else(|| anyhow::anyhow!("missing [memory] in agent.toml"))?;
-    let cfg = m.clone().try_into()?;
-    Ok(cfg)
-}
-
-/// 从 `agent.toml` 加载 `[evolution].rule_escalation_threshold`，默认 3。
-/// Load `[evolution].rule_escalation_threshold` from `agent.toml`, default 3.
-pub fn load_escalation_threshold() -> anyhow::Result<usize> {
-    let raw = std::fs::read_to_string("agent.toml")?;
-    let parsed: toml::Value = toml::from_str(&raw)?;
-    let threshold = parsed
-        .get("evolution")
-        .and_then(|e| e.get("rule_escalation_threshold"))
-        .and_then(|v| v.as_integer())
-        .unwrap_or(3) as usize;
-    Ok(threshold)
 }

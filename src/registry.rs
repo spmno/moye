@@ -86,48 +86,10 @@ pub enum Permission {
     Deny,
 }
 
-/// `[agent]` 子节：默认模型与循环上限。
-/// `[agent]` subsection: default model and loop limit.
-#[derive(Debug, Deserialize, Default)]
-pub struct AgentSection {
-    #[serde(default)]
-    pub default_model: String,
-    #[serde(default)]
-    pub max_turns: usize,
-}
-
-/// 注册表顶层配置：来自 agent.toml，包含循环上限与各角色配置。
-/// Registry top-level config: from agent.toml, includes loop limit and per-role configs.
-#[derive(Debug, Deserialize)]
-pub struct AgentRegistryConfig {
-    #[serde(default)]
-    pub agent: AgentSection,
-    #[serde(rename = "agents")]
-    pub roles: std::collections::HashMap<String, RoleConfig>,
-    #[serde(default)]
-    pub context: crate::context::ContextConfig,
-}
-
-impl AgentRegistryConfig {
-    /// 从 agent.toml 加载配置。
-    /// Loads config from agent.toml.
-    pub fn load(path: &str) -> anyhow::Result<Self> {
-        let raw = std::fs::read_to_string(path)?;
-        let cfg: AgentRegistryConfig = toml::from_str(&raw)?;
-        Ok(cfg)
-    }
-
-    /// 返回循环上限；为 0 时回退到默认 20 轮。
-    /// Returns the loop limit; falls back to default 20 turns when 0.
-    pub fn max_turns(&self) -> usize {
-        let turns = self.agent.max_turns;
-        if turns == 0 {
-            20
-        } else {
-            turns
-        }
-    }
-}
+// `[agent]` 子节与顶层配置已合并进统一配置模块 `crate::config::Config`，
+// 由 main 通过 `config::init()` 一次解析，此处不再单独定义。
+// The `[agent]` subsection and top-level config now live in the unified
+// `crate::config::Config`, parsed once via `config::init()` in main.
 
 /// 绑定到某个角色的 Agent：模型 + preamble（提示词，从 .md 文件加载）。
 /// An Agent bound to a role: model + preamble (prompt, loaded from .md file).
@@ -174,7 +136,7 @@ impl RoleAgent {
 /// Agent 注册表：持有共享配置，并为各角色构建 Agent；同时保存会话级的模型覆盖。
 /// Agent registry: holds shared config, builds Agents per role; also stores session-level model override.
 pub struct AgentRegistry {
-    config: Arc<AgentRegistryConfig>,
+    config: Arc<crate::config::Config>,
     // 整个会话的运行时模型覆盖。一旦设置，所有角色都使用该 slug 而非各自配置的模型，
     // Runtime model override for the entire session. Once set, all roles use this slug instead of their configured model,
     // 让用户无需改文件即可从 REPL 切换到免费模型（如 tencent/hy3:free）。
@@ -183,14 +145,14 @@ pub struct AgentRegistry {
 }
 
 impl AgentRegistry {
-    pub fn new(config: AgentRegistryConfig) -> Self {
+    pub fn new(config: Arc<crate::config::Config>) -> Self {
         // MY_AGENT_MODEL 环境变量作为会话级模型覆盖的初始值。
         // The MY_AGENT_MODEL env var serves as the initial session-level model override.
         // 优先级：/model REPL 命令 > MY_AGENT_MODEL env > agent.toml 各角色配置。
         // Priority: /model REPL command > MY_AGENT_MODEL env > agent.toml per-role config.
         let session_model = std::env::var("MY_AGENT_MODEL").ok();
         Self {
-            config: Arc::new(config),
+            config,
             session_model: Arc::new(Mutex::new(session_model)),
         }
     }

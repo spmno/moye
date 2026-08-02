@@ -9,6 +9,9 @@ pub enum ReplCommand {
     /// `/model [slug]`：查看或切换当前会话模型。
     /// `/model [slug]`: show or switch the current session model.
     Model { slug: Option<String> },
+    /// `/models`：打开交互式模型选择器（opencode 风格）。
+    /// `/models`: open the interactive model selector (opencode-style).
+    Models,
     /// `/evolve`：触发提示词进化。
     /// `/evolve`: trigger prompt evolution.
     Evolve,
@@ -77,6 +80,7 @@ impl ReplCommand {
             "/model" | "/m" => Self::Model {
                 slug: rest.first().map(|s| s.as_str()).map(str::to_owned),
             },
+            "/models" => Self::Models,
             "/evolve" | "/e" => Self::Evolve,
             "/evolve-code" | "/ec" => match rest {
                 [file, old, new, ..] if !file.is_empty() => Self::EvolveCode {
@@ -109,5 +113,34 @@ impl ReplCommand {
             "/quit" | "/q" | "/exit" => Self::Quit,
             _ => Self::InvalidUsage("unknown command; type /help for usage"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn models_command_parses() {
+        assert!(matches!(
+            ReplCommand::parse("/models"),
+            ReplCommand::Models
+        ));
+    }
+
+    #[test]
+    fn model_slug_still_works() {
+        assert!(matches!(
+            ReplCommand::parse("/model kimi-k3"),
+            ReplCommand::Model { slug: Some(s) } if s == "kimi-k3"
+        ));
+    }
+
+    #[test]
+    fn non_slash_is_goal() {
+        assert!(matches!(
+            ReplCommand::parse("帮我修复 bug"),
+            ReplCommand::Goal(_)
+        ));
     }
 }

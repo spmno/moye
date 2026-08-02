@@ -28,6 +28,7 @@ use tokio::time::interval;
 use crate::cli::context::AppContext;
 use crate::cli::repl::ReplCommand;
 use crate::event::{AgentEvent, EventReceiver, EventSender};
+use crate::ui::selector::{SelectorItem, SelectorState};
 use crate::ui::{markdown, theme};
 use tracing::{info, warn};
 
@@ -242,6 +243,9 @@ struct TuiState {
     /// Handle to the currently running background task. Press Esc to abort.
     task_handle: Option<JoinHandle<()>>,
     needs_full_redraw: bool,
+    /// 打开中的选择器（如 /models 模型选择）。非 None 时键盘输入进入选择器。
+    /// Open selector (e.g. the /models model picker). When Some, keyboard input goes to it.
+    selector: Option<SelectorState>,
 }
 
 impl TuiState {
@@ -267,6 +271,7 @@ impl TuiState {
             skill_names,
             task_handle: None,
             needs_full_redraw: false,
+            selector: None,
         }
     }
 
@@ -562,6 +567,57 @@ fn handle_key_event(
         return;
     }
 
+    // Selector（命令面板）模式：优先于常规输入与 Esc 中断。
+    // Selector (command palette) mode: takes priority over regular input and Esc interrupt.
+    if state.selector.is_some() {
+        // Ctrl+C/D 在面板中视为取消，避免误退出程序。
+        // Ctrl+C/D cancels the panel instead of quitting the program.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
+        {
+            state.selector = None;
+            return;
+        }
+        match key.code {
+            KeyCode::Up => {
+                if let Some(s) = &mut state.selector {
+                    s.move_cursor(-1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(s) = &mut state.selector {
+                    s.move_cursor(1);
+                }
+            }
+            KeyCode::Enter => {
+                let selected = state.selector.as_ref().and_then(|s| s.selection());
+                state.selector = None;
+                if let Some(item) = selected {
+                    // 当前仅模型选择器：切换会话模型。
+                    // Currently only the model selector exists: switch the session model.
+                    ctx.cmd_model(Some(item.label.clone()));
+                    state.model = ctx.current_model();
+                    state.push_event(AgentEvent::Info(format!("model: {}", state.model)));
+                }
+            }
+            KeyCode::Esc => {
+                state.selector = None;
+            }
+            KeyCode::Backspace => {
+                if let Some(s) = &mut state.selector {
+                    s.backspace();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(s) = &mut state.selector {
+                    s.input_char(c);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
     // Esc: interrupt the running task (only when thinking and not in HITL mode).
     // Esc：中断正在运行的任务（仅在 thinking 且非 HITL 模式时生效）。
     if key.code == KeyCode::Esc && state.thinking {
@@ -687,6 +743,21 @@ fn handle_command(
             ctx.cmd_model(slug);
             state.model = ctx.current_model();
             state.push_event(AgentEvent::Info(format!("model: {}", state.model)));
+        }
+        ReplCommand::Models => {
+            let provider = crate::providers::current_provider();
+            let items: Vec<SelectorItem> = crate::providers::provider_models(provider)
+                .into_iter()
+                .map(|m| SelectorItem {
+                    label: m.slug,
+                    detail: m.desc.to_string(),
+                })
+                .collect();
+            state.selector = Some(SelectorState::new(
+                format!("{provider:?} \u{6a21}\u{578b}\u{9009}\u{62e9} / Models"),
+                items,
+                true,
+            ));
         }
         ReplCommand::Help => {
             state.push_event(AgentEvent::Info(ctx.cmd_help()));
@@ -911,6 +982,110 @@ fn draw(f: &mut Frame, state: &mut TuiState) {
     if state.hitl.is_some() {
         draw_hitl_overlay(f, state);
     }
+    if state.selector.is_some() {
+        draw_selector(f, state);
+    }
+}
+
+/// 渲染选择器弹窗（opencode 风格）：标题 + 可滚动列表 + 过滤/自定义输入行。
+/// Renders the selector dialog (opencode-style): title + scrollable list + filter/custom input line.
+fn draw_selector(f: &mut Frame, state: &mut TuiState) {
+    let area = f.area();
+    // 终端过小时不渲染选择器（避免尺寸运算下溢）。
+    // Skip rendering when the terminal is too small (avoids size arithmetic underflow).
+    if area.width < 10 || area.height < 8 {
+        return;
+    }
+    let sel = state.selector.as_ref().unwrap();
+    let visible = sel.visible();
+    let list_cap = 8usize;
+    let dw = 60u16.min(area.width.saturating_sub(4));
+    let shown = visible.len().min(list_cap);
+    // 高度 = 列表行 + 空行 + 输入行 + 提示行 + 边框(2) + 内边距(2)
+    let dh = (shown as u16 + 7).max(8).min(area.height.saturating_sub(4));
+    let dx = (area.width.saturating_sub(dw)) / 2;
+    let dy = (area.height.saturating_sub(dh)) / 2;
+    let dialog_area = Rect::new(dx, dy, dw, dh);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    let count = visible.len();
+    if count > 0 {
+        // 光标保持在可见窗口内：窗口顶部 = cursor - (list_cap - 1)
+        let scroll = sel.cursor().saturating_sub(list_cap - 1);
+        for (i, item) in visible.iter().enumerate().skip(scroll).take(list_cap) {
+            let marker = if i == sel.cursor() { "\u{25b6}" } else { " " };
+            let text = format!(" {marker} {}", item.label);
+            if i == sel.cursor() {
+                lines.push(Line::styled(
+                    format!("{text}  {}", item.detail),
+                    theme::selector_highlight(),
+                ));
+            } else {
+                lines.push(Line::styled(
+                    format!("{text}  {}", item.detail),
+                    theme::selector_normal(),
+                ));
+            }
+        }
+    } else if !sel.filter().trim().is_empty() {
+        lines.push(Line::styled(
+            format!(
+                "\u{65e0}\u{5339}\u{914d}\u{300c}{}\u{300d}\u{ff0c}Enter \u{4f7f}\u{7528}\u{81ea}\u{5b9a}\u{4e49}\u{6a21}\u{578b}",
+                sel.filter().trim()
+            ),
+            theme::selector_dim(),
+        ));
+    } else {
+        lines.push(Line::styled(
+            "\u{ff08}\u{65e0}\u{53ef}\u{7528}\u{6a21}\u{578b}\u{ff0c}\u{8f93}\u{5165}\u{81ea}\u{5b9a}\u{4e49}\u{6a21}\u{578b} ID\u{ff09}",
+            theme::selector_dim(),
+        ));
+    }
+
+    lines.push(Line::default());
+    let is_custom_mode = count == 0 && !sel.filter().trim().is_empty();
+    let input_label = if is_custom_mode {
+        format!("\u{81ea}\u{5b9a}\u{4e49} custom: {}", sel.filter())
+    } else {
+        format!("\u{8fc7}\u{6ee4} filter: {}", sel.filter())
+    };
+    lines.push(Line::styled(input_label, theme::selector_input()));
+    lines.push(Line::styled(
+        "\u{2191}/\u{2193} \u{9009}\u{62e9} | Enter \u{786e}\u{8ba4} | Esc \u{53d6}\u{6d88}",
+        theme::selector_dim(),
+    ));
+
+    let dialog = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(theme::selector_title())
+                .title(format!(" {} ", sel.title()))
+                .title_alignment(Alignment::Center)
+                .padding(Padding::uniform(1)),
+        )
+        .wrap(Wrap { trim: false });
+
+    f.render_widget(Clear, dialog_area);
+    f.render_widget(dialog, dialog_area);
+
+    // filter 输入光标（input 行 = y + 边框1 + 内边距1 + 列表 + 空行1）
+    let prefix = if is_custom_mode { "\u{81ea}\u{5b9a}\u{4e49} custom: " } else { "\u{8fc7}\u{6ee4} filter: " };
+    let prefix_w: usize = prefix
+        .chars()
+        .map(|c| if c.is_ascii() { 1 } else { 2 })
+        .sum();
+    let filter_w: usize = sel
+        .filter()
+        .chars()
+        .map(|c| if c.is_ascii() { 1 } else { 2 })
+        .sum();
+    let cx = (dialog_area.x + 2 + (prefix_w + filter_w) as u16)
+        .min(dialog_area.x + dw.saturating_sub(2));
+    let cy = dialog_area.y + 3 + shown as u16;
+    f.set_cursor_position((cx, cy));
 }
 
 fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {

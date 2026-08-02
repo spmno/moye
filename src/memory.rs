@@ -33,10 +33,13 @@ pub struct Lesson {
 
 /// 记忆存储的路径配置（来自 agent.toml 的 [memory] 段）。
 /// Path configuration for the memory store (from the `[memory]` section of agent.toml).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct MemoryConfig {
+    #[serde(default)]
     pub dir: PathBuf,
+    #[serde(default)]
     pub conversation_file: String,
+    #[serde(default)]
     pub lessons_file: String,
 }
 

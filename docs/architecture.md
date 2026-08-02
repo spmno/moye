@@ -58,7 +58,7 @@ src/
 │   ├── mod.rs                 # 模块声明
 │   ├── repl.rs                # ReplCommand enum + match 分发
 │   └── context.rs             # AppContext：持有 registry/orchestrator/memory/evolver
-├── config/                    # （未来：分层配置加载）
+├── config.rs                  # 统一配置：agent.toml 一次解析（provider/agent/context/roles/memory/evolution）+ OnceLock 缓存
 ├── tools_ext/
 │   └── mod.rs                 # 动态工具：load_all() 由 ToolManifest 重新生成
 ├── tool/                      # （未来：从 tools.rs 拆分）

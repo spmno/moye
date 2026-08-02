@@ -2,6 +2,7 @@
 // Program entry point: logging initialization, context construction, TUI launch.
 mod agent_loop;
 mod cli;
+mod config;
 mod context;
 mod event;
 mod evolution;
@@ -20,19 +21,32 @@ use std::sync::Arc;
 use anyhow::Result;
 use cli::context::AppContext;
 use evolution::prompt_evolve::PromptEvolver;
-use registry::{AgentRegistry, AgentRegistryConfig, Orchestrator};
+use registry::{AgentRegistry, Orchestrator};
 use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 加载项目根 .env（若存在）：把供应商/API Key/模型等配置写进 .env 一次，
+    // 之后无需每次启动前 export。已显式 export 的环境变量优先，不会被覆盖。
+    // Loads the project-root .env (if present): provider/API key/model config can be
+    // written to .env once, no need to export before every launch. Explicitly exported
+    // environment variables take precedence and are never overridden.
+    let env_file = dotenvy::dotenv().ok();
+
     init_logging();
 
-    let reg_cfg = AgentRegistryConfig::load("agent.toml")?;
-    let registry = AgentRegistry::new(reg_cfg);
+    if let Some(path) = env_file {
+        info!("[env] \u{8f7d}\u{5165}\u{4e86}\u{914d}\u{7f6e}\u{6587}\u{4ef6}: {}", path.display());
+    }
+
+    // 统一解析 agent.toml（仅此一处），各模块共享同一份配置。
+    // Parse agent.toml once here; all modules share this single config.
+    let config = crate::config::init("agent.toml")?;
+    let registry = AgentRegistry::new(config.clone());
     let orchestrator = Orchestrator::new(registry.clone());
     let evolver = PromptEvolver::new(registry.clone(), "AGENTS.md".to_string());
-    let memory = memory::MemoryStore::new(&cli::context::load_memory_cfg()?)?;
-    let rule_threshold = cli::context::load_escalation_threshold()?;
+    let memory = memory::MemoryStore::new(&config.memory)?;
+    let rule_threshold = config.evolution.rule_escalation_threshold;
 
     let ctx = Arc::new(AppContext {
         registry,

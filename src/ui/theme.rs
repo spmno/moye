@@ -118,3 +118,29 @@ pub fn status_ready() -> Style {
 pub fn status_hitl() -> Style {
     Style::new().fg(Color::LightRed).add_modifier(Modifier::BOLD)
 }
+
+// ===== 选择器样式 =====
+// ===== Selector styles =====
+
+pub fn selector_title() -> Style {
+    Style::new().fg(Color::LightCyan).add_modifier(Modifier::BOLD)
+}
+
+pub fn selector_highlight() -> Style {
+    Style::new()
+        .fg(Color::Black)
+        .bg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+pub fn selector_normal() -> Style {
+    Style::new().fg(Color::Gray)
+}
+
+pub fn selector_dim() -> Style {
+    Style::new().fg(Color::DarkGray)
+}
+
+pub fn selector_input() -> Style {
+    Style::new().fg(Color::LightYellow).add_modifier(Modifier::BOLD)
+}

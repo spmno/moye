@@ -100,6 +100,22 @@ cd my-agent
 
 Set `MY_AGENT_PROVIDER` to select a provider. API keys are read from provider-specific environment variables. All providers use the OpenAI-compatible interface.
 
+### 推荐：`.env` 文件（写一次，无需每次 export）/ Recommended: `.env` file
+
+程序启动时会自动加载项目根目录的 `.env` 文件（若存在），把配置写入进程环境——只需配置一次，之后每次启动自动生效，无需手动 export。显式 export 的变量优先，不会被 `.env` 覆盖。
+
+The program auto-loads a `.env` file from the project root at startup (if present), so you configure once and every launch picks it up — no manual export needed. Explicitly exported variables take precedence and are never overridden.
+
+```bash
+# 首次配置：复制模板并填写你的 key
+cp .env.example .env
+# 编辑 .env：设置 MY_AGENT_PROVIDER 与对应 API Key
+
+cargo run   # 之后每次启动自动生效
+```
+
+`.env` 已被 `.gitignore` 忽略，密钥不会进入 git。/ `.env` is gitignored; secrets never enter git.
+
 ### DeepSeek（默认 / Default）
 
 无需设置 `MY_AGENT_PROVIDER`，默认即为 DeepSeek。/ No need to set `MY_AGENT_PROVIDER`; DeepSeek is the default.
@@ -107,6 +123,13 @@ Set `MY_AGENT_PROVIDER` to select a provider. API keys are read from provider-sp
 ```bash
 export DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxx
 cargo run
+```
+
+或在 `.env` 中配置 / or configure in `.env`:
+
+```bash
+MY_AGENT_PROVIDER=deepseek
+DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
 | 项目 / Item | 值 / Value |
@@ -229,6 +252,7 @@ Type a task for the Agent to complete. It will plan and execute autonomously. St
 |------|------|------|
 | `model <slug>` | 切换当前会话的模型 / Switch session model | `model kimi-k3` |
 | `model` | 查看当前模型 / Show current model | `model` |
+| `models` | 打开交互式模型选择器（opencode 风格，可输入过滤/自定义 ID）/ Open interactive model picker | `models` |
 | `add-skill <name> <desc>` | 添加新技能（运行时加载）/ Add a skill (runtime) | `add-skill "rust-expert" "Rust code review"` |
 | `skills` | 列出所有已注册技能 / List registered skills | `skills` |
 | `history [n]` | 查看最近 n 轮对话记录（默认 10）/ Show last n turns | `history 5` |
@@ -260,8 +284,14 @@ Type a task for the Agent to complete. It will plan and execute autonomously. St
 
 ```toml
 [provider]
-# 由 MY_AGENT_PROVIDER 环境变量控制，无需手动配置
-# Controlled by MY_AGENT_PROVIDER env var; no manual config needed
+# 默认供应商（deepseek / bailian / moonshot / custom）
+# 优先级：MY_AGENT_PROVIDER 环境变量（或 .env）> 此处配置 > deepseek
+provider = "deepseek"
+# 可选：全局覆盖 OpenAI 兼容 base URL
+# 优先级：MY_AGENT_BASE_URL 环境变量 > 此处配置 > 供应商默认
+# base_url = "https://api.example.com/v1"
+# 可选：自定义 API key 环境变量名（默认按供应商自动选择）
+# api_key_env = "MY_CUSTOM_KEY"
 
 [agent]
 # 默认模型（需与供应商匹配）/ Default model (must match provider)

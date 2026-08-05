@@ -15,8 +15,9 @@
 // 5. truncate_lines / truncate_at_char_boundary — 工具输出截断。
 //    truncate_lines / truncate_at_char_boundary — tool output truncation.
 
-use rig_core::completion::message::{ToolResultContent, UserContent};
+use rig_core::completion::message::{ToolResult, ToolResultContent, UserContent};
 use rig_core::completion::{Message, Usage};
+use rig_core::OneOrMany;
 use serde::Deserialize;
 
 // ─── 配置 ────────────────────────────────────────────────────────────────────
@@ -50,6 +51,16 @@ pub struct ContextConfig {
     /// Max lines for read_file output.
     #[serde(default = "default_max_read_lines")]
     pub max_read_lines: usize,
+
+    /// 触发微压缩（Tier 1）的 token 阈值（估算 token 数超过此值时触发）。
+    /// Token threshold to trigger microcompact (Tier 1) when estimated tokens exceed this.
+    #[serde(default = "default_microcompact_threshold")]
+    pub microcompact_threshold: usize,
+
+    /// 微压缩时保护的最近工具结果数量（最近 N 个 ToolResult 不清除）。
+    /// Number of recent ToolResults to protect during microcompact (last N are not cleared).
+    #[serde(default = "default_microcompact_protected_results")]
+    pub microcompact_protected_results: usize,
 }
 
 pub(crate) fn default_max_output_tokens() -> usize {
@@ -67,6 +78,12 @@ pub(crate) fn default_max_bash_output() -> usize {
 pub(crate) fn default_max_read_lines() -> usize {
     500
 }
+pub(crate) fn default_microcompact_threshold() -> usize {
+    20000
+}
+pub(crate) fn default_microcompact_protected_results() -> usize {
+    3
+}
 
 impl Default for ContextConfig {
     fn default() -> Self {
@@ -76,6 +93,8 @@ impl Default for ContextConfig {
             keep_recent_turns: default_keep_recent_turns(),
             max_bash_output_chars: default_max_bash_output(),
             max_read_lines: default_max_read_lines(),
+            microcompact_threshold: default_microcompact_threshold(),
+            microcompact_protected_results: default_microcompact_protected_results(),
         }
     }
 }
@@ -344,13 +363,111 @@ pub fn format_messages_for_summary(messages: &[Message]) -> String {
     parts.join("\n\n")
 }
 
+// ─── 微压缩（Tier 1）─────────────────────────────────────────────────────────
+// ─── Microcompact (Tier 1) ──────────────────────────────────────────────────────
+
+/// 微压缩：无需 LLM 调用，清除旧工具结果。
+/// Microcompact: clear old tool results without an LLM call.
+///
+/// 扫描历史中的 `ToolResult`，保护最近 `protected_results` 个，
+/// 将更早的 ToolResult 内容替换为 `[Tool result cleared]` 标记。
+/// Scans history for `ToolResult` content, protects the last `protected_results`
+/// tool results, and replaces all older tool result content with a cleared marker.
+///
+/// 返回修改后的历史副本；若无 ToolResult 需清除则返回原历史的克隆。
+/// Returns a modified copy of the history; if no ToolResults need clearing,
+/// returns a clone of the original.
+pub fn microcompact(history: &[Message], protected_results: usize) -> Vec<Message> {
+    // 收集所有 ToolResult 在历史中的 (msg_idx, content_idx) 位置。
+    // Collect all (msg_idx, content_idx) positions of ToolResult in history.
+    let mut tool_result_positions: Vec<(usize, usize)> = Vec::new();
+    for (msg_idx, msg) in history.iter().enumerate() {
+        if let Message::User { content } = msg {
+            for (ci, item) in content.iter().enumerate() {
+                if matches!(item, UserContent::ToolResult(_)) {
+                    tool_result_positions.push((msg_idx, ci));
+                }
+            }
+        }
+    }
+
+    // 工具结果数量 <= 保护数量，无需清除。
+    // If tool result count <= protected count, nothing to clear.
+    if tool_result_positions.len() <= protected_results {
+        return history.to_vec();
+    }
+
+    // 待清除的位置：除了最后 `protected_results` 个。
+    // Positions to clear: all except the last `protected_results`.
+    let clear_count = tool_result_positions.len() - protected_results;
+    let to_clear: std::collections::HashSet<(usize, usize)> =
+        tool_result_positions[..clear_count].iter().cloned().collect();
+
+    let mut result: Vec<Message> = Vec::with_capacity(history.len());
+    for (msg_idx, msg) in history.iter().enumerate() {
+        match msg {
+            Message::User { content } => {
+                // 检查本消息是否有需要清除的 ToolResult。
+                // Check if this message has any ToolResult to clear.
+                let needs_clearing = content
+                    .iter()
+                    .enumerate()
+                    .any(|(ci, _)| to_clear.contains(&(msg_idx, ci)));
+
+                if !needs_clearing {
+                    result.push(msg.clone());
+                    continue;
+                }
+
+                // 重建 content，将待清除的 ToolResult 替换为清除标记。
+                // Rebuild content, replacing designated ToolResults with cleared marker.
+                let mut new_items: Vec<UserContent> = Vec::new();
+                for (ci, item) in content.iter().enumerate() {
+                    if to_clear.contains(&(msg_idx, ci)) {
+                        if let UserContent::ToolResult(tr) = item {
+                            new_items.push(UserContent::ToolResult(ToolResult {
+                                id: tr.id.clone(),
+                                call_id: tr.call_id.clone(),
+                                content: OneOrMany::one(ToolResultContent::text(
+                                    "[Tool result cleared / 工具结果已清除]",
+                                )),
+                            }));
+                        }
+                    } else {
+                        new_items.push(item.clone());
+                    }
+                }
+
+                let new_content = OneOrMany::many(new_items)
+                    .expect("non-empty: original message had at least one content item");
+                result.push(Message::User {
+                    content: new_content,
+                });
+            }
+            _ => result.push(msg.clone()),
+        }
+    }
+    result
+}
+
 /// 压缩系统提示词（发给摘要 LLM 的 preamble）。
 /// Compaction system prompt (preamble sent to the summarization LLM).
+///
+/// 采用 9 段结构化模板，确保摘要覆盖关键维度。
+/// Uses a 9-section structured template to ensure the summary covers key dimensions.
 pub const COMPACTION_PREAMBLE: &str = "\
-你是对话历史压缩器。将以下对话历史压缩为简洁的结构化摘要，\
-保留关键信息：用户目标、已完成的工作、工具调用结果摘要、\
-未完成的步骤、重要决策与发现。\
-用简洁的中文要点格式输出，不要超过 500 字。";
+你是对话历史压缩器。将以下对话历史压缩为结构化摘要，\
+严格使用以下 9 个小节格式输出：\n\
+\n## 1. 任务意图\n用户想要达成的目标（1-2 句）。\n\
+\n## 2. 技术概念\n涉及的关键技术、框架、库（要点列表）。\n\
+\n## 3. 文件与代码\n已创建/修改的文件路径及关键代码片段（要点列表）。\n\
+\n## 4. 错误与修复\n遇到的错误及解决方案（要点列表）。\n\
+\n## 5. 方法\n采用的实现路径或方法论（1-2 句）。\n\
+\n## 6. 用户消息\n用户的关键指令和反馈（要点列表）。\n\
+\n## 7. 待办\n尚未完成的任务（要点列表，如无则写\"无\"）。\n\
+\n## 8. 当前进展\n已完成的步骤总结（要点列表）。\n\
+\n## 9. 下一步\n紧接着需要做什么（1-2 句）。\n\
+\n用简洁的中文输出。保留代码片段、文件路径、错误信息的原文。";
 
 // ─── 截断工具 ─────────────────────────────────────────────────────────────────
 // ─── Truncation Utilities ───────────────────────────────────────────────────────
@@ -557,6 +674,98 @@ mod tests {
         assert!(formatted.contains("[Assistant]: hi there"));
     }
 
+    // ── microcompact ──
+
+    #[test]
+    fn microcompact_clears_old_tool_results() {
+        // 5 tool results, protect last 2 → first 3 should be cleared.
+        let msgs = vec![
+            Message::user("do task 1"),
+            Message::assistant_with_id("m1".into(), "calling tool 1"),
+            Message::tool_result("t1", "result 1 with lots of content"),
+            Message::assistant_with_id("m2".into(), "calling tool 2"),
+            Message::tool_result("t2", "result 2 with lots of content"),
+            Message::assistant_with_id("m3".into(), "calling tool 3"),
+            Message::tool_result("t3", "result 3 with lots of content"),
+            Message::assistant_with_id("m4".into(), "calling tool 4"),
+            Message::tool_result("t4", "result 4 protected"),
+            Message::assistant_with_id("m5".into(), "calling tool 5"),
+            Message::tool_result("t5", "result 5 protected"),
+        ];
+        let compacted = microcompact(&msgs, 2);
+        // Same length.
+        assert_eq!(compacted.len(), msgs.len());
+
+        // Tool results at index 2, 4, 6 should be cleared.
+        let cleared = extract_text(&compacted[2]);
+        assert!(cleared.contains("cleared"));
+        assert!(!cleared.contains("result 1"));
+
+        let cleared2 = extract_text(&compacted[4]);
+        assert!(cleared2.contains("cleared"));
+        assert!(!cleared2.contains("result 2"));
+
+        let cleared3 = extract_text(&compacted[6]);
+        assert!(cleared3.contains("cleared"));
+        assert!(!cleared3.contains("result 3"));
+
+        // Last 2 tool results (index 8, 10) should be preserved.
+        let preserved4 = extract_text(&compacted[8]);
+        assert!(preserved4.contains("result 4 protected"));
+
+        let preserved5 = extract_text(&compacted[10]);
+        assert!(preserved5.contains("result 5 protected"));
+    }
+
+    #[test]
+    fn microcompact_fewer_than_protected() {
+        // 2 tool results, protect 5 → nothing should be cleared.
+        let msgs = vec![
+            Message::user("do task"),
+            Message::assistant_with_id("m1".into(), "calling tool"),
+            Message::tool_result("t1", "result 1"),
+            Message::assistant("done"),
+        ];
+        let compacted = microcompact(&msgs, 5);
+        // Should be identical (no clearing).
+        let text = extract_text(&compacted[2]);
+        assert!(text.contains("result 1"));
+        assert!(!text.contains("cleared"));
+    }
+
+    #[test]
+    fn microcompact_no_tool_results() {
+        let msgs = vec![
+            Message::user("hello"),
+            Message::assistant("hi"),
+            Message::user("how are you"),
+        ];
+        let compacted = microcompact(&msgs, 3);
+        assert_eq!(compacted.len(), msgs.len());
+    }
+
+    #[test]
+    fn microcompact_preserves_non_tool_content() {
+        // User message with both Text and ToolResult content.
+        let msgs = vec![
+            Message::user("start"),
+            Message::assistant_with_id("m1".into(), "call tool"),
+            Message::tool_result("t1", "old result 1"),
+            Message::assistant_with_id("m2".into(), "call tool 2"),
+            Message::tool_result("t2", "old result 2"),
+            Message::assistant_with_id("m3".into(), "call tool 3"),
+            Message::tool_result("t3", "protected result 3"),
+        ];
+        let compacted = microcompact(&msgs, 1);
+        // First two tool results cleared, last one preserved.
+        assert!(extract_text(&compacted[2]).contains("cleared"));
+        assert!(extract_text(&compacted[4]).contains("cleared"));
+        assert!(extract_text(&compacted[6]).contains("protected result 3"));
+        // Assistant messages preserved.
+        assert!(extract_text(&compacted[1]).contains("call tool"));
+        assert!(extract_text(&compacted[3]).contains("call tool 2"));
+    }
+
     // ── truncate_at_char_boundary ──
 
     #[test]
@@ -602,6 +811,8 @@ mod tests {
         assert_eq!(cfg.keep_recent_turns, 6);
         assert_eq!(cfg.max_bash_output_chars, 20000);
         assert_eq!(cfg.max_read_lines, 500);
+        assert_eq!(cfg.microcompact_threshold, 20000);
+        assert_eq!(cfg.microcompact_protected_results, 3);
     }
 
     #[test]
@@ -612,6 +823,8 @@ compaction_threshold = 0.8
 keep_recent_turns = 4
 max_bash_output_chars = 30000
 max_read_lines = 300
+microcompact_threshold = 15000
+microcompact_protected_results = 5
 "#;
         let cfg: ContextConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.max_output_tokens, 8192);
@@ -619,6 +832,8 @@ max_read_lines = 300
         assert_eq!(cfg.keep_recent_turns, 4);
         assert_eq!(cfg.max_bash_output_chars, 30000);
         assert_eq!(cfg.max_read_lines, 300);
+        assert_eq!(cfg.microcompact_threshold, 15000);
+        assert_eq!(cfg.microcompact_protected_results, 5);
     }
 
     #[test]

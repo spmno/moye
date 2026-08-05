@@ -25,6 +25,8 @@ my-agent
 │   │                    # Built-in tools (read_file / edit_file / run_bash / write_file)
 │   ├── sandbox.rs       # 文件系统沙箱（限制访问到项目根目录及子目录）
 │   │                    # Filesystem sandbox (restricts access to project root + subdirs)
+│   ├── context.rs       # 上下文管理（token 估算 + 两层压缩 + 工具输出截断）
+│   │                    # Context management (token estimation + two-tier compaction + truncation)
 │   ├── skills.rs        # 技能系统（运行时加载，无需重编译）
 │   │                    # Skill system (runtime-loaded, no recompilation)
 │   ├── reviewer.rs      # 审计门控（两阶段评审）
@@ -320,6 +322,16 @@ permissions.run_bash_readonly = "allow"
 permissions.run_bash_mutating = "ask"     # 需人工确认 / Requires confirmation
 permissions.edit_file = "allow"
 
+[context]
+# 上下文管理配置 / Context management config
+max_output_tokens = 4096           # 预留输出 token / Output token reservation
+compaction_threshold = 0.75        # 触发 LLM 摘要的比例 / Overflow ratio for LLM summary
+keep_recent_turns = 6              # 压缩时保留的最近轮数 / Recent turns to keep
+max_bash_output_chars = 20000      # run_bash 输出截断 / Bash output truncation
+max_read_lines = 500               # read_file 输出截断 / Read file truncation
+microcompact_threshold = 20000     # Tier 1 触发 token 阈值 / Tier 1 trigger token threshold
+microcompact_protected_results = 3 # Tier 1 保护最近 N 个工具结果 / Protect last N tool results
+
 [memory]
 dir = "memory"
 conversation_file = "conversations.jsonl"
@@ -383,6 +395,148 @@ cargo run
 
 > 工具分类由 `is_readonly_bash()` 自动判断。只读命令（`ls`、`cat`、`git log` 等）自动归为 `run_bash_readonly`，其余归为 `run_bash_mutating`。
 > Tool classification is automatic via `is_readonly_bash()`. Read-only commands (`ls`, `cat`, `git log`, etc.) are classified as `run_bash_readonly`; everything else as `run_bash_mutating`.
+
+---
+
+## 上下文管理 / Context Management
+
+长时间运行的 Agent 会话会积累大量对话历史（用户消息、Assistant 回复、工具调用结果），最终超出模型的上下文窗口。my-agent 采用**两层渐进式压缩策略**，在不丢失关键信息的前提下自动管理上下文。
+
+Long-running agent sessions accumulate conversation history (user messages, assistant replies, tool call results) that eventually exceeds the model's context window. my-agent uses a **two-tier progressive compaction strategy** that automatically manages context without losing critical information.
+
+### 策略概览 / Strategy Overview
+
+```
+                    估算 token 数
+                    estimated tokens
+                         │
+           ┌─────────────┴─────────────┐
+           │                           │
+     ≤ microcompact_threshold    > microcompact_threshold
+           │                           │
+     不做处理                      Tier 1: 微压缩
+     Continue                  Microcompact (no LLM)
+                                    │
+                           ┌────────┴────────┐
+                           │                  │
+                     仍超阈值            已降至阈值以下
+                     Still overflow       Below threshold
+                           │                  │
+                     Tier 2: LLM 摘要     返回微压缩历史
+                     LLM Summarization    Return microcompacted
+                           │
+                     返回摘要 + 近期历史
+                     Return summary + recent
+```
+
+| 层级 / Tier | 机制 / Mechanism | 触发条件 / Trigger | LLM 调用 / LLM Call | 耗时 / Cost |
+|------|------|------|------|------|
+| **Tier 1 — 微压缩 / Microcompact** | 扫描历史中的旧 `ToolResult`，保护最近 N 个，将更早的工具结果替换为 `[Tool result cleared]` 标记 | 估算 token > `microcompact_threshold`（默认 20000） | 否 / No | 极低（纯内存操作）/ Minimal (in-memory) |
+| **Tier 2 — LLM 摘要 / LLM Summarization** | 将旧对话历史发送给摘要 LLM，生成 9 段结构化摘要，替换为单条 System 消息 | Tier 1 后仍超过 `compaction_threshold`（默认 0.75 × 有效预算）| 是 / Yes | 较高（一次 LLM 调用）/ Moderate (one LLM call) |
+
+### Tier 1：微压缩 / Microcompact
+
+**无需 LLM 调用**的轻量压缩。工具调用结果（`ToolResult`）通常占据大量 token（如 `read_file` 返回数百行代码、`run_bash` 返回长输出），但在后续轮次中往往不再需要完整内容。
+
+A lightweight compaction **without an LLM call**. Tool call results (`ToolResult`) typically consume many tokens (e.g., `read_file` returning hundreds of lines, `run_bash` returning long output), but their full content is often no longer needed in subsequent turns.
+
+**工作流程 / Workflow:**
+
+1. 扫描历史中所有 `ToolResult` 的位置 / Scan all `ToolResult` positions in history
+2. 保护最近 `microcompact_protected_results` 个（默认 3）/ Protect the last `microcompact_protected_results` (default 3)
+3. 将更早的 `ToolResult` 内容替换为 `[Tool result cleared / 工具结果已清除]` / Replace older `ToolResult` content with a cleared marker
+4. 保留 `ToolResult` 的 `id` 和 `call_id`（API 需要它们关联工具调用）/ Preserve `id` and `call_id` (needed by the API for tool call correlation)
+
+**示例 / Example:**
+
+```
+压缩前 / Before:
+  User: do task 1
+  Assistant: [tool_call: read_file]
+  User: [ToolResult: fn main() { ... 200 lines of code ... }]   ← 清除
+  Assistant: [tool_call: run_bash]
+  User: [ToolResult: cargo build output ... 50 lines ...]       ← 清除
+  Assistant: [tool_call: edit_file]
+  User: [ToolResult: file edited successfully]                  ← 保留（最近 3 个之一）
+  Assistant: [tool_call: run_bash]
+  User: [ToolResult: cargo test output ... 30 lines ...]        ← 保留
+  Assistant: [tool_call: read_file]
+  User: [ToolResult: fn helper() { ... }]                       ← 保留
+
+压缩后 / After:
+  User: do task 1
+  Assistant: [tool_call: read_file]
+  User: [ToolResult: [Tool result cleared / 工具结果已清除]]     ← 替换
+  Assistant: [tool_call: run_bash]
+  User: [ToolResult: [Tool result cleared / 工具结果已清除]]     ← 替换
+  Assistant: [tool_call: edit_file]
+  User: [ToolResult: file edited successfully]                  ← 原样保留
+  ...
+```
+
+### Tier 2：LLM 摘要 / LLM Summarization
+
+当 Tier 1 微压缩后仍超出 `compaction_threshold` 时触发。将旧对话历史发送给摘要 LLM，生成** 9 段结构化摘要**，确保关键信息不丢失。
+
+Triggered when tokens still exceed `compaction_threshold` after Tier 1. Sends old conversation history to a summarization LLM, generating a **9-section structured summary** to ensure critical information is preserved.
+
+**9 段摘要模板 / 9-Section Summary Template:**
+
+| # | 小节 / Section | 内容 / Content |
+|---|------|------|
+| 1 | 任务意图 / Task Intent | 用户想要达成的目标（1-2 句）/ User's goal (1-2 sentences) |
+| 2 | 技术概念 / Technical Concepts | 涉及的关键技术、框架、库 / Key technologies, frameworks, libraries |
+| 3 | 文件与代码 / Files & Code | 已创建/修改的文件路径及关键代码片段 / File paths and key code snippets |
+| 4 | 错误与修复 / Errors & Fixes | 遇到的错误及解决方案 / Errors encountered and solutions |
+| 5 | 方法 / Approach | 采用的实现路径或方法论 / Implementation path or methodology |
+| 6 | 用户消息 / User Messages | 用户的关键指令和反馈 / Key user instructions and feedback |
+| 7 | 待办 / TODOs | 尚未完成的任务 / Pending tasks |
+| 8 | 当前进展 / Current Progress | 已完成的步骤总结 / Summary of completed steps |
+| 9 | 下一步 / Next Steps | 紧接着需要做什么 / What needs to happen next |
+
+**压缩后历史结构 / Compacted History Structure:**
+
+```
+[System: [对话历史摘要 / Conversation Summary]
+  ## 1. 任务意图 ...
+  ## 2. 技术概念 ...
+  ...
+  ## 9. 下一步 ...]
+[User: 最近第 1 轮消息]          ← keep_recent_turns 保留
+[Assistant: 最近第 1 轮回复]
+[User: 最近第 2 轮消息]
+...
+```
+
+### rig PatchRequest 机制 / rig PatchRequest Mechanism
+
+压缩通过 rig 的 `Flow::PatchRequest` + `RequestPatch::history()` 实现。这是**每轮非粘性**的替换：只修改当轮发送给 API 的历史，不影响 rig 内部持久化的真实 transcript。这意味着 Agent 始终能访问完整的真实历史，只是在发送给 API 时用压缩版替换。
+
+Compaction uses rig's `Flow::PatchRequest` + `RequestPatch::history()`. This is a **per-turn non-sticky** replacement: it only modifies the history sent to the API for the current turn, without affecting rig's internally persisted real transcript. This means the Agent always has access to the full real history, but uses the compacted version when sending to the API.
+
+### 配置参数 / Configuration Parameters
+
+所有参数在 `agent.toml` 的 `[context]` 节配置 / All parameters are configured in the `[context]` section of `agent.toml`:
+
+| 参数 / Parameter | 默认值 / Default | 说明 / Description |
+|------|------|------|
+| `max_output_tokens` | `4096` | 预留给模型输出的 token 数 / Tokens reserved for model output |
+| `compaction_threshold` | `0.75` | Tier 2 触发比例（占有效预算的比例，0.0–1.0）/ Tier 2 trigger ratio (fraction of effective budget, 0.0–1.0) |
+| `keep_recent_turns` | `6` | Tier 2 压缩时保留的最近对话轮数 / Recent turns kept during Tier 2 compaction |
+| `max_bash_output_chars` | `20000` | `run_bash` 工具输出截断字符数 / Max chars for `run_bash` output |
+| `max_read_lines` | `500` | `read_file` 工具输出截断行数 / Max lines for `read_file` output |
+| `microcompact_threshold` | `20000` | Tier 1 触发的 token 阈值 / Tier 1 trigger token threshold |
+| `microcompact_protected_results` | `3` | Tier 1 微压缩时保护的最近工具结果数量 / Number of recent tool results protected during Tier 1 |
+
+> **有效预算 / Effective Budget** = `上下文窗口大小 - max_output_tokens`。例如 128K 窗口、4096 预留 → 有效预算 123,904 tokens，Tier 2 触发线 = 123,904 × 0.75 ≈ 92,928 tokens。
+>
+> **Effective Budget** = `context window - max_output_tokens`. E.g., 128K window, 4096 reserved → effective budget 123,904 tokens, Tier 2 trigger = 123,904 × 0.75 ≈ 92,928 tokens.
+
+### 缓存机制 / Caching
+
+压缩结果会被缓存（`compaction_cache`）。当历史长度未变时（例如 Agent 在等待用户输入期间多次进入 `handle_completion_call`），直接复用上次的压缩结果，避免重复计算。
+
+Compaction results are cached (`compaction_cache`). When the history length hasn't changed (e.g., the Agent enters `handle_completion_call` multiple times while waiting for user input), the last compaction result is reused directly, avoiding redundant computation.
 
 ---
 
@@ -450,6 +604,10 @@ src/
 │                        # Role registry + tool tiers + intent classification
 ├── tools.rs             # 内置工具（read_file / edit_file / run_bash / write_file）
 │                        # Built-in tools
+├── sandbox.rs           # 文件系统沙箱（限制访问到项目根目录及子目录）
+│                        # Filesystem sandbox (restricts access to project root + subdirs)
+├── context.rs           # 上下文管理（token 估算 + 两层压缩 + 工具输出截断）
+│                        # Context management (token estimation + two-tier compaction + truncation)
 ├── skills.rs            # 技能清单 + 注入逻辑
 │                        # Skill manifest + injection logic
 ├── reviewer.rs          # 两阶段审计门控（规格符合性 + 代码质量）

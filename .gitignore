@@ -2,6 +2,7 @@
 memory/
 *.log
 .env
+agent.toml
 .omo/
 logs/
 .sisyphus/

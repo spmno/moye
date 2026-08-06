@@ -659,7 +659,7 @@ pub async fn run_autonomous(
             .unwrap_or_else(|| registry.effective_model());
         let context_limit = crate::providers::context_limit_for_model(&model);
         let context_config = registry.context_config().clone();
-        let context_client = crate::providers::create_client()?;
+        let context_client = registry.create_client()?;
         let context_hook = ContextHook::new(
             context_limit,
             context_config,
@@ -829,7 +829,7 @@ fn build_runner_agent(
     let rc = registry
         .role_config(role)
         .ok_or_else(|| anyhow::anyhow!("no config for role {role:?}"))?;
-    let client = crate::providers::create_client()?;
+    let client = registry.create_client()?;
     let preamble = std::fs::read_to_string(&rc.preamble)
         .unwrap_or_else(|_| format!("\u{4f60}\u{662f} {role:?} agent\u{3002}"));
     let preamble = crate::registry::inject_skills_public(&preamble);

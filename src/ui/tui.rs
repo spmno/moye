@@ -593,9 +593,20 @@ fn handle_key_event(
                 let selected = state.selector.as_ref().and_then(|s| s.selection());
                 state.selector = None;
                 if let Some(item) = selected {
-                    // 当前仅模型选择器：切换会话模型。
-                    // Currently only the model selector exists: switch the session model.
-                    ctx.cmd_model(Some(item.label.clone()));
+                    // 历史项在 data 里编码了 "provider\nbase_url"；解码后连同恢复，否则只切 slug。
+                    // History items encode "provider\nbase_url" in data; decode and restore
+                    // together, otherwise only switch the slug.
+                    let (provider, base_url) = item
+                        .data
+                        .as_ref()
+                        .and_then(|s| {
+                            let mut it = s.splitn(2, '\n');
+                            let p = it.next()?.to_string();
+                            let b = it.next()?.to_string();
+                            Some((Some(p), Some(b)))
+                        })
+                        .unwrap_or((None, None));
+                    ctx.cmd_model(Some(item.label.clone()), provider, base_url);
                     state.model = ctx.current_model();
                     state.push_event(AgentEvent::Info(format!("model: {}", state.model)));
                 }
@@ -740,19 +751,34 @@ fn handle_command(
             state.task_handle = Some(handle);
         }
         ReplCommand::Model { slug } => {
-            ctx.cmd_model(slug);
+            ctx.cmd_model(slug, None, None);
             state.model = ctx.current_model();
             state.push_event(AgentEvent::Info(format!("model: {}", state.model)));
         }
         ReplCommand::Models => {
             let provider = crate::providers::current_provider();
-            let items: Vec<SelectorItem> = crate::providers::provider_models(provider)
+            let mut items: Vec<SelectorItem> = crate::providers::provider_models(provider)
                 .into_iter()
                 .map(|m| SelectorItem {
                     label: m.slug,
                     detail: m.desc.to_string(),
+                    ..Default::default()
                 })
                 .collect();
+            // 追加最近使用模型（去重内置清单已列出的 slug），标注使用次数；
+            // Custom 供应商无内置清单时，历史是主要来源。
+            let hist = ctx.model_history.lock().unwrap();
+            for r in hist.recent(10) {
+                if !items.iter().any(|i| i.label == r.slug) {
+                    items.push(SelectorItem {
+                        label: r.slug.clone(),
+                        detail: format!("\u{6700}\u{8fd1}\u{4f7f}\u{7528} {} \u{6b21}", r.uses),
+                        data: Some(format!("{}\n{}", r.provider, r.base_url)),
+                        ..Default::default()
+                    });
+                }
+            }
+            drop(hist);
             state.selector = Some(SelectorState::new(
                 format!("{provider:?} \u{6a21}\u{578b}\u{9009}\u{62e9} / Models"),
                 items,

@@ -3,7 +3,7 @@
 // 以及构建和管理各角色 Agent 的 AgentRegistry。权限分级驱动自主循环的 HITL（人在环）控制。
 // and AgentRegistry for building and managing role Agents. Permission tiers drive autonomous loop HITL (Human-in-the-Loop) control.
 use crate::event::{AgentEvent, EventSender};
-use crate::providers::{create_client, ChatAgent};
+use crate::providers::ChatAgent;
 use crate::sandbox::Sandbox;
 use rig_core::client::CompletionClient;
 use serde::Deserialize;
@@ -142,6 +142,12 @@ pub struct AgentRegistry {
     // 让用户无需改文件即可从 REPL 切换到免费模型（如 tencent/hy3:free）。
     // letting users switch to a free model (e.g. tencent/hy3:free) from REPL without editing files.
     session_model: Arc<Mutex<Option<String>>>,
+    /// 会话级供应商覆盖（切回历史模型时恢复）。None 时走 env > config。
+    /// Session-level provider override (restored when switching back). None falls through.
+    session_provider: Arc<Mutex<Option<String>>>,
+    /// 会话级 base_url 覆盖（切回历史模型时恢复）。None 时走 env > config > 默认。
+    /// Session-level base_url override (restored when switching back). None falls through.
+    session_base_url: Arc<Mutex<Option<String>>>,
 }
 
 impl AgentRegistry {
@@ -154,6 +160,8 @@ impl AgentRegistry {
         Self {
             config,
             session_model: Arc::new(Mutex::new(session_model)),
+            session_provider: Arc::new(Mutex::new(None)),
+            session_base_url: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -163,6 +171,8 @@ impl AgentRegistry {
         Self {
             config: self.config.clone(),
             session_model: self.session_model.clone(),
+            session_provider: self.session_provider.clone(),
+            session_base_url: self.session_base_url.clone(),
         }
     }
 
@@ -174,6 +184,36 @@ impl AgentRegistry {
 
     pub fn session_model(&self) -> Option<String> {
         self.session_model.lock().unwrap().clone()
+    }
+
+    /// 覆盖本会话的供应商（切回历史模型时恢复当时的供应商）。
+    /// Overrides the provider for this session (restored when switching back to a historical model).
+    pub fn set_session_provider(&self, provider: &str) {
+        *self.session_provider.lock().unwrap() = Some(provider.to_string());
+    }
+
+    pub fn session_provider(&self) -> Option<String> {
+        self.session_provider.lock().unwrap().clone()
+    }
+
+    /// 覆盖本会话的 base URL（切回历史模型时恢复当时的网关）。
+    /// Overrides the base URL for this session (restored when switching back to a historical model).
+    pub fn set_session_base_url(&self, base_url: &str) {
+        *self.session_base_url.lock().unwrap() = Some(base_url.to_string());
+    }
+
+    pub fn session_base_url(&self) -> Option<String> {
+        self.session_base_url.lock().unwrap().clone()
+    }
+
+    /// 构建客户端，应用 session 级 provider/base_url 覆盖（切回历史模型时走当时的网关）。
+    /// Build a client applying session-level provider/base_url overrides
+    /// (uses the gateway from the time when switching back to a historical model).
+    pub fn create_client(&self) -> anyhow::Result<crate::providers::CompletionsClient> {
+        crate::providers::create_client_with(
+            self.session_provider().as_deref(),
+            self.session_base_url().as_deref(),
+        )
     }
 
     /// 自主循环的上限轮数，从配置透传。
@@ -197,7 +237,7 @@ impl AgentRegistry {
             .roles
             .get(&key)
             .ok_or_else(|| anyhow::anyhow!("no config for role {key}"))?;
-        let client = create_client()?;
+        let client = self.create_client()?;
         let preamble = std::fs::read_to_string(&rc.preamble)
             .unwrap_or_else(|_| format!("你是 {key} agent。"));
         // 把与角色领域相关的技能指令注入提示词，使模型遵循技能中的步骤。

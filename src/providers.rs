@@ -81,6 +81,28 @@ impl Provider {
         }
     }
 
+    /// 该供应商的默认 API key 环境变量名（不含 config 自定义覆盖）。
+    /// Default API key env var name for this provider (without config overrides).
+    fn default_api_key_env(&self) -> &'static str {
+        match self {
+            Provider::DeepSeek => "DEEPSEEK_API_KEY",
+            Provider::Bailian => "DASHSCOPE_API_KEY",
+            Provider::Moonshot => "MOONSHOT_API_KEY",
+            Provider::Custom => "MY_AGENT_API_KEY",
+        }
+    }
+
+    /// 该供应商的默认 OpenAI 兼容 base URL（不含 env/config 覆盖）。
+    /// Default OpenAI-compatible base URL for this provider (without env/config overrides).
+    fn default_base_url(&self) -> &'static str {
+        match self {
+            Provider::DeepSeek => "https://api.deepseek.com/v1",
+            Provider::Bailian => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            Provider::Moonshot => "https://api.moonshot.cn/v1",
+            Provider::Custom => "https://api.openai.com/v1",
+        }
+    }
+
     /// 将请求的 temperature 限制在供应商允许的范围内。
     /// Clamp the requested temperature to the range allowed by the provider.
     pub fn clamp_temperature(desired: f64) -> f64 {
@@ -91,17 +113,61 @@ impl Provider {
     }
 }
 
-/// 构建当前供应商的 OpenAI 兼容客户端。
-/// Build the OpenAI-compatible client for the current provider.
-pub fn create_client() -> Result<CompletionsClient> {
-    let provider = Provider::from_env();
-    let api_key = std::env::var(provider.api_key_env())
-        .map_err(|_| anyhow::anyhow!(
+/// 把 slug 字符串解析为 [`Provider`]；未知值回退 DeepSeek。
+/// Parse a slug string into a [`Provider`]; unknown values fall back to DeepSeek.
+fn parse_provider(raw: &str) -> Provider {
+    match raw.to_lowercase().as_str() {
+        "bailian" => Provider::Bailian,
+        "moonshot" | "kimi" => Provider::Moonshot,
+        "custom" | "openai" | "glm" => Provider::Custom,
+        _ => Provider::DeepSeek,
+    }
+}
+
+/// 构建客户端，支持 session 级 provider/base_url 覆盖（切回历史模型时恢复当时的网关）。
+/// Build a client with optional session-level provider/base_url overrides (restores the
+/// gateway used at the time when switching back to a historical model).
+///
+/// provider override 存在时，API key 变量名跟随该 provider 的默认——切换供应商即切换
+/// key 来源，否则切了 provider 仍读旧变量名会取不到 key。base_url override 优先于
+/// env / config / provider 默认。
+/// When a provider override is present, the API key env var follows that provider's default
+/// — switching providers switches the key source, otherwise the old var name would be read
+/// and the key would be missing. base_url override takes priority over env / config / default.
+pub fn create_client_with(
+    provider_override: Option<&str>,
+    base_url_override: Option<&str>,
+) -> Result<CompletionsClient> {
+    let provider = provider_override
+        .map(parse_provider)
+        .unwrap_or_else(Provider::from_env);
+    let base_url = base_url_override
+        .map(str::to_string)
+        .or_else(|| std::env::var("MY_AGENT_BASE_URL").ok())
+        .or_else(|| {
+            crate::config::config()
+                .and_then(|c| c.provider.base_url.clone())
+                .filter(|u| !u.trim().is_empty())
+        })
+        .unwrap_or_else(|| provider.default_base_url().to_string());
+    let api_key_env: String = if provider_override.is_some() {
+        provider.default_api_key_env().to_string()
+    } else {
+        provider.api_key_env()
+    };
+    // 当前目录优先：env（项目 .env / export）→ 全局 config.toml [keys] 兜底。
+    // Current dir first: env (project .env / export) → global config.toml [keys] fallback.
+    let api_key = std::env::var(&api_key_env)
+        .ok()
+        .or_else(|| {
+            crate::config::config()
+                .and_then(|c| c.keys.get(&api_key_env).cloned())
+        })
+        .ok_or_else(|| anyhow::anyhow!(
             "{} \u{672a}\u{8bbe}\u{7f6e}\u{3002}\u{8bf7}\u{5728}\u{9879}\u{76ee}\u{6839}\u{76ee}\u{5f55}\u{7684} .env \u{4e2d}\u{914d}\u{7f6e}\u{ff08}\u{53c2}\u{8003} .env.example\u{ff09}\u{6216} export {}",
-            provider.api_key_env(),
-            provider.api_key_env()
+            api_key_env,
+            api_key_env
         ))?;
-    let base_url = provider.base_url();
     info!(
         "[provider] {:?} | base_url={} | api_key={}...{}",
         provider,
@@ -126,6 +192,24 @@ pub fn create_client() -> Result<CompletionsClient> {
 /// Return the currently active provider.
 pub fn current_provider() -> Provider {
     Provider::from_env()
+}
+
+/// 返回当前生效的供应商（小写 slug 字符串），供模型历史记录展示。
+/// Return the currently active provider as a lowercase slug string, for model-history display.
+pub fn current_provider_slug() -> String {
+    match Provider::from_env() {
+        Provider::DeepSeek => "deepseek",
+        Provider::Bailian => "bailian",
+        Provider::Moonshot => "moonshot",
+        Provider::Custom => "custom",
+    }
+    .to_string()
+}
+
+/// 返回当前生效的 OpenAI 兼容 base URL，供模型历史记录写入。
+/// Return the currently effective OpenAI-compatible base URL, written into model history.
+pub fn current_base_url() -> String {
+    Provider::from_env().base_url()
 }
 
 /// 返回当前供应商需要的额外请求参数。

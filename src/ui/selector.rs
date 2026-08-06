@@ -6,14 +6,19 @@
 
 /// 选择器中的一个条目。
 /// A single item in the selector.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SelectorItem {
     /// 条目标识（选中的返回值）。
     /// Item identifier (returned when selected).
     pub label: String,
     /// 条目说明（渲染时显示在 label 之后）。
-    /// Item detail (rendered after the label).
+    /// Item detail (rendered after label).
     pub detail: String,
+    /// 通用负载：模型选择器的历史项编码 `"provider\nbase_url"`，选中时据此恢复网关；
+    /// 其他用途可放任意标识。默认 `None`。
+    /// Generic payload: the model selector's history items encode `"provider\nbase_url"`,
+    /// used on selection to restore the gateway; other uses may store any id. Defaults to `None`.
+    pub data: Option<String>,
 }
 
 /// 选择器状态：条目列表 + 过滤关键字 + 光标。
@@ -120,6 +125,7 @@ impl SelectorState {
             return Some(SelectorItem {
                 label: f.to_string(),
                 detail: "自定义 / custom".to_string(),
+                ..Default::default()
             });
         }
         None
@@ -132,9 +138,9 @@ mod tests {
 
     fn models() -> Vec<SelectorItem> {
         vec![
-            SelectorItem { label: "deepseek-v4-pro".into(), detail: "旗舰".into() },
-            SelectorItem { label: "deepseek-v4-flash".into(), detail: "快速".into() },
-            SelectorItem { label: "kimi-k3".into(), detail: "长上下文".into() },
+            SelectorItem { label: "deepseek-v4-pro".into(), detail: "旗舰".into(), ..Default::default() },
+            SelectorItem { label: "deepseek-v4-flash".into(), detail: "快速".into(), ..Default::default() },
+            SelectorItem { label: "kimi-k3".into(), detail: "长上下文".into(), ..Default::default() },
         ]
     }
 

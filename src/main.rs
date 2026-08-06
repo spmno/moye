@@ -7,6 +7,7 @@ mod context;
 mod event;
 mod evolution;
 mod memory;
+mod model_history;
 mod providers;
 mod registry;
 mod reviewer;
@@ -16,11 +17,12 @@ mod tools;
 mod tools_ext;
 mod ui;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use cli::context::AppContext;
 use evolution::prompt_evolve::PromptEvolver;
+use model_history::ModelHistory;
 use registry::{AgentRegistry, Orchestrator};
 use tracing::info;
 
@@ -48,12 +50,18 @@ async fn main() -> Result<()> {
     let memory = memory::MemoryStore::new(&config.memory)?;
     let rule_threshold = config.evolution.rule_escalation_threshold;
 
+    // 加载跨会话模型历史（~/.config/my-agent/models.json）；失败时回退空历史，不阻断启动。
+    // Load cross-session model history (~/.config/my-agent/models.json); fall back to empty
+    // on failure without blocking startup.
+    let model_history = Arc::new(Mutex::new(ModelHistory::load()));
+
     let ctx = Arc::new(AppContext {
         registry,
         orchestrator,
         memory,
         evolver,
         rule_threshold,
+        model_history,
     });
 
     ui::tui::run_tui(ctx).await

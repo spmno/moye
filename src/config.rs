@@ -15,6 +15,7 @@ use crate::memory::MemoryConfig;
 use crate::registry::RoleConfig;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 /// 顶层配置：对应 agent.toml 的全部小节。
@@ -33,6 +34,12 @@ pub struct Config {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub evolution: EvolutionSection,
+    /// 全局 API key 存储：`[keys]` section，键为环境变量名（如 `DEEPSEEK_API_KEY`），
+    /// 值为 key 本身。当前目录 `.env`/export 优先，缺失时回退此处。
+    /// Global API key store: `[keys]` section, keyed by env var name (e.g. `DEEPSEEK_API_KEY`),
+    /// valued as the key itself. The project `.env`/export takes priority; this is the fallback.
+    #[serde(default)]
+    pub keys: HashMap<String, String>,
 }
 
 impl Config {
@@ -87,11 +94,62 @@ pub struct EvolutionSection {
 
 static CONFIG: OnceLock<Arc<Config>> = OnceLock::new();
 
-/// main 启动时调用一次：加载并缓存配置，返回共享 Arc。
-/// Call once at startup: loads and caches the config, returning the shared Arc.
+/// 启动时调用一次：加载项目 `agent.toml`，再用全局 `~/.config/my-agent/config.toml`
+/// 作为 fallback 填充项目中缺失的 `[provider]` 字段，最后缓存并返回共享 Arc。
+/// 合并优先级：环境变量 > 项目 agent.toml > 全局 config.toml > 供应商默认。
+/// Call once at startup: loads the project `agent.toml`, then fills in any missing
+/// `[provider]` fields from the global `~/.config/my-agent/config.toml` as a fallback,
+/// before caching and returning the shared Arc.
+/// Precedence: env vars > project agent.toml > global config.toml > provider default.
 pub fn init(path: &str) -> anyhow::Result<Arc<Config>> {
-    let cfg = Arc::new(Config::load(path)?);
+    let mut cfg = Config::load(path)?;
+    // 全局配置仅作为 provider 小节的 fallback（项目优先）。
+    // Global config only backfills the provider section (project wins).
+    if let Some(global_path) = global_config_path() {
+        if global_path.exists() {
+            if let Ok(global) = Config::load(global_path.to_string_lossy().as_ref()) {
+                merge_provider_fallback(&mut cfg, global);
+            }
+        }
+    }
+    let cfg = Arc::new(cfg);
     Ok(CONFIG.get_or_init(|| cfg).clone())
+}
+
+/// 返回全局配置路径 `~/.config/my-agent/config.toml`；`HOME` 未设置时返回 `None`。
+/// Return the global config path `~/.config/my-agent/config.toml`; `None` when `HOME` is unset.
+fn global_config_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        PathBuf::from(home)
+            .join(".config")
+            .join("my-agent")
+            .join("config.toml"),
+    )
+}
+
+/// 用全局配置填充项目中为 `None` 的 `[provider]` 字段，并把全局 `[keys]` 中
+/// 项目缺失的条目补全进来。项目已设的值不被覆盖。
+/// Fill `None` `[provider]` fields of the project config from the global config, and
+/// backfill any `[keys]` entries the project is missing. Values already set in the
+/// project config are not overwritten.
+fn merge_provider_fallback(project: &mut Config, global: Config) {
+    let g = global.provider;
+    if project.provider.provider.is_none() {
+        project.provider.provider = g.provider;
+    }
+    if project.provider.base_url.is_none() {
+        project.provider.base_url = g.base_url;
+    }
+    if project.provider.api_key_env.is_none() {
+        project.provider.api_key_env = g.api_key_env;
+    }
+    // 全局 key 回退：项目 [keys] 没有的条目用全局补全（项目优先，不覆盖已设的）。
+    // Global key fallback: entries missing from the project [keys] are backfilled from
+    // the global config (project wins; existing entries are not overwritten).
+    for (k, v) in global.keys {
+        project.keys.entry(k).or_insert(v);
+    }
 }
 
 /// 返回缓存的配置；未初始化（如纯单元测试）时返回 None。
@@ -161,5 +219,60 @@ rule_escalation_threshold = 5
     fn max_turns_zero_falls_back() {
         let cfg: Config = toml::from_str("[agent]\nmax_turns = 0\n").unwrap();
         assert_eq!(cfg.max_turns(), 20);
+    }
+
+    #[test]
+    fn merge_provider_fallback_keeps_project_and_fills_none() {
+        // 项目已设的 provider 不被全局覆盖；为 None 的 base_url / api_key_env 用全局回填。
+        // A provider already set in the project is not overwritten by the global; None
+        // base_url / api_key_env are backfilled from the global config.
+        let mut project: Config = toml::from_str(
+            r#"
+[provider]
+provider = "custom"
+"#,
+        )
+        .unwrap();
+        let global: Config = toml::from_str(
+            r#"
+[provider]
+provider = "deepseek"
+base_url = "https://gw.example.com/v1"
+api_key_env = "GLOBAL_KEY"
+"#,
+        )
+        .unwrap();
+        merge_provider_fallback(&mut project, global);
+        assert_eq!(project.provider.provider.as_deref(), Some("custom"));
+        assert_eq!(
+            project.provider.base_url.as_deref(),
+            Some("https://gw.example.com/v1")
+        );
+        assert_eq!(project.provider.api_key_env.as_deref(), Some("GLOBAL_KEY"));
+    }
+
+    #[test]
+    fn merge_keys_project_wins_and_global_backfills() {
+        // 项目已设的 key 不被全局覆盖；项目缺失的由全局补全（当前目录优先）。
+        // A key set in the project is not overwritten by the global; missing keys are
+        // backfilled from the global (current dir wins).
+        let mut project: Config = toml::from_str(
+            r#"
+[keys]
+DEEPSEEK_API_KEY = "project-key"
+"#,
+        )
+        .unwrap();
+        let global: Config = toml::from_str(
+            r#"
+[keys]
+DEEPSEEK_API_KEY = "global-key"
+MOONSHOT_API_KEY = "global-moon"
+"#,
+        )
+        .unwrap();
+        merge_provider_fallback(&mut project, global);
+        assert_eq!(project.keys.get("DEEPSEEK_API_KEY").unwrap(), "project-key");
+        assert_eq!(project.keys.get("MOONSHOT_API_KEY").unwrap(), "global-moon");
     }
 }

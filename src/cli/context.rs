@@ -6,8 +6,10 @@
 use crate::event::{AgentEvent, EventSender};
 use crate::evolution::prompt_evolve::PromptEvolver;
 use crate::memory::{Lesson, MemoryStore, Turn};
+use crate::model_history::ModelHistory;
 use crate::registry::{self, AgentRegistry, Intent, Orchestrator};
 use crate::{evolution, skills};
+use std::sync::{Arc, Mutex};
 
 /// 应用上下文：运行期共享的状态集合，承载所有 `/` 命令分发与任务执行所需依赖。
 /// Application context: the shared runtime state holding all dependencies needed for
@@ -18,6 +20,9 @@ pub struct AppContext {
     pub memory: MemoryStore,
     pub evolver: PromptEvolver,
     pub rule_threshold: usize,
+    /// 跨会话持久化的模型历史，供 `/models` 选择器列出"最近使用"分区。
+    /// Cross-session persisted model history, listed as a "recently used" section in `/models`.
+    pub model_history: Arc<Mutex<ModelHistory>>,
 }
 
 impl AppContext {
@@ -31,15 +36,36 @@ impl AppContext {
             .unwrap_or_else(|| "deepseek-v4-pro".to_string())
     }
 
-    /// `/model [slug]`：有 slug 则切换会话模型，无 slug 则保持不变（调用方负责显示）。
-    /// `/model [slug]`: if a slug is given, switch the session model; otherwise leave it
-    /// unchanged (the caller is responsible for displaying the current model).
-    pub fn cmd_model(&self, slug: Option<String>) {
-        match slug {
-            Some(s) => {
-                self.registry.set_session_model(&s);
+    /// `/model [slug]`：切换会话模型；可选 provider/base_url 用于切回历史模型时恢复当时的网关。
+    /// 无 slug 则保持不变（调用方负责显示当前模型）。切换后记入历史，跨会话持久化。
+    /// `/model [slug]`: switch the session model; optional provider/base_url restore the
+    /// gateway used at the time when switching back to a historical model. Without a slug
+    /// the model is unchanged (the caller displays it). Recorded into history, persisted across sessions.
+    pub fn cmd_model(
+        &self,
+        slug: Option<String>,
+        provider: Option<String>,
+        base_url: Option<String>,
+    ) {
+        if let Some(s) = slug {
+            // 切回历史模型时，连同 provider/base_url 一起恢复，否则切了 slug 但网关不对无法调用。
+            if let Some(p) = &provider {
+                self.registry.set_session_provider(p);
             }
-            None => {}
+            if let Some(b) = &base_url {
+                self.registry.set_session_base_url(b);
+            }
+            self.registry.set_session_model(&s);
+            // 记入历史：provider/base_url 用最终生效值（override 优先，否则当前全局）。
+            let p = provider
+                .clone()
+                .unwrap_or_else(crate::providers::current_provider_slug);
+            let b = base_url
+                .clone()
+                .unwrap_or_else(crate::providers::current_base_url);
+            let mut hist = self.model_history.lock().unwrap();
+            hist.record(&s, &p, &b);
+            let _ = hist.save();
         }
     }
 

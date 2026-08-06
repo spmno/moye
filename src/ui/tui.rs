@@ -5,7 +5,7 @@ use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
         EnableMouseCapture, EventStream, KeyCode, KeyEvent, KeyModifiers,
-        MouseEvent, MouseEventKind,
+        MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -14,6 +14,7 @@ use futures::StreamExt;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::Modifier,
     text::{Line, Span, Text},
     widgets::{
         Block, BorderType, Borders, Clear, Padding, Paragraph, Scrollbar,
@@ -28,7 +29,9 @@ use tokio::time::interval;
 use crate::cli::context::AppContext;
 use crate::cli::repl::ReplCommand;
 use crate::event::{AgentEvent, EventReceiver, EventSender};
+use crate::ui::clipboard;
 use crate::ui::selector::{SelectorItem, SelectorState};
+use crate::ui::selection::Selection;
 use crate::ui::{markdown, theme};
 use tracing::{info, warn};
 
@@ -223,6 +226,17 @@ struct TuiState {
     /// 打开中的选择器（如 /models 模型选择）。非 None 时键盘输入进入选择器。
     /// Open selector (e.g. the /models model picker). When Some, keyboard input goes to it.
     selector: Option<SelectorState>,
+    /// 当前文本选区（鼠标拖拽产生）。
+    /// Current text selection (produced by mouse drag).
+    selection: Option<Selection>,
+    /// 消息内容区 Rect：draw_messages 时写入（Block::inner 后），handle_mouse_event 命中测试时读。
+    /// Message content Rect: written in draw_messages (after Block::inner), read in
+    /// handle_mouse_event for hit-testing. Stores the actual content area, not the bordered area.
+    msg_area: Rect,
+    /// 消息区 Paragraph scroll 值（跳过的顶部行数），draw 时存，mouse 事件时读以算屏幕行→逻辑行。
+    /// Message Paragraph scroll (top lines skipped); written at draw time, read at
+    /// mouse-event time for screen-row→logical-line mapping.
+    msg_scroll: u16,
 }
 
 impl TuiState {
@@ -247,10 +261,13 @@ impl TuiState {
             tool_names,
             skill_names,
             task_handle: None,
-            needs_full_redraw: false,
-            selector: None,
-        }
+        needs_full_redraw: false,
+        selector: None,
+        selection: None,
+        msg_area: Rect::new(0, 0, 0, 0),
+        msg_scroll: 0,
     }
+}
 
     fn tick(&mut self) {
         if self.thinking {
@@ -628,6 +645,10 @@ fn handle_key_event(
                 state.should_quit = true;
                 return;
             }
+            KeyCode::Char('y') => {
+                copy_selection(state);
+                return;
+            }
             _ => {}
         }
     }
@@ -681,6 +702,18 @@ fn handle_key_event(
     }
 }
 
+fn copy_selection(state: &mut TuiState) {
+    if let Some(sel) = state.selection.take() {
+        let text = sel.extract(&state.all_message_lines());
+        if !text.is_empty() {
+            clipboard::copy_to_clipboard(&text);
+            state.push_event(AgentEvent::Info(
+                "\u{2713} \u{5df2}\u{590d}\u{5236}\u{9009}\u{533a}".into(),
+            ));
+        }
+    }
+}
+
 fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
@@ -692,6 +725,49 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
             if state.scroll_offset == 0 {
                 state.user_scrolled = false;
             }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let row = mouse.row;
+            let col = mouse.column;
+            let inner = state.msg_area;
+            if row >= inner.y && row < inner.y.saturating_add(inner.height) {
+                let logical = Selection::screen_to_logical(row, inner.y, state.msg_scroll);
+                let rel_col = col.saturating_sub(inner.x);
+                state.selection = Some(Selection::new_at(logical, rel_col));
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let row = mouse.row;
+            let col = mouse.column;
+            let inner = state.msg_area;
+            let rel_col = col.saturating_sub(inner.x);
+            if row < inner.y {
+                // 拖出顶部：向上滚一行，焦点=滚后可见首行
+                state.scroll_offset = state.scroll_offset.saturating_add(1);
+                state.user_scrolled = true;
+                let new_scroll = state.msg_scroll.saturating_sub(1);
+                let logical = Selection::screen_to_logical(inner.y, inner.y, new_scroll);
+                if let Some(sel) = state.selection.as_mut() {
+                    sel.extend(logical, rel_col);
+                }
+            } else if row >= inner.y.saturating_add(inner.height) {
+                // 拖出底部：向下滚一行，焦点=滚后可见末行
+                state.scroll_offset = state.scroll_offset.saturating_sub(1);
+                let new_scroll = state.msg_scroll.saturating_add(1);
+                let bottom = inner.y.saturating_add(inner.height).saturating_sub(1);
+                let logical = Selection::screen_to_logical(bottom, inner.y, new_scroll);
+                if let Some(sel) = state.selection.as_mut() {
+                    sel.extend(logical, rel_col);
+                }
+            } else {
+                let logical = Selection::screen_to_logical(row, inner.y, state.msg_scroll);
+                if let Some(sel) = state.selection.as_mut() {
+                    sel.extend(logical, rel_col);
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            copy_selection(state);
         }
         _ => {}
     }
@@ -1091,6 +1167,9 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
 
     let block = Block::default().padding(Padding::horizontal(1));
     let inner = block.inner(area);
+    // 存消息内容区，供 handle_mouse_event 命中测试读取屏幕行→逻辑行映射。
+    // Store the message content area for handle_mouse_event hit-testing.
+    state.msg_area = inner;
     let total = all_lines.len() as u16;
 
     let base = if total > inner.height {
@@ -1099,6 +1178,7 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
         0
     };
     let scroll = base.saturating_sub(state.scroll_offset);
+    state.msg_scroll = scroll;
 
     let text = Text::from(all_lines);
     let messages = Paragraph::new(text)
@@ -1106,6 +1186,45 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
         .block(block);
 
     f.render_widget(messages, area);
+
+    // 选区高亮：把选中逻辑行在屏幕上对应的 Cell 叠加反色。
+    // 因为 Paragraph 无 Wrap，逻辑行→屏幕行 = inner.y + (logical - scroll)。
+    // Selection highlight: overlay REVERSED on screen cells for selected logical
+    // lines. Since Paragraph has no Wrap, logical→screen row = inner.y + (logical - scroll).
+    if let Some(sel) = state.selection {
+        let (lo_line, lo_col, hi_line, hi_col) = sel.bounds();
+        let buf = f.buffer_mut();
+        for logical in lo_line..=hi_line {
+            let logical_u16 = match u16::try_from(logical) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if logical_u16 < scroll {
+                continue;
+            }
+            let screen_row = inner.y + (logical_u16 - scroll);
+            if screen_row >= inner.y + inner.height {
+                continue;
+            }
+            // 行内高亮列范围：首行从 lo_col 起，末行到 hi_col 止，中间整行
+            let right = inner.x.saturating_add(inner.width);
+            let col_start = if logical == lo_line {
+                inner.x.saturating_add(lo_col).min(right)
+            } else {
+                inner.x
+            };
+            let col_end = if logical == hi_line {
+                inner.x.saturating_add(hi_col).min(right)
+            } else {
+                right
+            };
+            for col in col_start..col_end {
+                if let Some(cell) = buf.cell_mut((col, screen_row)) {
+                    cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                }
+            }
+        }
+    }
 
     if total > inner.height {
         let mut sb_state = ScrollbarState::default()

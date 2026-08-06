@@ -1,7 +1,7 @@
-// 供应商客户端：通过 MY_AGENT_PROVIDER 环境变量选择供应商（deepseek / bailian / moonshot）。
-// Provider client: selects a provider (deepseek / bailian / moonshot) via the MY_AGENT_PROVIDER env var.
-// 均使用 OpenAI 兼容接口，Bailian 百炼平台和 Moonshot Kimi 平台通过自定义 base URL 接入。
-// All providers use the OpenAI-compatible interface; Bailian and Moonshot Kimi connect via custom base URLs.
+// 供应商客户端：通过 MY_AGENT_PROVIDER 环境变量选择供应商（deepseek / bailian / moonshot / volcengine）。
+// Provider client: selects a provider (deepseek / bailian / moonshot / volcengine) via the MY_AGENT_PROVIDER env var.
+// 均使用 OpenAI 兼容接口，Bailian 百炼平台、Moonshot Kimi 平台和火山引擎 Ark 通过自定义 base URL 接入。
+// All providers use the OpenAI-compatible interface; Bailian, Moonshot Kimi, and Volcengine Ark connect via custom base URLs.
 use anyhow::Result;
 pub use rig_core::providers::openai::{self, CompletionsClient};
 use tracing::info;
@@ -15,6 +15,9 @@ pub enum Provider {
     /// Moonshot Kimi 平台（https://platform.kimi.com）。Kimi K3 需要用原生 API。
     /// Moonshot Kimi platform (https://platform.kimi.com). Kimi K3 needs the native API.
     Moonshot,
+    /// 火山引擎 Ark 平台（https://www.volcengine.com/product/ark）。通过 OpenAI 兼容接口接入。
+    /// Volcengine Ark platform (https://www.volcengine.com/product/ark). OpenAI-compatible API.
+    Volcengine,
     /// 自定义 OpenAI 兼容供应商。通过 MY_AGENT_BASE_URL + MY_AGENT_API_KEY 配置。
     /// Custom OpenAI-compatible provider. Configured via MY_AGENT_BASE_URL + MY_AGENT_API_KEY.
     Custom,
@@ -34,6 +37,7 @@ impl Provider {
         match raw.to_lowercase().as_str() {
             "bailian" => Provider::Bailian,
             "moonshot" | "kimi" => Provider::Moonshot,
+            "volcengine" | "ark" | "火山" => Provider::Volcengine,
             "custom" | "openai" | "glm" => Provider::Custom,
             _ => Provider::DeepSeek,
         }
@@ -54,6 +58,7 @@ impl Provider {
             Provider::DeepSeek => "DEEPSEEK_API_KEY",
             Provider::Bailian => "DASHSCOPE_API_KEY",
             Provider::Moonshot => "MOONSHOT_API_KEY",
+            Provider::Volcengine => "ARK_API_KEY",
             Provider::Custom => "MY_AGENT_API_KEY",
         }
         .to_string()
@@ -77,6 +82,7 @@ impl Provider {
             Provider::DeepSeek => "https://api.deepseek.com/v1".to_string(),
             Provider::Bailian => "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
             Provider::Moonshot => "https://api.moonshot.cn/v1".to_string(),
+            Provider::Volcengine => "https://ark.cn-beijing.volces.com/api/plan/v3".to_string(),
             Provider::Custom => "https://api.openai.com/v1".to_string(),
         }
     }
@@ -88,6 +94,7 @@ impl Provider {
             Provider::DeepSeek => "DEEPSEEK_API_KEY",
             Provider::Bailian => "DASHSCOPE_API_KEY",
             Provider::Moonshot => "MOONSHOT_API_KEY",
+            Provider::Volcengine => "ARK_API_KEY",
             Provider::Custom => "MY_AGENT_API_KEY",
         }
     }
@@ -99,6 +106,7 @@ impl Provider {
             Provider::DeepSeek => "https://api.deepseek.com/v1",
             Provider::Bailian => "https://dashscope.aliyuncs.com/compatible-mode/v1",
             Provider::Moonshot => "https://api.moonshot.cn/v1",
+            Provider::Volcengine => "https://ark.cn-beijing.volces.com/api/plan/v3",
             Provider::Custom => "https://api.openai.com/v1",
         }
     }
@@ -119,6 +127,7 @@ fn parse_provider(raw: &str) -> Provider {
     match raw.to_lowercase().as_str() {
         "bailian" => Provider::Bailian,
         "moonshot" | "kimi" => Provider::Moonshot,
+        "volcengine" | "ark" | "火山" => Provider::Volcengine,
         "custom" | "openai" | "glm" => Provider::Custom,
         _ => Provider::DeepSeek,
     }
@@ -201,6 +210,7 @@ pub fn current_provider_slug() -> String {
         Provider::DeepSeek => "deepseek",
         Provider::Bailian => "bailian",
         Provider::Moonshot => "moonshot",
+        Provider::Volcengine => "volcengine",
         Provider::Custom => "custom",
     }
     .to_string()
@@ -217,7 +227,9 @@ pub fn current_base_url() -> String {
 pub fn provider_additional_params() -> serde_json::Value {
     match Provider::from_env() {
         Provider::Moonshot => serde_json::json!({}),
-        Provider::Bailian | Provider::DeepSeek | Provider::Custom => serde_json::json!({}),
+        Provider::Bailian | Provider::DeepSeek | Provider::Volcengine | Provider::Custom => {
+            serde_json::json!({})
+        }
     }
 }
 
@@ -251,6 +263,11 @@ pub fn provider_models(provider: Provider) -> Vec<ModelInfo> {
             ModelInfo { slug: "kimi-k3".into(), desc: "Kimi K3 · 长上下文" },
             ModelInfo { slug: "kimi-k2.7-code-highspeed".into(), desc: "代码加速版" },
         ],
+        Provider::Volcengine => vec![
+            ModelInfo { slug: "doubao-1-5-pro-256k".into(), desc: "豆包 1.5 Pro · 长上下文" },
+            ModelInfo { slug: "doubao-1-5-lite-32k".into(), desc: "豆包 1.5 Lite · 轻量快速" },
+            ModelInfo { slug: "deepseek-r1-250120".into(), desc: "DeepSeek R1 · 推理模型" },
+        ],
         Provider::Custom => vec![],
     }
 }
@@ -263,6 +280,7 @@ impl Provider {
             Provider::DeepSeek => 128_000,
             Provider::Bailian => 128_000,
             Provider::Moonshot => 256_000,
+            Provider::Volcengine => 256_000,
             Provider::Custom => 128_000,
         }
     }

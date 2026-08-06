@@ -1,9 +1,9 @@
 # Agent 运行时配置。
-# 通过环境变量 MY_AGENT_PROVIDER 选择供应商（deepseek / bailian / moonshot）。
-# API Key 从供应商对应的环境变量读取（DEEPSEEK / DASHSCOPE / MOONSHOT）。
+# 通过环境变量 MY_AGENT_PROVIDER 选择供应商（deepseek / bailian / moonshot / volcengine）。
+# API Key 从供应商对应的环境变量读取（DEEPSEEK / DASHSCOPE / MOONSHOT / ARK）。
 
 [provider]
-# 默认供应商（deepseek / bailian / moonshot / custom）。
+# 默认供应商（deepseek / bailian / moonshot / volcengine / custom）。
 # 优先级：MY_AGENT_PROVIDER 环境变量（或 .env）> 此处配置 > deepseek。
 # 推荐：把配置写进项目根的 .env 文件（参考 .env.example），启动时自动加载。
 # Priority: MY_AGENT_PROVIDER env (or .env) > this config > deepseek.
@@ -24,6 +24,7 @@ api_key_env = "MY_AGENT_API_KEY"
 # DeepSeek: deepseek-v4-pro / deepseek-v4-flash
 # Bailian: kimi/kimi-k3 / qwen-plus / qwen-max
 # Moonshot: kimi-k3 / kimi-k2.7-code-highspeed
+# Volcengine: doubao-1-5-pro-256k / doubao-1-5-lite-32k / deepseek-r1-250120
 # 切换模型用 REPL 命令：model <slug>
 default_model = "glm-latest"
 # 自主循环上限：agent 最多执行的轮数。

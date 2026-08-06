@@ -83,7 +83,6 @@ struct HitlState {
 
 struct InputState {
     buffer: String,
-    pasted: Option<String>,
     cursor: usize,
     history: Vec<String>,
     history_idx: Option<usize>,
@@ -93,29 +92,14 @@ impl InputState {
     fn new() -> Self {
         Self {
             buffer: String::new(),
-            pasted: None,
             cursor: 0,
             history: Vec::new(),
             history_idx: None,
         }
     }
 
-    fn paste_prefix(&self) -> String {
-        if let Some(pasted) = &self.pasted {
-            let lines = pasted.lines().count();
-            if lines > 1 {
-                format!("[paste {} lines] ", lines)
-            } else {
-                let chars = pasted.chars().count();
-                format!("[paste {} chars] ", chars)
-            }
-        } else {
-            String::new()
-        }
-    }
-
     fn display_text(&self) -> String {
-        format!("{}{}", self.paste_prefix(), self.buffer)
+        self.buffer.clone()
     }
 
     fn insert_char(&mut self, c: char) {
@@ -123,13 +107,16 @@ impl InputState {
         self.cursor += c.len_utf8();
     }
 
+    fn insert_str(&mut self, s: &str) {
+        self.buffer.insert_str(self.cursor, s);
+        self.cursor += s.len();
+    }
+
     fn backspace(&mut self) {
         if self.cursor > 0 {
             let prev = self.buffer.floor_char_boundary(self.cursor - 1);
             self.buffer.remove(prev);
             self.cursor = prev;
-        } else if self.pasted.is_some() {
-            self.pasted = None;
         }
     }
 
@@ -174,7 +161,6 @@ impl InputState {
             Some(i) => Some(i),
         };
         if let Some(idx) = self.history_idx {
-            self.pasted = None;
             self.buffer = self.history[idx].clone();
             self.cursor = self.buffer.len();
         }
@@ -184,11 +170,9 @@ impl InputState {
         if let Some(idx) = self.history_idx {
             if idx + 1 < self.history.len() {
                 self.history_idx = Some(idx + 1);
-                self.pasted = None;
                 self.buffer = self.history[idx + 1].clone();
             } else {
                 self.history_idx = None;
-                self.pasted = None;
                 self.buffer.clear();
             }
             self.cursor = self.buffer.len();
@@ -196,22 +180,15 @@ impl InputState {
     }
 
     fn take_submitted(&mut self) -> Option<String> {
-        let pasted = self.pasted.take().unwrap_or_default();
         let typed = self.buffer.trim().to_string();
-        let combined = if pasted.is_empty() && typed.is_empty() {
+        if typed.is_empty() {
             return None;
-        } else if pasted.is_empty() {
-            typed
-        } else if typed.is_empty() {
-            pasted.trim().to_string()
-        } else {
-            format!("{}\n{}", pasted.trim(), typed)
-        };
-        self.history.push(combined.clone());
+        }
+        self.history.push(typed.clone());
         self.history_idx = None;
         self.buffer.clear();
         self.cursor = 0;
-        Some(combined)
+        Some(typed)
     }
 }
 
@@ -509,12 +486,7 @@ async fn run_loop(
                     crossterm::event::Event::Paste(text) => {
                         if !state.thinking && state.hitl.is_none() {
                             let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                            if let Some(existing) = &mut state.input.pasted {
-                                existing.push('\n');
-                                existing.push_str(&text);
-                            } else {
-                                state.input.pasted = Some(text);
-                            }
+                            state.input.insert_str(&text);
                         }
                     }
                     _ => {}
@@ -1204,9 +1176,7 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
 
     if !state.thinking {
         let inner_width = (area.width.saturating_sub(2)).max(1) as usize;
-        let paste_prefix = state.input.paste_prefix();
-        let paste_width: usize = paste_prefix.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
-        let mut x: usize = paste_width;
+        let mut x: usize = 0;
         let mut y: u16 = 0;
         for c in state.input.buffer[..state.input.cursor].chars() {
             if c == '\n' {

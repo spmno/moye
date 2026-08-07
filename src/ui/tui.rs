@@ -958,6 +958,7 @@ fn handle_command(
         }
         ReplCommand::Evolve => {
             state.thinking = true;
+            let _ = action_tx.send(AgentEvent::AgentStarted);
             let ctx = Arc::clone(ctx);
             let tx = action_tx.clone();
             let handle = tokio::spawn(async move {
@@ -1092,6 +1093,7 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
         AgentEvent::AgentStarted => {
             state.thinking = true;
             state.spinner = 0;
+            state.current_turn = 0;
         }
         AgentEvent::AgentFinished => {
             state.task_handle = None;
@@ -1103,9 +1105,7 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
             }
             state.thinking = false;
             state.streaming_reasoning.clear();
-            // Reset turn counter so the progress bar starts fresh for the next conversation.
-            // 重置回合计数器，使进度条在下次对话时从 0 开始。
-            state.current_turn = 0;
+            state.current_turn = state.max_turns;
             state.reset_scroll();
         }
         // User and System events are pushed directly by handle_command —
@@ -1146,7 +1146,7 @@ fn draw(f: &mut Frame, state: &mut TuiState) {
 
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(1), Constraint::Length(28)])
+        .constraints([Constraint::Min(1), Constraint::Length(34)])
         .split(area);
 
     let display = state.input.display_text();
@@ -1470,12 +1470,18 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
     lines.push(Line::default());
 
     lines.push(Line::styled("Progress", theme::status_dim()));
-    let bar_w = 10usize;
+    let bar_w = 15usize;
     let max = state.max_turns.max(1);
-    let filled = (bar_w * state.current_turn / max).min(bar_w);
+    // Use floating-point division with rounding so the bar fills proportionally.
+    // Integer division (bar_w * current_turn / max) truncates and causes the
+    // bar to under-fill, especially in the mid-range (e.g. turn 3/25 → 0 blocks).
+    // 浮点除法 + 四舍五入，使进度条按比例填充。
+    // 整数除法会截断，导致中间段进度条不满（如 3/25 → 0 格）。
+    let filled = (bar_w as f64 * state.current_turn as f64 / max as f64).round() as usize;
+    let filled = filled.min(bar_w);
     let bar: String = "\u{2588}".repeat(filled) + &"\u{2591}".repeat(bar_w - filled);
     lines.push(Line::styled(
-        format!("[ {bar} ] {}/{}", state.current_turn, state.max_turns),
+        format!("[{bar}] {}/{}", state.current_turn, state.max_turns),
         theme::status_turn(),
     ));
 

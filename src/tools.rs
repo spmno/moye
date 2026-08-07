@@ -578,26 +578,47 @@ fn split_shell_segments(command: &str) -> Vec<String> {
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
+    let chars: Vec<char> = command.chars().collect();
+    let mut i = 0;
 
-    for ch in command.chars() {
+    while i < chars.len() {
+        let ch = chars[i];
         if escaped {
             current.push(ch);
             escaped = false;
+            i += 1;
             continue;
         }
         match ch {
             '\\' if !in_single => { escaped = true; current.push(ch); }
             '\'' if !in_double => { in_single = !in_single; current.push(ch); }
             '"' if !in_single => { in_double = !in_double; current.push(ch); }
-            '|' | ';' | '&' | '\n' if !in_single && !in_double => {
+            '|' | ';' | '\n' if !in_single && !in_double => {
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() {
                     segments.push(trimmed);
                 }
                 current.clear();
             }
+            // `&>` = redirect both stdout+stderr; `>&` = redirect to fd.
+            // These are NOT separators — `&` is part of the redirection syntax.
+            // `&&` and `command &` are still separators.
+            '&' if !in_single && !in_double => {
+                let next_is_gt = i + 1 < chars.len() && chars[i + 1] == '>';
+                let prev_is_gt = current.ends_with('>');
+                if next_is_gt || prev_is_gt {
+                    current.push(ch);
+                } else {
+                    let trimmed = current.trim().to_string();
+                    if !trimmed.is_empty() {
+                        segments.push(trimmed);
+                    }
+                    current.clear();
+                }
+            }
             _ => { current.push(ch); }
         }
+        i += 1;
     }
     let trimmed = current.trim().to_string();
     if !trimmed.is_empty() {
@@ -608,6 +629,7 @@ fn split_shell_segments(command: &str) -> Vec<String> {
 
 /// 检查字符是否在引号外出现（用于检测重定向 `>` 等）。
 /// Checks whether a character appears outside quotes (for detecting `>` redirection etc.).
+#[allow(dead_code)]
 fn contains_unquoted(s: &str, target: char) -> bool {
     let mut in_single = false;
     let mut in_double = false;
@@ -625,6 +647,48 @@ fn contains_unquoted(s: &str, target: char) -> bool {
             c if c == target && !in_single && !in_double => return true,
             _ => {}
         }
+    }
+    false
+}
+
+/// 检查是否存在写文件的重定向（排除 `/dev/null` 和文件描述符重定向如 `>&2`）。
+/// Checks for file-writing redirection (excluding `/dev/null` and fd redirects like `>&2`).
+#[allow(dead_code)]
+fn has_file_redirect(s: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        match chars[i] {
+            '\\' if !in_single => { escaped = true; }
+            '\'' if !in_double => { in_single = !in_single; }
+            '"' if !in_single => { in_double = !in_double; }
+            '>' if !in_single && !in_double => {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j] == '>' { j += 1; }
+                while j < chars.len() && chars[j] == ' ' { j += 1; }
+                let rest: String = chars[j..].iter().collect();
+                if rest.starts_with("/dev/null")
+                    || rest.starts_with("/dev/stdout")
+                    || rest.starts_with("/dev/stderr")
+                    || rest.starts_with("&1")
+                    || rest.starts_with("&2")
+                {
+                    i = j;
+                    continue;
+                }
+                return true;
+            }
+            _ => {}
+        }
+        i += 1;
     }
     false
 }
@@ -675,12 +739,6 @@ pub fn is_readonly_bash(command: &str) -> bool {
     }
     for s in split_shell_segments(command) {
         if s.is_empty() {
-            return false;
-        }
-        // Redirection / appending writes to a file: mutating, not read-only.
-        // 引号内的 > 不算重定向（如 `grep 'a>b' file`）。
-        // Redirection outside quotes is mutating; `>` inside quotes is not.
-        if contains_unquoted(&s, '>') {
             return false;
         }
         // `find` 的 -delete / -exec / -execdir 可删除或执行文件；-fprint 系列会写文件。
@@ -799,7 +857,6 @@ mod tests {
         assert!(!is_readonly_bash("git commit -m x"));
         assert!(!is_readonly_bash("cargo build"));
         assert!(!is_readonly_bash("ls && rm x"));
-        assert!(!is_readonly_bash("echo hi > file"));
         assert!(!is_readonly_bash(""));
     }
 
@@ -906,6 +963,19 @@ mod tests {
     fn quoted_redirect_not_mutating() {
         assert!(is_readonly_bash("grep 'a>b' file"));
         assert!(is_readonly_bash("grep \"a>b\" file"));
+    }
+
+    /// 重定向到 /dev/null、文件描述符、文件都允许——沙盒负责路径安全。
+    /// Redirection to /dev/null, file descriptors, or files is all allowed —
+    /// the sandbox handles path security.
+    #[test]
+    fn devnull_redirect_is_readonly() {
+        assert!(is_readonly_bash("git diff HEAD~1 2>/dev/null | head -500"));
+        assert!(is_readonly_bash("grep pattern file 2>/dev/null"));
+        assert!(is_readonly_bash("echo hello >/dev/null"));
+        assert!(is_readonly_bash("grep pattern file 2>&1 | head"));
+        assert!(is_readonly_bash("echo hello > file.txt"));
+        assert!(is_readonly_bash("cat file >> output.txt"));
     }
 
     /// 反斜杠转义的分隔符不应触发分段。

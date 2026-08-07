@@ -568,6 +568,67 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&#x27;", "'")
 }
 
+/// 将命令按 `|` `;` `&` `\n` 分割，但尊重引号和反斜杠转义。
+/// 引号内的分隔符不触发分割；反斜杠转义的下一个字符也跳过。
+/// Splits a command by `|` `;` `&` `\n`, respecting quotes and backslash escaping.
+/// Separators inside quotes do not trigger a split; escaped chars are passed through.
+fn split_shell_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if !in_single => { escaped = true; current.push(ch); }
+            '\'' if !in_double => { in_single = !in_single; current.push(ch); }
+            '"' if !in_single => { in_double = !in_double; current.push(ch); }
+            '|' | ';' | '&' | '\n' if !in_single && !in_double => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    segments.push(trimmed);
+                }
+                current.clear();
+            }
+            _ => { current.push(ch); }
+        }
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        segments.push(trimmed);
+    }
+    segments
+}
+
+/// 检查字符是否在引号外出现（用于检测重定向 `>` 等）。
+/// Checks whether a character appears outside quotes (for detecting `>` redirection etc.).
+fn contains_unquoted(s: &str, target: char) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for ch in s.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if !in_single => { escaped = true; }
+            '\'' if !in_double => { in_single = !in_single; }
+            '"' if !in_single => { in_double = !in_double; }
+            c if c == target && !in_single && !in_double => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// 判断 shell 命令是否为只读（可安全自动执行）还是会改变状态（需询问）。
 /// Determines whether a shell command is read-only (safe to auto-run) or mutating (needs prompting).
 /// 拿不准时返回 false —— 循环会将其视为"会改变状态"并询问人类，
@@ -606,17 +667,20 @@ pub fn is_readonly_bash(command: &str) -> bool {
     // read-only prefix — e.g. `ls $(rm -rf ~)` starts with the read-only `ls` but
     // actually deletes the user's home directory. Any command substitution means the
     // command must be treated as mutating and routed to HITL.
+    if command.trim().is_empty() {
+        return false;
+    }
     if command.contains("$(") || command.contains('`') {
         return false;
     }
-    for segment in command.split(['|', ';', '&', '\n']) {
-        let s = segment.trim();
+    for s in split_shell_segments(command) {
         if s.is_empty() {
             return false;
         }
         // Redirection / appending writes to a file: mutating, not read-only.
-        // 重定向 / 追加写入文件：会改变状态，非只读。
-        if s.contains('>') || s.contains("2>") {
+        // 引号内的 > 不算重定向（如 `grep 'a>b' file`）。
+        // Redirection outside quotes is mutating; `>` inside quotes is not.
+        if contains_unquoted(&s, '>') {
             return false;
         }
         // `find` 的 -delete / -exec / -execdir 可删除或执行文件；-fprint 系列会写文件。
@@ -785,5 +849,33 @@ mod tests {
     fn sed_awk_not_readonly() {
         assert!(!is_readonly_bash("sed 's/foo/bar/' file.txt"));
         assert!(!is_readonly_bash("awk '{print $1}' file.txt"));
+    }
+
+    /// 引号内的管道符不应触发分段（grep 正则中的 `\|` 是或操作符，不是管道）。
+    /// Pipe characters inside quotes should not trigger segmentation
+    /// (`\|` in grep regex is an alternation operator, not a pipe).
+    #[test]
+    fn quoted_pipe_not_segmented() {
+        assert!(is_readonly_bash("grep -rn 'foo\\|bar' src | sort"));
+        assert!(is_readonly_bash("grep 'a|b' file"));
+        assert!(is_readonly_bash("grep \"a|b\" file"));
+        assert!(is_readonly_bash(
+            "grep -rn 'ContextHook::new\\|context_limit' ./src --include='*.rs' | grep -v 'target/'"
+        ));
+    }
+
+    /// 引号内的 `>` 不应被视为重定向。
+    /// `>` inside quotes should not be treated as redirection.
+    #[test]
+    fn quoted_redirect_not_mutating() {
+        assert!(is_readonly_bash("grep 'a>b' file"));
+        assert!(is_readonly_bash("grep \"a>b\" file"));
+    }
+
+    /// 反斜杠转义的分隔符不应触发分段。
+    /// Backslash-escaped separators should not trigger segmentation.
+    #[test]
+    fn escaped_separator_not_segmented() {
+        assert!(is_readonly_bash("grep 'a\\;b' file"));
     }
 }

@@ -296,6 +296,11 @@ pub fn context_limit_for_model(model: &str) -> usize {
     if lower.contains("kimi") {
         return 256_000;
     }
+    // DeepSeek V4 系列支持 1M 上下文窗口。
+    // DeepSeek V4 series supports a 1M context window.
+    if lower.contains("deepseek-v4-pro") || lower.contains("deepseek-v4-flash") {
+        return 1_000_000;
+    }
     if lower.contains("deepseek") {
         return 128_000;
     }
@@ -304,6 +309,9 @@ pub fn context_limit_for_model(model: &str) -> usize {
     }
     if lower.contains("qwen-plus") {
         return 128_000;
+    }
+    if lower.contains("glm") {
+        return 1_000_000;
     }
     // 回退到供应商默认值 / Fall back to provider default
     provider.context_limit()
@@ -329,8 +337,16 @@ mod tests {
     }
 
     #[test]
-    fn context_limit_for_deepseek_model() {
-        assert_eq!(context_limit_for_model("deepseek-v4-pro"), 128_000);
+    fn context_limit_for_deepseek_v4_model() {
+        assert_eq!(context_limit_for_model("deepseek-v4-pro"), 1_000_000);
+        assert_eq!(context_limit_for_model("deepseek-v4-flash"), 1_000_000);
+    }
+
+    #[test]
+    fn context_limit_for_deepseek_legacy_model() {
+        // 非 V4 系列的 DeepSeek 模型仍为 128K。
+        // Non-V4 DeepSeek models remain 128K.
+        assert_eq!(context_limit_for_model("deepseek-r1-250120"), 128_000);
     }
 
     #[test]

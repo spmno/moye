@@ -361,11 +361,9 @@ impl ContextHook {
         let (is_overflow, last_input, microcompact_threshold) = {
             let budget = self.budget.lock().unwrap();
             let last = budget.last_input_tokens();
-            let overflow = if last > 0 {
-                budget.is_near_overflow(last as usize, self.config.compaction_threshold)
-            } else {
-                budget.is_near_overflow(estimated, self.config.compaction_threshold)
-            };
+            let overflow = budget.is_near_overflow(estimated, self.config.compaction_threshold)
+                || (last > 0
+                    && budget.is_near_overflow(last as usize, self.config.compaction_threshold));
             let dynamic = budget.effective_budget() / 20;
             let threshold = self.config.microcompact_threshold.max(dynamic);
             (overflow, last, threshold)
@@ -464,36 +462,39 @@ impl ContextHook {
             history.to_vec()
         };
 
-        // Tier 2: LLM 摘要压缩。
-        // Tier 2: LLM summarization compaction.
-        // 切分历史：旧消息（待压缩）+ 近期消息（保留）。
-        // Split history: old messages (to compact) + recent messages (to keep).
+        // Tier 2: LLM 摘要压缩（锚定模式 — 更新上一次摘要而非从头创建）。
+        // Tier 2: LLM summarization compaction (anchored mode — updates previous summary).
+        let tail_budget = {
+            let budget = self.budget.lock().unwrap();
+            let eff = budget.effective_budget();
+            eff / 4
+        };
         let (old, recent) =
-            crate::context::split_history(&base_history, self.config.keep_recent_turns);
+            crate::context::select_head_tail(&base_history, self.config.keep_recent_turns, tail_budget);
         if old.is_empty() {
             return Flow::Continue;
         }
 
-        // 通过 LLM 摘要旧消息。
-        // Summarize old messages via LLM.
-        let summary_prompt = crate::context::format_messages_for_summary(&old);
+        let previous = crate::context::find_previous_summary(&base_history);
+        let summary_prompt = crate::context::build_compaction_prompt(&old, previous.as_deref());
         let summary = match self.compact_via_llm(&summary_prompt).await {
             Ok(s) => s,
             Err(e) => {
                 warn!("compaction LLM call failed: {e}");
-                // 回退：用截断的旧消息文本作为摘要。
-                // Fallback: use truncated old message text as summary.
                 crate::context::format_messages_for_summary(&old)
             }
         };
 
-        // 构建压缩后的历史：[摘要 system 消息, ...近期消息]。
-        // Build compacted history: [summary system message, ...recent messages].
         let summary_msg = Message::system(format!(
             "[对话历史摘要 / Conversation Summary]\n{summary}"
         ));
+        let continue_msg = Message::system(
+            "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.\n\
+             \u{5982}\u{679c}\u{6709}\u{540e}\u{7eed}\u{6b65}\u{9aa4}\u{8bf7}\u{7ee7}\u{7eed}\u{ff0c}\u{5426}\u{5219}\u{8bf7}\u{6c42}\u{6f84}\u{6e05}\u{3002}"
+        );
         let compacted: Vec<Message> = std::iter::once(summary_msg)
             .chain(recent.iter().cloned())
+            .chain(std::iter::once(continue_msg))
             .collect();
 
         let new_tokens = crate::context::estimate_history_tokens(&compacted);
@@ -725,7 +726,7 @@ pub async fn run_autonomous(
     let captured_history: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let captured_turn: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let mut turns_used: usize = 0;
-    let total_max_turns = registry.max_turns();
+    let total_max_turns = registry.max_turns_for_role(role);
 
     for attempt in 0..=MAX_RETRIES {
         let max_turns_remaining = total_max_turns.saturating_sub(turns_used);
@@ -763,7 +764,7 @@ pub async fn run_autonomous(
             context_client,
             model,
             tx.clone(),
-            total_max_turns,
+            max_turns_remaining,
         )
         .with_history_capture(captured_history.clone(), captured_turn.clone());
 
@@ -819,11 +820,14 @@ pub async fn run_autonomous(
 /// Determines whether an error is an SSE stream disconnect (safe to retry).
 pub fn is_stream_error(e: &anyhow::Error) -> bool {
     let msg = e.to_string();
+    if msg.contains("MaxTurnsError") || msg.contains("max turns limit") {
+        return false;
+    }
     msg.contains("error decoding response body")
         || msg.contains("SSE error")
         || msg.contains("Reset(StreamId")
-        || msg.contains("\u{6d41}\u{5f0f}\u{9519}\u{8bef}")
-        || msg.contains("\u{7a7a}\u{95f2}\u{8d85}\u{65f6}")
+        || msg.contains("流式错误")
+        || msg.contains("空闲超时")
 }
 
 /// 消费流式输出：文本增量通过 channel 发送给 TUI，reasoning 实时发送。
@@ -922,6 +926,10 @@ pub async fn consume_stream<R>(
             }
             Err(e) => {
                 warn!(error = %e, error_debug = ?e, "stream item error");
+                let msg = e.to_string();
+                if msg.contains("MaxTurnsError") {
+                    return Err(anyhow::anyhow!("{e}"));
+                }
                 return Err(anyhow::anyhow!(
                     "\u{6d41}\u{5f0f}\u{9519}\u{8bef}: {e}"
                 ));
@@ -957,7 +965,7 @@ fn build_runner_agent(
         .unwrap_or_else(|_| format!("\u{4f60}\u{662f} {role:?} agent\u{3002}"));
     let preamble = crate::registry::inject_skills_public(&preamble);
     let model = registry.session_model().unwrap_or_else(|| rc.model.clone());
-    let max_turns = registry.max_turns();
+    let max_turns = registry.max_turns_for_role(role);
     info!("[runner] role={role:?} model={model} max_turns={max_turns}");
     let tools: Vec<Box<dyn ToolDyn>> = crate::tools::builtin_tools(registry.context_config())?;
     let params = crate::providers::provider_additional_params();

@@ -31,6 +31,8 @@ pub struct RoleConfig {
     pub preamble: String,
     #[serde(default)]
     pub permissions: ToolPerms,
+    #[serde(default)]
+    pub max_turns: Option<usize>,
 }
 
 // 自主循环 HITL（人在环）门控所用的按工具权限分级：
@@ -222,6 +224,15 @@ impl AgentRegistry {
     /// The autonomous loop's max turns, passed through from config.
     pub fn max_turns(&self) -> usize {
         self.config.max_turns()
+    }
+
+    pub fn max_turns_for_role(&self, role: Role) -> usize {
+        let key = format!("{role:?}").to_lowercase();
+        self.config
+            .roles
+            .get(&key)
+            .and_then(|rc| rc.max_turns)
+            .unwrap_or_else(|| self.max_turns())
     }
 
     /// 上下文管理配置（token 预算、压缩阈值、截断限制）。

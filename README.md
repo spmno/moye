@@ -441,8 +441,8 @@ permissions.web_search = "deny"
 [context]
 # 上下文管理配置 / Context management config
 max_output_tokens = 4096           # 预留输出 token / Output token reservation
-compaction_threshold = 0.75        # 触发 LLM 摘要的比例 / Overflow ratio for LLM summary
-keep_recent_turns = 6              # 压缩时保留的最近轮数 / Recent turns to keep
+compaction_threshold = 0.5         # 触发 LLM 摘要的比例 / Overflow ratio for LLM summary
+keep_recent_turns = 2              # 压缩时保留的最近轮数 / Recent turns to keep
 max_bash_output_chars = 20000      # run_bash 输出截断 / Bash output truncation
 max_read_lines = 500               # read_file 输出截断 / Read file truncation
 microcompact_threshold = 20000     # Tier 1 触发 token 阈值 / Tier 1 trigger token threshold
@@ -554,7 +554,7 @@ Long-running agent sessions accumulate conversation history (user messages, assi
 | 层级 / Tier | 机制 / Mechanism | 触发条件 / Trigger | LLM 调用 / LLM Call | 耗时 / Cost |
 |------|------|------|------|------|
 | **Tier 1 — 微压缩 / Microcompact** | 扫描历史中的旧 `ToolResult`，保护最近 N 个，将更早的工具结果替换为 `[Tool result cleared]` 标记 | 估算 token > `microcompact_threshold`（默认 20000） | 否 / No | 极低（纯内存操作）/ Minimal (in-memory) |
-| **Tier 2 — LLM 摘要 / LLM Summarization** | 将旧对话历史发送给摘要 LLM，生成 9 段结构化摘要，替换为单条 System 消息 | Tier 1 后仍超过 `compaction_threshold`（默认 0.75 × 有效预算）| 是 / Yes | 较高（一次 LLM 调用）/ Moderate (one LLM call) |
+| **Tier 2 — LLM 摘要 / LLM Summarization** | 将旧对话历史发送给摘要 LLM，生成 5 段锚定摘要，替换为单条 System 消息 | Tier 1 后仍超过 `compaction_threshold`（默认 0.5 × 有效预算）| 是 / Yes | 较高（一次 LLM 调用）/ Moderate (one LLM call) |
 
 ### Tier 1：微压缩 / Microcompact
 
@@ -598,32 +598,29 @@ A lightweight compaction **without an LLM call**. Tool call results (`ToolResult
 
 ### Tier 2：LLM 摘要 / LLM Summarization
 
-当 Tier 1 微压缩后仍超出 `compaction_threshold` 时触发。将旧对话历史发送给摘要 LLM，生成** 9 段结构化摘要**，确保关键信息不丢失。
+当 Tier 1 微压缩后仍超出 `compaction_threshold` 时触发。将旧对话历史发送给摘要 LLM，生成** 5 段锚定摘要**（受 OpenCode 启发），确保关键信息不丢失。如果历史中已存在上一次摘要，LLM 将增量更新而非从头创建。
 
-Triggered when tokens still exceed `compaction_threshold` after Tier 1. Sends old conversation history to a summarization LLM, generating a **9-section structured summary** to ensure critical information is preserved.
+Triggered when tokens still exceed `compaction_threshold` after Tier 1. Sends old conversation history to a summarization LLM, generating a **5-section anchored summary** (inspired by OpenCode) to ensure critical information is preserved. If a previous summary exists in history, the LLM updates it incrementally rather than creating from scratch.
 
-**9 段摘要模板 / 9-Section Summary Template:**
+**5 段摘要模板 / 5-Section Summary Template:**
 
 | # | 小节 / Section | 内容 / Content |
 |---|------|------|
-| 1 | 任务意图 / Task Intent | 用户想要达成的目标（1-2 句）/ User's goal (1-2 sentences) |
-| 2 | 技术概念 / Technical Concepts | 涉及的关键技术、框架、库 / Key technologies, frameworks, libraries |
-| 3 | 文件与代码 / Files & Code | 已创建/修改的文件路径及关键代码片段 / File paths and key code snippets |
-| 4 | 错误与修复 / Errors & Fixes | 遇到的错误及解决方案 / Errors encountered and solutions |
-| 5 | 方法 / Approach | 采用的实现路径或方法论 / Implementation path or methodology |
-| 6 | 用户消息 / User Messages | 用户的关键指令和反馈 / Key user instructions and feedback |
-| 7 | 待办 / TODOs | 尚未完成的任务 / Pending tasks |
-| 8 | 当前进展 / Current Progress | 已完成的步骤总结 / Summary of completed steps |
-| 9 | 下一步 / Next Steps | 紧接着需要做什么 / What needs to happen next |
+| 1 | Objective | 用户目标（1-2 句）/ User's goal (1-2 sentences) |
+| 2 | Important Details | 约束/偏好、决策原因、重要事实 / Constraints, decisions, key facts |
+| 3 | Work State | Completed / Active / Blocked — 工作状态 / Work status |
+| 4 | Next Move | 紧接着需要做什么 / What needs to happen next |
+| 5 | Relevant Files | 文件/目录路径及重要性 / File paths and why they matter |
 
 **压缩后历史结构 / Compacted History Structure:**
 
 ```
 [System: [对话历史摘要 / Conversation Summary]
-  ## 1. 任务意图 ...
-  ## 2. 技术概念 ...
+  ## 1. Objective ...
+  ## 2. Important Details ...
   ...
-  ## 9. 下一步 ...]
+  ## 5. Relevant Files ...]
+[System: Continue if you have next steps ...]
 [User: 最近第 1 轮消息]          ← keep_recent_turns 保留
 [Assistant: 最近第 1 轮回复]
 [User: 最近第 2 轮消息]
@@ -643,16 +640,16 @@ Compaction uses rig's `Flow::PatchRequest` + `RequestPatch::history()`. This is 
 | 参数 / Parameter | 默认值 / Default | 说明 / Description |
 |------|------|------|
 | `max_output_tokens` | `4096` | 预留给模型输出的 token 数 / Tokens reserved for model output |
-| `compaction_threshold` | `0.75` | Tier 2 触发比例（占有效预算的比例，0.0–1.0）/ Tier 2 trigger ratio (fraction of effective budget, 0.0–1.0) |
-| `keep_recent_turns` | `6` | Tier 2 压缩时保留的最近对话轮数 / Recent turns kept during Tier 2 compaction |
+| `compaction_threshold` | `0.5` | Tier 2 触发比例（占有效预算的比例，0.0–1.0）/ Tier 2 trigger ratio (fraction of effective budget, 0.0–1.0) |
+| `keep_recent_turns` | `2` | Tier 2 压缩时保留的最近对话轮数 / Recent turns kept during Tier 2 compaction |
 | `max_bash_output_chars` | `20000` | `run_bash` 工具输出截断字符数 / Max chars for `run_bash` output |
 | `max_read_lines` | `500` | `read_file` 工具输出截断行数 / Max lines for `read_file` output |
 | `microcompact_threshold` | `20000` | Tier 1 触发的 token 阈值 / Tier 1 trigger token threshold |
 | `microcompact_protected_results` | `3` | Tier 1 微压缩时保护的最近工具结果数量 / Number of recent tool results protected during Tier 1 |
 
-> **有效预算 / Effective Budget** = `上下文窗口大小 - max_output_tokens`。例如 128K 窗口、4096 预留 → 有效预算 123,904 tokens，Tier 2 触发线 = 123,904 × 0.75 ≈ 92,928 tokens。
+> **有效预算 / Effective Budget** = `上下文窗口大小 - max_output_tokens`。例如 128K 窗口、4096 预留 → 有效预算 123,904 tokens，Tier 2 触发线 = 123,904 × 0.5 ≈ 61,952 tokens。
 >
-> **Effective Budget** = `context window - max_output_tokens`. E.g., 128K window, 4096 reserved → effective budget 123,904 tokens, Tier 2 trigger = 123,904 × 0.75 ≈ 92,928 tokens.
+> **Effective Budget** = `context window - max_output_tokens`. E.g., 128K window, 4096 reserved → effective budget 123,904 tokens, Tier 2 trigger = 123,904 × 0.5 ≈ 61,952 tokens.
 
 ### 缓存机制 / Caching
 

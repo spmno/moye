@@ -32,8 +32,8 @@ max_turns = 30
 
 [context]
 max_output_tokens = 4096
-compaction_threshold = 0.75
-keep_recent_turns = 6
+compaction_threshold = 0.5
+keep_recent_turns = 2
 max_bash_output_chars = 20000
 max_read_lines = 500
 microcompact_threshold = 20000
@@ -57,6 +57,7 @@ permissions.web_search = "allow"
 [agents.investigator]
 model = "glm-latest"
 preamble = "prompts/investigator.md"
+max_turns = 20
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
 permissions.run_bash_mutating = "deny"

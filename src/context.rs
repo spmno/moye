@@ -348,8 +348,9 @@ fn is_user_text_message(msg: &Message) -> bool {
 /// 将一组 Message 格式化为摘要 LLM 的提示词文本。
 /// Format a slice of Messages into prompt text for the summarization LLM.
 ///
-/// 每条消息截断到 ~500 字符以防提示词过大。
-/// Each message is truncated to ~500 chars to keep the summarization prompt manageable.
+/// 每条消息截断到 ~4000 字符以防提示词过大，但保留足够的调查报告细节。
+/// Each message is truncated to ~4000 chars to keep the summarization prompt manageable
+/// while preserving enough detail from investigation reports.
 pub fn format_messages_for_summary(messages: &[Message]) -> String {
     let mut parts = Vec::new();
     for msg in messages {
@@ -359,7 +360,7 @@ pub fn format_messages_for_summary(messages: &[Message]) -> String {
             Message::Assistant { .. } => "Assistant",
         };
         let text = extract_text(msg);
-        let truncated = truncate_at_char_boundary(&text, 500);
+        let truncated = truncate_at_char_boundary(&text, 4000);
         parts.push(format!("[{}]: {}", role, truncated));
     }
     parts.join("\n\n")

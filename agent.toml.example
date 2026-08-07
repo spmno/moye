@@ -28,7 +28,7 @@ api_key_env = "MY_AGENT_API_KEY"
 # 切换模型用 REPL 命令：model <slug>
 default_model = "glm-latest"
 # 自主循环上限：agent 最多执行的轮数。
-max_turns = 20
+max_turns = 30
 
 [context]
 max_output_tokens = 4096

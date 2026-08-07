@@ -284,6 +284,15 @@ pub struct ContextHook {
     /// 缓存：(压缩时的历史长度, 压缩后的历史)。历史未变时复用。
     /// Cache: (history length at compaction, compacted history). Reused when history unchanged.
     compaction_cache: Arc<Mutex<Option<(usize, Vec<Message>)>>>,
+    /// SSE 重试时用于捕获对话历史的共享 Arc（None = 不捕获）。
+    /// Shared Arc for capturing conversation history on SSE retry (None = no capture).
+    history_capture: Option<Arc<Mutex<Vec<Message>>>>,
+    /// SSE 重试时用于捕获当前轮次的共享 Arc。
+    /// Shared Arc for capturing the current turn number on SSE retry.
+    turn_capture: Option<Arc<Mutex<usize>>>,
+    /// 自主循环轮数上限，用于轮次预算提醒。
+    /// Max turns for the autonomous loop, used for turn-budget awareness.
+    max_turns: usize,
 }
 
 impl ContextHook {
@@ -295,6 +304,7 @@ impl ContextHook {
         client: crate::providers::CompletionsClient,
         model: String,
         tx: EventSender,
+        max_turns: usize,
     ) -> Self {
         let budget = crate::context::TokenBudget::new(context_limit, config.max_output_tokens);
         Self {
@@ -304,12 +314,49 @@ impl ContextHook {
             model,
             tx,
             compaction_cache: Arc::new(Mutex::new(None)),
+            history_capture: None,
+            turn_capture: None,
+            max_turns,
         }
+    }
+
+    /// 启用 SSE 重试历史捕获：传入共享 Arc，每轮 CompletionCall 时写入最新历史。
+    /// Enable SSE-retry history capture: pass shared Arcs, written on every CompletionCall.
+    pub fn with_history_capture(
+        mut self,
+        history: Arc<Mutex<Vec<Message>>>,
+        turn: Arc<Mutex<usize>>,
+    ) -> Self {
+        self.history_capture = Some(history);
+        self.turn_capture = Some(turn);
+        self
+    }
+
+    /// 当轮次超过上限 70% 时返回收敛提醒文本。
+    /// Returns a convergence reminder text when turns exceed 70% of the limit.
+    fn turn_reminder(&self, turn: usize) -> Option<String> {
+        if self.max_turns == 0 || turn < self.max_turns * 7 / 10 {
+            return None;
+        }
+        let remaining = self.max_turns.saturating_sub(turn);
+        Some(format!(
+            "[\u{7cfb}\u{7edf}\u{63d0}\u{793a}] \u{4f60}\u{5df2}\u{4f7f}\u{7528} {}/{} \u{8f6e}\u{ff0c}\u{5269}\u{4f59} {} \u{8f6e}\u{3002}\u{8bf7}\u{4f18}\u{5148}\u{6536}\u{655b}\u{5230}\u{7ed3}\u{8bba}\u{ff0c}\u{907f}\u{514d}\u{8fc7}\u{5ea6}\u{63a2}\u{7d22}\u{3002}\n\
+             [System] {}/{} turns used, {} remaining. Prioritize converging to a conclusion, avoid excessive exploration.",
+            turn, self.max_turns, remaining,
+            turn, self.max_turns, remaining,
+        ))
     }
 
     /// 检测溢出并在必要时压缩历史，返回 `Flow::PatchRequest` 或 `Flow::Continue`。
     /// Detect overflow and compact if needed, returning `Flow::PatchRequest` or `Flow::Continue`.
     async fn handle_completion_call(&self, history: &[Message], _turn: usize) -> Flow {
+        if let Some(hc) = &self.history_capture {
+            *hc.lock().unwrap() = history.to_vec();
+        }
+        if let Some(tc) = &self.turn_capture {
+            *tc.lock().unwrap() = _turn;
+        }
+
         let estimated = crate::context::estimate_history_tokens(history);
         let (is_overflow, last_input, microcompact_threshold) = {
             let budget = self.budget.lock().unwrap();
@@ -339,6 +386,11 @@ impl ContextHook {
         );
 
         if !is_overflow && !need_microcompact {
+            if let Some(reminder) = self.turn_reminder(_turn) {
+                let mut patched = history.to_vec();
+                patched.push(Message::system(&reminder));
+                return Flow::patch_request(RequestPatch::new().history(patched));
+            }
             return Flow::Continue;
         }
 
@@ -670,19 +722,31 @@ pub async fn run_autonomous(
 ) -> anyhow::Result<String> {
     const MAX_RETRIES: usize = 3;
 
+    let captured_history: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_turn: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let mut turns_used: usize = 0;
+    let total_max_turns = registry.max_turns();
+
     for attempt in 0..=MAX_RETRIES {
+        let max_turns_remaining = total_max_turns.saturating_sub(turns_used);
+        if max_turns_remaining == 0 {
+            return Err(anyhow::anyhow!(
+                "{role:?} \u{8f6e}\u{6b21}\u{5df2}\u{7528}\u{5c3d}\u{ff08}{turns_used}/{total_max_turns}\u{ff09}"
+            ));
+        }
+
         let prompt = if attempt == 0 {
             goal.to_string()
         } else {
             format!(
                 "{goal}\n\n\
-                 [\u{7cfb}\u{7edf}\u{63d0}\u{793a}] \u{4e0a}\u{6b21}\u{6267}\u{884c}\u{56e0} SSE \u{8fde}\u{63a5}\u{4e2d}\u{65ad}\u{ff08}\u{7b2c} {attempt} \u{6b21}\u{91cd}\u{8bd5}\u{ff09}\u{3002}\
-                 \u{8bf7}\u{7528} `ls -R .` \u{68c0}\u{67e5}\u{5df2}\u{521b}\u{5efa}\u{7684}\u{6587}\u{4ef6}\u{ff0c}\u{8df3}\u{8fc7}\u{5df2}\u{5b8c}\u{6210}\u{7684}\u{6b65}\u{9aa4}\u{ff0c}\u{7ee7}\u{7eed}\u{672a}\u{5b8c}\u{6210}\u{7684}\u{90e8}\u{5206}\u{3002}"
+                 [\u{7cfb}\u{7edf}\u{63d0}\u{793a}] \u{4e0a}\u{6b21}\u{56e0} SSE \u{8fde}\u{63a5}\u{4e2d}\u{65ad}\u{ff08}\u{7b2c} {attempt} \u{6b21}\u{91cd}\u{8bd5}\u{ff09}\u{ff0c}\u{5df2}\u{4fdd}\u{7559}\u{4e4b}\u{524d}\u{7684}\u{5bf9}\u{8bdd}\u{5386}\u{53f2}\u{3002}\
+                 \u{5df2}\u{7528} {turns_used}/{total_max_turns} \u{8f6e}\u{ff0c}\u{5269}\u{4f59} {max_turns_remaining} \u{8f6e}\u{3002}\
+                 \u{8bf7}\u{57fa}\u{4e8e}\u{5df2}\u{6709}\u{8fdb}\u{5c55}\u{7ee7}\u{7eed}\u{ff0c}\u{8df3}\u{8fc7}\u{5df2}\u{5b8c}\u{6210}\u{7684}\u{63a2}\u{7d22}\u{ff0c}\u{4f18}\u{5148}\u{6536}\u{655b}\u{5230}\u{7ed3}\u{8bba}\u{3002}"
             )
         };
 
         let perms = registry.tool_perms(role);
-        let max_turns = registry.max_turns();
         let hitl_waiting = Arc::new(AtomicBool::new(false));
         let hook = HitlHook::new(perms, hitl_waiting.clone(), tx.clone(), sandbox.clone(), trust_sandbox.clone());
 
@@ -699,31 +763,41 @@ pub async fn run_autonomous(
             context_client,
             model,
             tx.clone(),
-        );
+            total_max_turns,
+        )
+        .with_history_capture(captured_history.clone(), captured_turn.clone());
 
         let agent = build_runner_agent(registry, role)?;
-        let stream = agent
+        let prior_history = captured_history.lock().unwrap().clone();
+        let mut runner = agent
             .runner(&prompt)
-            .max_turns(max_turns)
+            .max_turns(max_turns_remaining)
             .max_invalid_tool_call_retries(3)
             .add_hook(hook)
-            .add_hook(context_hook)
-            .stream()
-            .await;
+            .add_hook(context_hook);
+        if !prior_history.is_empty() {
+            runner = runner.history(prior_history);
+        }
+        let stream = runner.stream().await;
 
         match consume_stream(stream, Some(hitl_waiting), tx).await {
             Ok(output) => return Ok(output),
             Err(e) if is_stream_error(&e) && attempt < MAX_RETRIES => {
+                turns_used = *captured_turn.lock().unwrap();
+                let hist_len = captured_history.lock().unwrap().len();
                 warn!(
                     error = %e,
                     error_debug = ?e,
                     attempt = attempt + 1,
                     max_retries = MAX_RETRIES,
                     role = ?role,
-                    "SSE disconnect, retrying"
+                    turns_used,
+                    total_max_turns,
+                    captured_history_len = hist_len,
+                    "SSE disconnect, retrying with preserved history"
                 );
                 let _ = tx.send(AgentEvent::Info(format!(
-                    "[\u{91cd}\u{8bd5}] {role:?} \u{7b2c} {}/{} \u{6b21}\u{ff1a}SSE \u{8fde}\u{63a5}\u{4e2d}\u{65ad}\u{ff0c}\u{91cd}\u{65b0}\u{8c03}\u{7528}",
+                    "[\u{91cd}\u{8bd5}] {role:?} \u{7b2c} {}/{} \u{6b21}\u{ff1a}SSE \u{8fde}\u{63a5}\u{4e2d}\u{65ad}\u{ff0c}\u{5df2}\u{4fdd}\u{7559}\u{5bf9}\u{8bdd}\u{5386}\u{53f2}\u{ff0c}\u{7ee7}\u{7eed}\u{6267}\u{884c}",
                     attempt + 1,
                     MAX_RETRIES
                 )));

@@ -70,12 +70,12 @@ impl Config {
         Ok(toml::from_str(&raw)?)
     }
 
-    /// 自主循环轮数上限；为 0 时回退到默认 30。
-    /// Max turns for the autonomous loop; falls back to 30 when 0.
+    /// 自主循环轮数上限；为 0 时回退到默认 50。
+    /// Max turns for the autonomous loop; falls back to 50 when 0.
     pub fn max_turns(&self) -> usize {
         let turns = self.agent.max_turns;
         if turns == 0 {
-            30
+            50
         } else {
             turns
         }
@@ -237,7 +237,7 @@ authorized_dirs = ["~/.config", "/tmp/my-agent"]
     #[test]
     fn load_empty_config_defaults() {
         let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.max_turns(), 30);
+        assert_eq!(cfg.max_turns(), 50);
         assert!(cfg.roles.is_empty());
         assert_eq!(cfg.evolution.rule_escalation_threshold, 0);
         assert_eq!(cfg.context.max_output_tokens, 4096);
@@ -248,7 +248,7 @@ authorized_dirs = ["~/.config", "/tmp/my-agent"]
     #[test]
     fn max_turns_zero_falls_back() {
         let cfg: Config = toml::from_str("[agent]\nmax_turns = 0\n").unwrap();
-        assert_eq!(cfg.max_turns(), 30);
+        assert_eq!(cfg.max_turns(), 50);
     }
 
     #[test]

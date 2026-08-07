@@ -382,7 +382,7 @@ provider = "deepseek"
 # Custom: 任意 OpenAI 兼容模型 ID / Any OpenAI-compatible model ID
 default_model = "kimi-k3"
 # 自主循环最大轮数 / Max turns for autonomous loop
-max_turns = 20
+max_turns = 30
 
 # 各角色配置（model 可被 /model 命令覆盖）
 # Role configs (model can be overridden by `/model` command)

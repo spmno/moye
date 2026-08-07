@@ -422,7 +422,16 @@ fn render_event(event: &AgentEvent) -> Vec<Line<'static>> {
             if text.is_empty() {
                 vec![Line::default()]
             } else {
-                let mut v = vec![Line::styled(text.clone(), theme::info())];
+                // 按 \n 拆分为多行，避免 ratatui Line 不识别换行符导致
+                // 整段文本挤在一行、超出终端宽度后被截断。
+                // Split on \n into separate Lines: ratatui's Line does not
+                // honor embedded newlines, so a multi-line string in a single
+                // Line gets squashed into one visual row and truncated at the
+                // terminal edge.
+                let mut v: Vec<Line<'static>> = text
+                    .split('\n')
+                    .map(|line| Line::styled(line.to_owned(), theme::info()))
+                    .collect();
                 v.push(Line::default());
                 v
             }
@@ -1466,7 +1475,7 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
     let filled = (bar_w * state.current_turn / max).min(bar_w);
     let bar: String = "\u{2588}".repeat(filled) + &"\u{2591}".repeat(bar_w - filled);
     lines.push(Line::styled(
-        format!("[{bar}] {}/{}", state.current_turn, state.max_turns),
+        format!("[ {bar} ] {}/{}", state.current_turn, state.max_turns),
         theme::status_turn(),
     ));
 

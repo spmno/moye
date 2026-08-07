@@ -647,7 +647,7 @@ pub fn is_readonly_bash(command: &str) -> bool {
         // 文本处理 / Text processing
         "sort", "uniq", "cut", "tr", "diff", "comm", "join", "paste",
         "fold", "fmt", "pr", "column", "expand", "unexpand",
-        "shuf", "tsort", "seq",
+        "shuf", "tsort", "seq", "sed", "awk",
         // 路径 / Path utilities
         "pwd", "basename", "dirname", "realpath", "readlink", "which",
         // 校验和 / Checksums
@@ -698,6 +698,29 @@ pub fn is_readonly_bash(command: &str) -> bool {
                 || s.contains(" -fprintf")
                 || s.contains(" -fls"))
         {
+            return false;
+        }
+        // `sed -i` 原地编辑会修改文件；`--in-place` 同理。
+        // 合并标志（如 -ni）中的 i 也要检测。
+        // `sed -i` modifies files in place; `--in-place` likewise.
+        // Also detect `i` in combined short flags (e.g. `-ni`).
+        if s.starts_with("sed") {
+            for token in s.split_whitespace() {
+                if token == "--in-place" || token.starts_with("--in-place=") {
+                    return false;
+                }
+                if token.starts_with('-')
+                    && !token.starts_with("--")
+                    && token.len() > 1
+                    && token.contains('i')
+                {
+                    return false;
+                }
+            }
+        }
+        // `awk` 的 system() 可执行任意命令；`| getline` 可从命令管道读取。
+        // `awk`'s system() can execute arbitrary commands; `| getline` reads from command pipes.
+        if s.starts_with("awk") && (s.contains("system(") || s.contains("| getline")) {
             return false;
         }
         // xargs 后跟只读命令则安全（如 `xargs grep`），否则需 HITL。
@@ -843,12 +866,25 @@ mod tests {
         assert!(!is_readonly_bash("find . | xargs chmod 644"));
     }
 
-    /// sed / awk 不在只读列表中——应被归类为非只读。
-    /// sed / awk are not in the readonly list — should be mutating.
+    /// sed 只读用法（-n 打印行范围）应放行；sed -i 原地编辑应拒绝。
+    /// sed read-only usage (-n print range) should pass; sed -i in-place editing should not.
     #[test]
-    fn sed_awk_not_readonly() {
-        assert!(!is_readonly_bash("sed 's/foo/bar/' file.txt"));
-        assert!(!is_readonly_bash("awk '{print $1}' file.txt"));
+    fn sed_readonly_vs_mutating() {
+        assert!(is_readonly_bash("sed -n '1140,1645p' src/ui/tui.rs"));
+        assert!(is_readonly_bash("sed 's/foo/bar/' file.txt"));
+        assert!(!is_readonly_bash("sed -i 's/foo/bar/' file.txt"));
+        assert!(!is_readonly_bash("sed -ni 's/foo/bar/' file.txt"));
+        assert!(!is_readonly_bash("sed --in-place 's/foo/bar/' file.txt"));
+    }
+
+    /// awk 只读用法应放行；awk system() 应拒绝。
+    /// awk read-only usage should pass; awk system() should not.
+    #[test]
+    fn awk_readonly_vs_mutating() {
+        assert!(is_readonly_bash("awk '{print $1}' file.txt"));
+        assert!(is_readonly_bash("awk -F: '{print $2}' /etc/passwd"));
+        assert!(!is_readonly_bash("awk 'BEGIN { system(\"rm -rf /\") }'"));
+        assert!(!is_readonly_bash("awk '{print | getline cmd}' file"));
     }
 
     /// 引号内的管道符不应触发分段（grep 正则中的 `\|` 是或操作符，不是管道）。

@@ -358,32 +358,24 @@ impl ContextHook {
         }
 
         let estimated = crate::context::estimate_history_tokens(history);
-        let (is_overflow, last_input, microcompact_threshold) = {
+        let (is_overflow, last_input) = {
             let budget = self.budget.lock().unwrap();
             let last = budget.last_input_tokens();
             let overflow = budget.is_near_overflow(estimated, self.config.compaction_threshold)
                 || (last > 0
                     && budget.is_near_overflow(last as usize, self.config.compaction_threshold));
-            let dynamic = budget.effective_budget() / 20;
-            let threshold = self.config.microcompact_threshold.max(dynamic);
-            (overflow, last, threshold)
+            (overflow, last)
         };
-
-        // Tier 1 触发：估算 token 超过微压缩阈值（动态 = max(配置值, 有效预算/20)）。
-        // Tier 1 trigger: estimated tokens exceed microcompact threshold (dynamic = max(config, budget/20)).
-        let need_microcompact = estimated > microcompact_threshold;
 
         info!(
             history_len = history.len(),
             estimated_tokens = estimated,
             last_input_tokens = last_input,
             is_overflow,
-            need_microcompact,
-            microcompact_threshold,
             "context check"
         );
 
-        if !is_overflow && !need_microcompact {
+        if !is_overflow {
             if let Some(reminder) = self.turn_reminder(_turn) {
                 let mut patched = history.to_vec();
                 patched.push(Message::system(&reminder));
@@ -392,75 +384,7 @@ impl ContextHook {
             return Flow::Continue;
         }
 
-        // 检查缓存：历史长度未变时复用上次的压缩结果。
-        // Check cache: reuse last compaction when history length is unchanged.
-        {
-            let cache = self.compaction_cache.lock().unwrap();
-            if let Some((cached_len, ref cached_history)) = *cache {
-                if cached_len == history.len() {
-                    info!(
-                        cached_len,
-                        "reusing cached compaction"
-                    );
-                    return Flow::patch_request(
-                        RequestPatch::new().history(cached_history.clone()),
-                    );
-                }
-            }
-        }
-
-        // Tier 1: 微压缩 — 清除旧工具结果（无 LLM 调用）。
-        // Tier 1: Microcompact — clear old tool results (no LLM call).
-        let base_history: Vec<Message> = if need_microcompact {
-            let microcompacted = crate::context::microcompact(
-                history,
-                self.config.microcompact_protected_results,
-            );
-            let micro_tokens = crate::context::estimate_history_tokens(&microcompacted);
-
-            // 重新检查微压缩后是否仍溢出。
-            // Re-check overflow after microcompact.
-            let still_overflow = {
-                let budget = self.budget.lock().unwrap();
-                if budget.last_input_tokens() > 0 {
-                    budget.is_near_overflow(
-                        budget.last_input_tokens() as usize,
-                        self.config.compaction_threshold,
-                    )
-                } else {
-                    budget.is_near_overflow(micro_tokens, self.config.compaction_threshold)
-                }
-            };
-
-            if !still_overflow {
-                if micro_tokens < estimated {
-                    // 微压缩已足够，直接返回。
-                    // Microcompact was sufficient — return immediately.
-                    *self.compaction_cache.lock().unwrap() =
-                        Some((history.len(), microcompacted.clone()));
-                    let _ = self.tx.send(AgentEvent::ContextCompacted {
-                        old_tokens: estimated,
-                        new_tokens: micro_tokens,
-                    });
-                    let _ = self.tx.send(AgentEvent::Info(format!(
-                        "  [微压缩 / microcompact] {estimated} → {micro_tokens} tokens"
-                    )));
-                    return Flow::patch_request(
-                        RequestPatch::new().history(microcompacted),
-                    );
-                } else if !is_overflow {
-                    // 无工具结果可清除，且未溢出。
-                    // No tool results to clear, and no overflow.
-                    return Flow::Continue;
-                }
-            }
-
-            // 仍溢出 — 使用微压缩后的历史作为 Tier 2 的基础。
-            // Still overflow — use microcompacted history as base for Tier 2.
-            microcompacted
-        } else {
-            history.to_vec()
-        };
+        let base_history: Vec<Message> = history.to_vec();
 
         // Tier 2: LLM 摘要压缩（锚定模式 — 更新上一次摘要而非从头创建）。
         // Tier 2: LLM summarization compaction (anchored mode — updates previous summary).

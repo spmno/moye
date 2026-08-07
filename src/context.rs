@@ -55,11 +55,13 @@ pub struct ContextConfig {
 
     /// 触发微压缩（Tier 1）的 token 阈值（估算 token 数超过此值时触发）。
     /// Token threshold to trigger microcompact (Tier 1) when estimated tokens exceed this.
+    #[allow(dead_code)]
     #[serde(default = "default_microcompact_threshold")]
     pub microcompact_threshold: usize,
 
     /// 微压缩时保护的最近工具结果数量（最近 N 个 ToolResult 不清除）。
     /// Number of recent ToolResults to protect during microcompact (last N are not cleared).
+    #[allow(dead_code)]
     #[serde(default = "default_microcompact_protected_results")]
     pub microcompact_protected_results: usize,
 }
@@ -441,6 +443,7 @@ fn summarize_tool_result(tool_name: &str, tool_args: &str, content: &str) -> Str
 /// 返回修改后的历史副本；若无 ToolResult 需清除则返回原历史的克隆。
 /// Returns a modified copy of the history; if no ToolResults need clearing,
 /// returns a clone of the original.
+#[allow(dead_code)]
 pub fn microcompact(history: &[Message], protected_results: usize) -> Vec<Message> {
     // 构建 ToolCall ID → (tool_name, args) 映射，用于在清除时保留工具元信息。
     // Build ToolCall ID → (tool_name, args) map for preserving tool metadata on clear.

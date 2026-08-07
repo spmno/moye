@@ -576,8 +576,28 @@ fn decode_html_entities(s: &str) -> String {
 /// because auto-running a destructive command is more dangerous than one extra confirmation.
 pub fn is_readonly_bash(command: &str) -> bool {
     const READONLY_PREFIXES: &[&str] = &[
-        "ls", "cat", "head", "tail", "grep", "git status", "git log", "git diff", "git show",
-        "pwd", "echo", "find", "wc", "tree", "which", "readlink",
+        // 目录/文件查看 / Directory & file viewing
+        "ls", "cat", "head", "tail", "tree", "file", "stat", "du", "df",
+        "wc", "nl", "tac", "rev", "bat", "eza", "exa",
+        // 搜索 / Search
+        "grep", "rg", "ag", "ack", "find", "fd",
+        // Git 只读 / Git read-only
+        "git status", "git log", "git diff", "git show",
+        // 文本处理 / Text processing
+        "sort", "uniq", "cut", "tr", "diff", "comm", "join", "paste",
+        "fold", "fmt", "pr", "column", "expand", "unexpand",
+        "shuf", "tsort", "seq",
+        // 路径 / Path utilities
+        "pwd", "basename", "dirname", "realpath", "readlink", "which",
+        // 校验和 / Checksums
+        "md5sum", "sha1sum", "sha256sum", "sha512sum",
+        // 十六进制/字符串 / Hex & strings
+        "xxd", "od", "hexdump", "strings",
+        // 编码 / Encoding
+        "iconv", "base64", "base32",
+        // 系统信息 / System info
+        "printenv", "whoami", "uname", "arch", "nproc", "uptime", "hostname",
+        "echo", "date", "test", "true", "false",
     ];
     // 命令替换（$(...) / 反引号）可在只读前缀内部执行任意命令——例如
     // `ls $(rm -rf ~)` 首 token 是只读的 `ls`，但实际会删除用户主目录。
@@ -615,6 +635,21 @@ pub fn is_readonly_bash(command: &str) -> bool {
                 || s.contains(" -fls"))
         {
             return false;
+        }
+        // xargs 后跟只读命令则安全（如 `xargs grep`），否则需 HITL。
+        // xargs 后的命令可能是危险的（如 `xargs rm`），需检查内部命令。
+        // xargs followed by a read-only command is safe (e.g. `xargs grep`);
+        // xargs followed by a mutating command (e.g. `xargs rm`) is dangerous.
+        if s.starts_with("xargs") {
+            let after = s.strip_prefix("xargs").unwrap_or("").trim();
+            let inner = after.split_whitespace().find(|t| !t.starts_with('-'));
+            match inner {
+                Some(cmd) if !READONLY_PREFIXES.iter().any(|p| cmd.starts_with(p)) => {
+                    return false;
+                }
+                _ => {} // None = xargs defaults to echo (safe); Some = inner is readonly
+            }
+            continue;
         }
         if !READONLY_PREFIXES.iter().any(|p| s.starts_with(p)) {
             return false;
@@ -699,5 +734,56 @@ mod tests {
         assert!(!is_readonly_bash("find . -delete"));
         assert!(!is_readonly_bash("find / -name x -exec rm {} \\;"));
         assert!(!is_readonly_bash("find . -execdir chmod 777 {} +"));
+    }
+
+    /// 扩展的只读命令（sort/uniq/cut/tr/diff/stat/rg/fd 等）应被归类为只读。
+    /// Extended read-only commands (sort/uniq/cut/tr/diff/stat/rg/fd etc.) should be read-only.
+    #[test]
+    fn extended_readonly_commands() {
+        assert!(is_readonly_bash("sort file.txt"));
+        assert!(is_readonly_bash("uniq -c file.txt"));
+        assert!(is_readonly_bash("cut -d: -f1 /etc/passwd"));
+        assert!(is_readonly_bash("tr 'a-z' 'A-Z'"));
+        assert!(is_readonly_bash("diff a.txt b.txt"));
+        assert!(is_readonly_bash("stat file.txt"));
+        assert!(is_readonly_bash("rg pattern src/"));
+        assert!(is_readonly_bash("fd . --type f"));
+        assert!(is_readonly_bash("bat README.md"));
+        assert!(is_readonly_bash("md5sum file.bin"));
+        assert!(is_readonly_bash("xxd hex.bin"));
+        assert!(is_readonly_bash("strings binary"));
+        assert!(is_readonly_bash("basename /a/b/c.txt"));
+        assert!(is_readonly_bash("seq 1 10"));
+        assert!(is_readonly_bash("date"));
+    }
+
+    /// 管道中的只读命令组合应被归类为只读（之前 sort 缺失导致 bug）。
+    /// Piped read-only commands should be read-only (sort was previously missing, causing a bug).
+    #[test]
+    fn piped_readonly_commands() {
+        assert!(is_readonly_bash("find src -type f | sort"));
+        assert!(is_readonly_bash("grep -r foo . | sort | uniq"));
+        assert!(is_readonly_bash("cat file | tr 'a-z' 'A-Z' | head"));
+        assert!(is_readonly_bash("git log --oneline | head -10 | cut -d' ' -f1"));
+        assert!(is_readonly_bash("ls -la | sort -k5 -n | tail -10"));
+    }
+
+    /// xargs 后跟只读命令应被归类为只读，跟危险命令则非只读。
+    /// xargs with a read-only inner command should be read-only;
+    /// with a mutating inner command it should not.
+    #[test]
+    fn xargs_readonly_vs_mutating() {
+        assert!(is_readonly_bash("find . -name '*.rs' | xargs grep 'foo'"));
+        assert!(is_readonly_bash("find . -name '*.go' | xargs wc -l"));
+        assert!(!is_readonly_bash("find . -name '*.tmp' | xargs rm"));
+        assert!(!is_readonly_bash("find . | xargs chmod 644"));
+    }
+
+    /// sed / awk 不在只读列表中——应被归类为非只读。
+    /// sed / awk are not in the readonly list — should be mutating.
+    #[test]
+    fn sed_awk_not_readonly() {
+        assert!(!is_readonly_bash("sed 's/foo/bar/' file.txt"));
+        assert!(!is_readonly_bash("awk '{print $1}' file.txt"));
     }
 }

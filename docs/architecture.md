@@ -27,7 +27,7 @@
 │  PromptEvolver · CodeModifier · LessonExtractor · RulePromoter│
 ├─────────────────────────────────────────────────────────────┤
 │  Orchestration Layer（编排层）                                │
-│  Orchestrator · IntentClassifier · ReviewGate（两轮审计门）    │
+│  Orchestrator · IntentClassifier · Investigator · ReviewGate│
 ├─────────────────────────────────────────────────────────────┤
 │  Session & Context Layer（会话与上下文层）—— Phase 1          │
 │  SessionStore · Message/Part · ContextManager · Compactor    │
@@ -84,6 +84,12 @@ src/
 │   ├── self_modify.rs         # 代码自修改（cargo build 验证 + 回退）
 │   └── tool_ext.rs            # 工具扩展（可编译模板 + 清单）
 └── skills.rs                  # 技能系统（运行时 markdown 注入）
+
+# 提示词文件（prompts/）
+#   investigator.md  # 调查者：判断是否需要调查 → 探索代码库 → 产出调查报告
+#   planner.md       # 规划者：拆解任务为可执行步骤
+#   builder.md       # 构建者：执行编辑与 bash 命令
+#   auditor.md       # 审计者：两轮评审（规格符合性 + 代码质量）
 ```
 
 ## Phase 路线图

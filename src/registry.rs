@@ -10,12 +10,13 @@ use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
-/// Agent 角色：编排者 / 规划者 / 构建者 / 审计者。
-/// Agent roles: Orchestrator / Planner / Builder / Auditor.
+/// Agent 角色：编排者 / 调查者 / 规划者 / 构建者 / 审计者。
+/// Agent roles: Orchestrator / Investigator / Planner / Builder / Auditor.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Orchestrator,
+    Investigator,
     Planner,
     Builder,
     Auditor,
@@ -368,10 +369,10 @@ pub fn classify(message: &str) -> Intent {
 
 /// 编排者：先分类意图，再按 SDD 纪律委派给对应的角色 Agent。
 /// Orchestrator: classifies intent first, then delegates to the corresponding role Agent per SDD discipline.
-/// Implement → 规划者拆解 → 构建者执行（工具循环 + HITL）→ 审计者两轮评审。
-/// Implement -> Planner decomposes -> Builder executes (tool loop + HITL) -> Auditor two-round review.
-/// Investigate → 规划者只读探索（工具循环，无编辑权限）。
-/// Investigate -> Planner read-only exploration (tool loop, no edit permission).
+/// Implement → 调查者探索 → 规划者拆解 → 构建者执行（工具循环 + HITL）→ 审计者两轮评审。
+/// Implement -> Investigator explores -> Planner decomposes -> Builder executes (tool loop + HITL) -> Auditor two-round review.
+/// Investigate → 调查者只读探索（工具循环，无编辑权限）。
+/// Investigate -> Investigator read-only exploration (tool loop, no edit permission).
 /// Chat → 构建者直接对话（无工具循环）。
 /// Chat -> Builder direct conversation (no tool loop).
 pub struct Orchestrator {
@@ -395,7 +396,7 @@ impl Orchestrator {
                 crate::agent_loop::run_autonomous(
                     &self.registry,
                     &self.sandbox,
-                    Role::Planner,
+                    Role::Investigator,
                     message,
                     tx,
                 )
@@ -409,10 +410,35 @@ impl Orchestrator {
     }
 
     async fn run_sdd_pipeline(&self, message: &str, tx: &EventSender) -> anyhow::Result<String> {
+        // 调查步骤：先让调查者判断是否需要调查并探索代码库。
+        // Investigation step: let the Investigator decide whether to investigate and explore the codebase.
+        let investigation = crate::agent_loop::run_autonomous(
+            &self.registry,
+            &self.sandbox,
+            Role::Investigator,
+            &format!(
+                "{message}\n\n\
+                 请先判断此任务是否需要调查代码背景。如果任务简单明了无需调查，\
+                 直接回复\"无需调查\"并简述原因，不调用任何工具。\
+                 否则，探索相关代码，理解架构与依赖，产出结构化调查报告。"
+            ),
+            tx,
+        )
+        .await?;
+
+        // 规划步骤：将调查发现注入 Planner 的 prompt。
+        // Planning step: inject investigation findings into Planner's prompt.
+        let plan_prompt = if investigation.contains("无需调查") {
+            format!("{message}\n\n请拆解为相互独立、可执行的步骤。")
+        } else {
+            format!(
+                "{message}\n\n\
+                 调查发现：\n{investigation}\n\n\
+                 请基于以上调查发现，拆解为相互独立、可执行的步骤。"
+            )
+        };
         let planner = self.registry.build(Role::Planner)?;
-        let plan = planner
-            .run(&format!("{message}\n\n\u{8bf7}\u{62c6}\u{89e3}\u{4e3a}\u{76f8}\u{4e92}\u{72ec}\u{7acb}\u{3001}\u{53ef}\u{6267}\u{884c}\u{7684}\u{6b65}\u{9aa4}\u{3002}"), tx)
-            .await?;
+        let plan = planner.run(&plan_prompt, tx).await?;
 
         let built = crate::agent_loop::run_autonomous(
             &self.registry,

@@ -54,6 +54,16 @@ permissions.edit_file = "deny"
 permissions.web_fetch = "allow"
 permissions.web_search = "allow"
 
+[agents.investigator]
+model = "glm-latest"
+preamble = "prompts/investigator.md"
+permissions.read_file = "allow"
+permissions.run_bash_readonly = "allow"
+permissions.run_bash_mutating = "deny"
+permissions.edit_file = "deny"
+permissions.web_fetch = "allow"
+permissions.web_search = "allow"
+
 [agents.planner]
 model = "glm-latest"
 preamble = "prompts/planner.md"

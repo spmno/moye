@@ -111,6 +111,7 @@ rule_escalation_threshold = 3
 # 用户确认后，该目录被加入授权列表，后续访问不再询问。
 #
 # 通过环境变量 MY_AGENT_SANDBOX=off 可禁用沙箱（不推荐）。
+# 通过环境变量 MY_AGENT_TRUST_SANDBOX=on 可在启动时开启信任模式（所有沙箱外访问自动授权）。
 #
 # The Agent can only access the project root (current working directory) and its
 # subdirectories by default. Access to other directories (e.g. /etc, /tmp,
@@ -118,3 +119,14 @@ rule_escalation_threshold = 3
 # the directory is added to the allow-list and subsequent accesses won't prompt.
 #
 # Disable via MY_AGENT_SANDBOX=off (not recommended).
+# Enable trust mode via MY_AGENT_TRUST_SANDBOX=on (auto-authorize all out-of-sandbox access).
+
+[sandbox]
+# 预授权目录列表：这些目录及其子目录可直接访问，无需弹窗确认。
+# 支持 ~ 展开（如 ~/.config）。
+# Pre-authorized directory list: these directories and their subdirectories are
+# accessible without prompting. Supports ~ expansion (e.g. ~/.config).
+#
+# 示例 / Example:
+# authorized_dirs = ["~/.config", "/tmp/my-agent", "../shared-libs"]
+authorized_dirs = []

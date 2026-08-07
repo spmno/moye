@@ -7,6 +7,7 @@ use crate::providers::ChatAgent;
 use crate::sandbox::Sandbox;
 use rig_core::client::CompletionClient;
 use serde::Deserialize;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
@@ -244,6 +245,18 @@ impl AgentRegistry {
         // 把与角色领域相关的技能指令注入提示词，使模型遵循技能中的步骤。
         // Injects role-domain skill instructions into the preamble so the model follows the steps in skills.
         let preamble = inject_skills_public(&preamble);
+        let rules_path = self.config.memory.dir.join(&self.config.memory.rules_file);
+        let rules = crate::memory::load_rules_from_file(&rules_path);
+        let preamble = if rules.is_empty() {
+            preamble
+        } else {
+            let rules_text = rules
+                .iter()
+                .map(|r| format!("- {}", r.text))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{preamble}\n\n# Escalated Rules\n{rules_text}")
+        };
         // 会话级模型覆盖优先于角色各自配置的模型。
         // Session-level model override takes priority over per-role configured model.
         let model = match *self.session_model.lock().unwrap() {
@@ -378,14 +391,39 @@ pub fn classify(message: &str) -> Intent {
 pub struct Orchestrator {
     registry: AgentRegistry,
     sandbox: Sandbox,
+    /// 信任模式标志：为 true 时沙箱外访问自动授权，不弹窗确认。
+    /// Trust-mode flag: when true, out-of-sandbox access is auto-authorized without prompting.
+    trust_sandbox: Arc<AtomicBool>,
 }
 
 impl Orchestrator {
     pub fn new(registry: AgentRegistry) -> Self {
+        // 环境变量 MY_AGENT_TRUST_SANDBOX=on 可在启动时开启信任模式。
+        // The MY_AGENT_TRUST_SANDBOX=on env var enables trust mode at startup.
+        let trust = std::env::var("MY_AGENT_TRUST_SANDBOX")
+            .map(|v| matches!(v.as_str(), "on" | "true" | "1"))
+            .unwrap_or(false);
+        // 从配置文件 [sandbox].authorized_dirs 预授权目录。
+        // Pre-authorize directories from the config file's [sandbox].authorized_dirs.
+        let authorized_dirs: Vec<String> = registry
+            .config
+            .sandbox
+            .authorized_dirs
+            .iter()
+            .cloned()
+            .collect();
+        let sandbox = Sandbox::with_authorized_dirs(&authorized_dirs);
         Self {
             registry,
-            sandbox: Sandbox::new(),
+            sandbox,
+            trust_sandbox: Arc::new(AtomicBool::new(trust)),
         }
+    }
+
+    /// 返回信任模式标志的共享引用，供 TUI 切换。
+    /// Returns a shared reference to the trust-mode flag, for TUI toggling.
+    pub fn trust_sandbox(&self) -> Arc<AtomicBool> {
+        self.trust_sandbox.clone()
     }
 
     pub async fn handle(&self, message: &str, tx: &EventSender) -> anyhow::Result<String> {
@@ -396,6 +434,7 @@ impl Orchestrator {
                 crate::agent_loop::run_autonomous(
                     &self.registry,
                     &self.sandbox,
+                    self.trust_sandbox.clone(),
                     Role::Investigator,
                     message,
                     tx,
@@ -415,6 +454,7 @@ impl Orchestrator {
         let investigation = crate::agent_loop::run_autonomous(
             &self.registry,
             &self.sandbox,
+            self.trust_sandbox.clone(),
             Role::Investigator,
             &format!(
                 "{message}\n\n\
@@ -443,6 +483,7 @@ impl Orchestrator {
         let built = crate::agent_loop::run_autonomous(
             &self.registry,
             &self.sandbox,
+            self.trust_sandbox.clone(),
             Role::Builder,
             &format!("{message}\n\n\u{53c2}\u{8003}\u{8ba1}\u{5212}\u{ff1a}\n{plan}"),
             tx,
@@ -460,6 +501,7 @@ impl Orchestrator {
                 crate::agent_loop::run_autonomous(
                     &self.registry,
                     &self.sandbox,
+                    self.trust_sandbox.clone(),
                     Role::Builder,
                     &retry,
                     tx,

@@ -27,6 +27,9 @@ pub enum ReplCommand {
     /// `/skills`：列出已注册技能。
     /// `/skills`: list registered skills.
     Skills,
+    /// `/context`：查看当前上下文（模型、token 用量、消息历史等）。
+    /// `/context`: show the current context (model, token usage, message history, etc.).
+    Context,
     /// `/help`：显示帮助信息。
     /// `/help`: show help text.
     Help,
@@ -39,6 +42,10 @@ pub enum ReplCommand {
     /// `/quit`：退出程序。
     /// `/quit`: quit the program.
     Quit,
+    /// `/trust`：切换沙箱信任模式（开启后沙箱外访问自动授权，不再弹窗确认）。
+    /// `/trust`: toggle sandbox trust mode (when enabled, out-of-sandbox access is
+    /// auto-authorized without prompting the user).
+    Trust,
     /// 非 `/` 开头的自然语言输入：作为任务目标交给 Orchestrator 执行。
     /// Natural-language input not starting with `/`: handed to the Orchestrator as a task goal.
     Goal(String),
@@ -105,12 +112,14 @@ impl ReplCommand {
                 _ => Self::InvalidUsage("usage: /add-skill <name> <description>"),
             },
             "/skills" => Self::Skills,
+            "/context" | "/ctx" => Self::Context,
             "/help" | "/h" | "/?" => Self::Help,
             "/history" | "/hist" => Self::History {
                 limit: rest.first().and_then(|s| s.parse().ok()),
             },
             "/lessons" => Self::Lessons,
             "/quit" | "/q" | "/exit" => Self::Quit,
+            "/trust" => Self::Trust,
             _ => Self::InvalidUsage("unknown command; type /help for usage"),
         }
     }

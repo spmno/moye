@@ -7,7 +7,7 @@ use crate::event::{AgentEvent, EventSender};
 use crate::evolution::prompt_evolve::PromptEvolver;
 use crate::memory::{Lesson, MemoryStore, Turn};
 use crate::model_history::ModelHistory;
-use crate::registry::{self, AgentRegistry, Intent, Orchestrator};
+use crate::registry::{AgentRegistry, Orchestrator};
 use crate::{evolution, skills};
 use std::sync::{Arc, Mutex};
 
@@ -145,6 +145,8 @@ impl AppContext {
              /skills             \u{5217}\u{51fa}\u{5df2}\u{6ce8}\u{518c}\u{6280}\u{80fd}\n\
              /history [n]        \u{67e5}\u{770b}\u{6700}\u{8fd1} n \u{8f6e}\u{5bf9}\u{8bdd}\u{8bb0}\u{5f55}\u{ff08}\u{9ed8}\u{8ba4} 10\u{ff09}\n\
              /lessons            \u{67e5}\u{770b}\u{5df2}\u{79ef}\u{7d2f}\u{7684}\u{7ecf}\u{9a8c}\u{6559}\u{8bad}\n\
+             /trust              \u{5207}\u{6362}\u{6c99}\u{7bb1}\u{4fe1}\u{4efb}\u{6a21}\u{5f0f}\u{ff08}\u{5f00}\u{542f}\u{540e}\u{6c99}\u{7bb1}\u{5916}\u{8bbf}\u{95ee}\u{81ea}\u{52a8}\u{6388}\u{6743}\u{ff0c}\u{4e0d}\u{518d}\u{5f39}\u{7a97}\u{786e}\u{8ba4}\u{ff09}\n\
+             /context            \u{67e5}\u{770b}\u{5f53}\u{524d}\u{4e0a}\u{4e0b}\u{6587}\u{ff08}\u{6a21}\u{578b}\u{3001}token \u{7528}\u{91cf}\u{3001}\u{6d88}\u{606f}\u{5386}\u{53f2}\u{7b49}\u{ff09}\n\
              /help               \u{663e}\u{793a}\u{672c}\u{5e2e}\u{52a9}\n\
              /quit               \u{9000}\u{51fa}\u{7a0b}\u{5e8f}\n\
              \u{2500}\u{2500}\u{2500} \u{7528}\u{6cd5} \u{2500}\u{2500}\u{2500}\n\
@@ -219,7 +221,14 @@ impl AppContext {
                 });
 
                 let summary = format!("\u{4efb}\u{52a1}: {goal} \u{2192} \u{4ea7}\u{51fa}: {}", truncate(&out, 200));
-                let _ = self.memory.record_lesson(&Lesson { summary, ts });
+                let lesson = Lesson { summary, ts };
+                let _ = self.memory.record_lesson(&lesson);
+                if let Ok(Some(rule)) = self.memory.check_and_escalate_rule(&lesson, self.rule_threshold) {
+                    let _ = tx.send(AgentEvent::Info(format!(
+                        "📋 规则提升：教训反复出现 {} 次，已提升为规则：{}",
+                        rule.count, rule.text
+                    )));
+                }
             }
             Err(e) => {
                 let _ = tx.send(AgentEvent::Error(format!("orchestrator error: {e}")));

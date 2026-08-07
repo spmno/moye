@@ -431,6 +431,66 @@ fn render_event(event: &AgentEvent) -> Vec<Line<'static>> {
     }
 }
 
+/// 将 AgentEvent 格式化为一行摘要，用于 `/context` 命令输出。
+/// Format an AgentEvent as a one-line summary for the `/context` command output.
+fn format_event_for_context(event: &AgentEvent) -> String {
+    match event {
+        AgentEvent::User(text) => {
+            format!("[User] {}", truncate_ctx(text, 120))
+        }
+        AgentEvent::System(text) => {
+            format!("[System] {}", truncate_ctx(text, 120))
+        }
+        AgentEvent::Agent(text) => {
+            format!("[Agent] {}", truncate_ctx(text, 200))
+        }
+        AgentEvent::ToolCall { name, desc } => {
+            format!("[ToolCall] {name}: {}", truncate_ctx(desc, 120))
+        }
+        AgentEvent::ToolResult { name, result, ok } => {
+            let icon = if *ok { "✓" } else { "✗" };
+            format!("[ToolResult] {icon} {name}: {}", truncate_ctx(result, 120))
+        }
+        AgentEvent::TurnFinished { turn, usage } => {
+            format!("[TurnFinished] turn {turn} | {usage}")
+        }
+        AgentEvent::Error(text) => {
+            format!("[Error] {}", truncate_ctx(text, 120))
+        }
+        AgentEvent::Info(text) => {
+            if text.is_empty() {
+                "[Info]".to_string()
+            } else {
+                format!("[Info] {}", truncate_ctx(text, 120))
+            }
+        }
+        AgentEvent::ContextCompacted { old_tokens, new_tokens } => {
+            format!("[ContextCompacted] {old_tokens} → {new_tokens} tokens")
+        }
+        AgentEvent::TextDelta(_) | AgentEvent::ReasoningDelta(_) => String::new(),
+        AgentEvent::AgentStarted => "[AgentStarted]".to_string(),
+        AgentEvent::AgentFinished => "[AgentFinished]".to_string(),
+        AgentEvent::HitlPrompt { .. } | AgentEvent::SuspendTui { .. } => String::new(),
+    }
+}
+
+/// 截断字符串用于上下文摘要显示（按字符数截断，追加省略号）。
+/// Truncate a string for context summary display (by char count, with ellipsis).
+fn truncate_ctx(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        s.replace('\n', " ")
+    } else {
+        let end = s
+            .char_indices()
+            .take(max_chars)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        format!("{}…", s[..end].replace('\n', " "))
+    }
+}
+
 // ===== Entry point =====
 // ===== 入口 =====
 
@@ -783,6 +843,20 @@ fn handle_command(
         ReplCommand::Quit => {
             state.should_quit = true;
         }
+        ReplCommand::Trust => {
+            let flag = ctx.orchestrator.trust_sandbox();
+            let new_val = !flag.load(std::sync::atomic::Ordering::Relaxed);
+            flag.store(new_val, std::sync::atomic::Ordering::Relaxed);
+            if new_val {
+                state.push_event(AgentEvent::Info(
+                    "🔒 沙箱信任模式已开启：沙箱外访问将自动授权，不再弹窗确认。".into(),
+                ));
+            } else {
+                state.push_event(AgentEvent::Info(
+                    "🔒 沙箱信任模式已关闭：沙箱外访问将恢复弹窗确认。".into(),
+                ));
+            }
+        }
         ReplCommand::Goal(goal) => {
             state.push_event(AgentEvent::User(goal.clone()));
             state.thinking = true;
@@ -832,6 +906,34 @@ fn handle_command(
                 items,
                 true,
             ));
+        }
+        ReplCommand::Context => {
+            let mut out = format!(
+                "─── 上下文 / Context ───\n\
+                 Provider: {}\n\
+                 Model: {}\n\
+                 Turn: {} / {}\n\
+                 Total tokens: {}\n\
+                 Last usage: {}\n\
+                 Tools: {}\n\
+                 Skills: {}\n\
+                 Messages: {}\n",
+                state.provider,
+                state.model,
+                state.current_turn,
+                state.max_turns,
+                state.total_tokens,
+                if state.last_usage.is_empty() { "N/A" } else { &state.last_usage },
+                state.tool_names.len(),
+                state.skill_names.len(),
+                state.messages.len(),
+            );
+            out.push_str("─── 消息历史 / Message History ───\n");
+            for (i, msg) in state.messages.iter().enumerate() {
+                let line = format_event_for_context(msg);
+                out.push_str(&format!("  {}. {}\n", i + 1, line));
+            }
+            state.push_event(AgentEvent::Info(out));
         }
         ReplCommand::Help => {
             state.push_event(AgentEvent::Info(ctx.cmd_help()));
@@ -992,6 +1094,9 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
             }
             state.thinking = false;
             state.streaming_reasoning.clear();
+            // Reset turn counter so the progress bar starts fresh for the next conversation.
+            // 重置回合计数器，使进度条在下次对话时从 0 开始。
+            state.current_turn = 0;
             state.reset_scroll();
         }
         // User and System events are pushed directly by handle_command —

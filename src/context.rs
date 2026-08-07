@@ -198,12 +198,12 @@ fn is_cjk(c: char) -> bool {
 /// 估算文本的 token 数。
 /// Estimate the token count of a text.
 ///
-/// 启发式规则：
-/// Heuristic rules:
-/// - CJK 字符 ≈ 0.5 token/char（即 2 char/token）。
-///   CJK chars ≈ 0.5 token/char (i.e., 2 char/token).
-/// - 拉丁字符 ≈ 0.25 token/char（即 4 char/token）。
-///   Latin chars ≈ 0.25 token/char (i.e., 4 char/token).
+/// 启发式规则（保守估算，偏高以避免上下文溢出）：
+/// Heuristic rules (conservative — over-estimates to avoid context overflow):
+/// - CJK 字符 ≈ 1 token/char。
+///   CJK chars ≈ 1 token/char.
+/// - 拉丁字符 ≈ 0.33 token/char（即 3 char/token）。
+///   Latin chars ≈ 0.33 token/char (i.e., 3 char/token).
 /// - 每条消息额外 4 token 开销（角色标签、分隔符）。
 ///   Per-message overhead of 4 tokens (role tags, delimiters).
 pub fn estimate_tokens(text: &str) -> usize {
@@ -219,10 +219,8 @@ pub fn estimate_tokens(text: &str) -> usize {
             other_count += 1;
         }
     }
-    // CJK: 2 char/token → ceil(cjk/2)
-    // Latin: 4 char/token → ceil(other/4)
-    let cjk_tokens = (cjk_count + 1) / 2;
-    let latin_tokens = (other_count + 3) / 4;
+    let cjk_tokens = cjk_count;
+    let latin_tokens = (other_count + 2) / 3;
     cjk_tokens + latin_tokens
 }
 
@@ -515,21 +513,21 @@ mod tests {
 
     #[test]
     fn estimate_tokens_english() {
-        // "hello world" = 11 chars → ceil(11/4) = 3 tokens
-        assert_eq!(estimate_tokens("hello world"), 3);
+        // "hello world" = 11 chars → ceil(11/3) = 4 tokens
+        assert_eq!(estimate_tokens("hello world"), 4);
     }
 
     #[test]
     fn estimate_tokens_cjk() {
-        // "你好世界" = 4 CJK chars → ceil(4/2) = 2 tokens
-        assert_eq!(estimate_tokens("你好世界"), 2);
+        // "你好世界" = 4 CJK chars → 4 tokens
+        assert_eq!(estimate_tokens("你好世界"), 4);
     }
 
     #[test]
     fn estimate_tokens_mixed() {
         // "hello 你好" = 6 Latin + 2 CJK
-        // Latin: ceil(6/4) = 2; CJK: ceil(2/2) = 1; total = 3
-        assert_eq!(estimate_tokens("hello 你好"), 3);
+        // Latin: ceil(6/3) = 2; CJK: 2; total = 4
+        assert_eq!(estimate_tokens("hello 你好"), 4);
     }
 
     // ── estimate_history_tokens ──
@@ -545,8 +543,8 @@ mod tests {
             Message::user("hello"),
             Message::assistant("hi there"),
         ];
-        // "hello" = ceil(5/4) = 2 + 4 overhead = 6
-        // "hi there" = ceil(8/4) = 2 + 4 overhead = 6
+        // "hello" = ceil(5/3) = 2 + 4 overhead = 6
+        // "hi there" = ceil(8/3) = 3 + 4 overhead = 7
         let est = estimate_history_tokens(&msgs);
         assert!(est > 0);
         // Two messages with 4 overhead each = at least 8 + content tokens

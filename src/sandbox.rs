@@ -64,6 +64,23 @@ impl Sandbox {
         }
     }
 
+    /// 创建沙箱并预授权一组目录（来自配置文件 `[sandbox].authorized_dirs`）。
+    /// Creates a sandbox and pre-authorizes a set of directories
+    /// (from the config file's `[sandbox].authorized_dirs`).
+    ///
+    /// 这些目录及其子目录可直接访问，无需弹窗确认。
+    /// These directories and their subdirectories can be accessed without prompting.
+    pub fn with_authorized_dirs(dirs: &[String]) -> Self {
+        let sb = Self::new();
+        if !sb.enabled {
+            return sb;
+        }
+        for dir in dirs {
+            sb.authorize(dir);
+        }
+        sb
+    }
+
     /// 返回项目根目录。
     /// Returns the project root.
     #[allow(dead_code)]

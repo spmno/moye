@@ -31,9 +31,18 @@ pub struct Lesson {
     pub ts: u64,
 }
 
+/// 一条从反复出现的教训自动提升来的规则。
+/// A rule auto-escalated from a lesson that recurred N times.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Rule {
+    pub text: String,
+    pub count: usize,
+    pub created_ts: u64,
+}
+
 /// 记忆存储的路径配置（来自 agent.toml 的 [memory] 段）。
 /// Path configuration for the memory store (from the `[memory]` section of agent.toml).
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct MemoryConfig {
     #[serde(default)]
     pub dir: PathBuf,
@@ -41,6 +50,23 @@ pub struct MemoryConfig {
     pub conversation_file: String,
     #[serde(default)]
     pub lessons_file: String,
+    #[serde(default = "default_rules_file")]
+    pub rules_file: String,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            dir: PathBuf::default(),
+            conversation_file: String::default(),
+            lessons_file: String::default(),
+            rules_file: default_rules_file(),
+        }
+    }
+}
+
+fn default_rules_file() -> String {
+    "rules.json".to_string()
 }
 
 /// 记忆存储：管理会话与经验的 JSONL 文件读写。
@@ -48,6 +74,7 @@ pub struct MemoryConfig {
 pub struct MemoryStore {
     conversation_file: PathBuf,
     lessons_file: PathBuf,
+    rules_file: PathBuf,
 }
 
 impl MemoryStore {
@@ -58,6 +85,7 @@ impl MemoryStore {
         Ok(Self {
             conversation_file: cfg.dir.join(&cfg.conversation_file),
             lessons_file: cfg.dir.join(&cfg.lessons_file),
+            rules_file: cfg.dir.join(&cfg.rules_file),
         })
     }
 
@@ -120,5 +148,170 @@ impl MemoryStore {
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect();
         Ok(lessons)
+    }
+
+    /// 加载所有已提升的规则（JSON 反序列化）。文件不存在或为空时返回空列表。
+    /// Load all escalated rules (JSON deserialization). Returns empty list if file missing or empty.
+    pub fn load_rules(&self) -> Result<Vec<Rule>> {
+        if !self.rules_file.exists() {
+            return Ok(vec![]);
+        }
+        let raw = std::fs::read_to_string(&self.rules_file)?;
+        if raw.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(serde_json::from_str(&raw).unwrap_or_default())
+    }
+
+    /// 检查一条教训是否反复出现 `threshold` 次；达到则提升为规则并写入 rules.json。
+    /// threshold 为 0 时禁用（返回 None）；已提升过的教训不重复提升。
+    pub fn check_and_escalate_rule(
+        &self,
+        lesson: &Lesson,
+        threshold: usize,
+    ) -> Result<Option<Rule>> {
+        if threshold == 0 {
+            return Ok(None);
+        }
+        let lessons = self.load_lessons()?;
+        let count = lessons.iter().filter(|l| l.summary == lesson.summary).count();
+        if count < threshold {
+            return Ok(None);
+        }
+        let rules = self.load_rules()?;
+        if rules.iter().any(|r| r.text == lesson.summary) {
+            return Ok(None);
+        }
+        let rule = Rule {
+            text: lesson.summary.clone(),
+            count,
+            created_ts: lesson.ts,
+        };
+        let mut rules = rules;
+        rules.push(rule.clone());
+        let json = serde_json::to_string_pretty(&rules)?;
+        std::fs::write(&self.rules_file, json)?;
+        Ok(Some(rule))
+    }
+}
+
+/// 从文件路径加载规则列表（供 registry build 注入 preamble）。
+/// 读取失败或文件不存在时返回空列表。
+/// Load rules from a file path (for registry build to inject into preamble).
+/// Returns empty list on read failure or missing file.
+pub fn load_rules_from_file(path: &std::path::Path) -> Vec<Rule> {
+    if !path.exists() {
+        return vec![];
+    }
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    if raw.trim().is_empty() {
+        return vec![];
+    }
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_store(tag: &str) -> MemoryStore {
+        let dir = std::env::temp_dir().join(format!(
+            "my-agent-test-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = MemoryConfig {
+            dir,
+            conversation_file: "conv.jsonl".into(),
+            lessons_file: "lessons.jsonl".into(),
+            rules_file: "rules.json".into(),
+        };
+        MemoryStore::new(&cfg).unwrap()
+    }
+
+    #[test]
+    fn escalate_below_threshold_returns_none() {
+        let store = tmp_store("below");
+        let lesson = Lesson { summary: "always commit after edit".into(), ts: 1 };
+        store.record_lesson(&lesson).unwrap();
+        assert!(store.check_and_escalate_rule(&lesson, 3).unwrap().is_none());
+    }
+
+    #[test]
+    fn escalate_at_threshold_creates_rule() {
+        let store = tmp_store("at");
+        let lesson = Lesson { summary: "always commit after edit".into(), ts: 1 };
+        for _ in 0..3 {
+            store.record_lesson(&lesson).unwrap();
+        }
+        let rule = store.check_and_escalate_rule(&lesson, 3).unwrap();
+        assert!(rule.is_some());
+        let rule = rule.unwrap();
+        assert_eq!(rule.text, lesson.summary);
+        assert_eq!(rule.count, 3);
+        assert_eq!(store.load_rules().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn escalate_does_not_duplicate() {
+        let store = tmp_store("dup");
+        let lesson = Lesson { summary: "always commit after edit".into(), ts: 1 };
+        for _ in 0..3 {
+            store.record_lesson(&lesson).unwrap();
+        }
+        assert!(store.check_and_escalate_rule(&lesson, 3).unwrap().is_some());
+        assert!(store.check_and_escalate_rule(&lesson, 3).unwrap().is_none());
+        assert_eq!(store.load_rules().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn escalate_threshold_zero_disabled() {
+        let store = tmp_store("zero");
+        let lesson = Lesson { summary: "always commit after edit".into(), ts: 1 };
+        store.record_lesson(&lesson).unwrap();
+        assert!(store.check_and_escalate_rule(&lesson, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn load_rules_empty_when_no_file() {
+        let store = tmp_store("empty");
+        assert!(store.load_rules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_rules_from_file_missing_returns_empty() {
+        let path = std::env::temp_dir().join("my-agent-nonexistent-rules.json");
+        let _ = std::fs::remove_file(&path);
+        assert!(load_rules_from_file(&path).is_empty());
+    }
+
+    #[test]
+    fn load_rules_from_file_parses_json() {
+        let dir = std::env::temp_dir().join(format!(
+            "my-agent-test-rf-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rules.json");
+        let rules = vec![
+            Rule { text: "rule a".into(), count: 3, created_ts: 1 },
+            Rule { text: "rule b".into(), count: 5, created_ts: 2 },
+        ];
+        std::fs::write(&path, serde_json::to_string_pretty(&rules).unwrap()).unwrap();
+        let loaded = load_rules_from_file(&path);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].text, "rule a");
+        assert_eq!(loaded[1].count, 5);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

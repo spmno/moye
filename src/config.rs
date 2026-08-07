@@ -34,12 +34,32 @@ pub struct Config {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub evolution: EvolutionSection,
+    /// 沙箱配置：预授权目录列表等。
+    /// Sandbox config: pre-authorized directory list, etc.
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
     /// 全局 API key 存储：`[keys]` section，键为环境变量名（如 `DEEPSEEK_API_KEY`），
     /// 值为 key 本身。当前目录 `.env`/export 优先，缺失时回退此处。
     /// Global API key store: `[keys]` section, keyed by env var name (e.g. `DEEPSEEK_API_KEY`),
     /// valued as the key itself. The project `.env`/export takes priority; this is the fallback.
     #[serde(default)]
     pub keys: HashMap<String, String>,
+}
+
+/// `[sandbox]` 小节：沙箱预授权目录配置。
+/// The `[sandbox]` section: sandbox pre-authorized directory config.
+///
+/// 通过 `authorized_dirs` 可在配置文件中预先授权一组目录，
+/// Agent 访问这些目录及其子目录时不再弹窗确认。
+/// You can pre-authorize a set of directories via `authorized_dirs` in the config file;
+/// the Agent can access these directories and their subdirectories without prompting.
+#[derive(Debug, Deserialize, Default)]
+pub struct SandboxConfig {
+    /// 预授权目录列表（支持 `~` 展开）。这些目录及其子目录可直接访问，无需确认。
+    /// Pre-authorized directory list (supports `~` expansion). These directories and
+    /// their subdirectories can be accessed without confirmation.
+    #[serde(default)]
+    pub authorized_dirs: Vec<String>,
 }
 
 impl Config {
@@ -50,12 +70,12 @@ impl Config {
         Ok(toml::from_str(&raw)?)
     }
 
-    /// 自主循环轮数上限；为 0 时回退到默认 20。
-    /// Max turns for the autonomous loop; falls back to 20 when 0.
+    /// 自主循环轮数上限；为 0 时回退到默认 30。
+    /// Max turns for the autonomous loop; falls back to 30 when 0.
     pub fn max_turns(&self) -> usize {
         let turns = self.agent.max_turns;
         if turns == 0 {
-            20
+            30
         } else {
             turns
         }
@@ -187,9 +207,13 @@ permissions.edit_file = "allow"
 dir = "memory"
 conversation_file = "conv.jsonl"
 lessons_file = "less.jsonl"
+rules_file = "rules.json"
 
 [evolution]
 rule_escalation_threshold = 5
+
+[sandbox]
+authorized_dirs = ["~/.config", "/tmp/my-agent"]
 "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.provider.provider.as_deref(), Some("moonshot"));
@@ -203,22 +227,28 @@ rule_escalation_threshold = 5
         assert_eq!(cfg.context.max_output_tokens, 2048);
         assert!(cfg.roles.contains_key("builder"));
         assert_eq!(cfg.memory.dir, PathBuf::from("memory"));
+        assert_eq!(cfg.memory.rules_file, "rules.json");
         assert_eq!(cfg.evolution.rule_escalation_threshold, 5);
+        assert_eq!(cfg.sandbox.authorized_dirs.len(), 2);
+        assert_eq!(cfg.sandbox.authorized_dirs[0], "~/.config");
+        assert_eq!(cfg.sandbox.authorized_dirs[1], "/tmp/my-agent");
     }
 
     #[test]
     fn load_empty_config_defaults() {
         let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.max_turns(), 20);
+        assert_eq!(cfg.max_turns(), 30);
         assert!(cfg.roles.is_empty());
         assert_eq!(cfg.evolution.rule_escalation_threshold, 0);
         assert_eq!(cfg.context.max_output_tokens, 4096);
+        assert!(cfg.sandbox.authorized_dirs.is_empty());
+        assert_eq!(cfg.memory.rules_file, "rules.json");
     }
 
     #[test]
     fn max_turns_zero_falls_back() {
         let cfg: Config = toml::from_str("[agent]\nmax_turns = 0\n").unwrap();
-        assert_eq!(cfg.max_turns(), 20);
+        assert_eq!(cfg.max_turns(), 30);
     }
 
     #[test]

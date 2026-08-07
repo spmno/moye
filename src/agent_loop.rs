@@ -48,6 +48,9 @@ pub struct HitlHook {
     waiting: Arc<AtomicBool>,
     tx: EventSender,
     sandbox: Sandbox,
+    /// 信任模式：为 true 时沙箱外访问自动授权，不弹窗确认。
+    /// Trust mode: when true, out-of-sandbox access is auto-authorized without prompting.
+    trust_sandbox: Arc<AtomicBool>,
 }
 
 impl HitlHook {
@@ -56,12 +59,14 @@ impl HitlHook {
         waiting: Arc<AtomicBool>,
         tx: EventSender,
         sandbox: Sandbox,
+        trust_sandbox: Arc<AtomicBool>,
     ) -> Self {
         Self {
             perms: Arc::new(Mutex::new(perms)),
             waiting,
             tx,
             sandbox,
+            trust_sandbox,
         }
     }
 
@@ -147,28 +152,44 @@ impl<M: CompletionModel> AgentHook<M> for HitlHook {
                 // Sandbox check: before the permission tier check, verify that the tool call
                 // doesn't access paths outside the sandbox. If it does and the directory
                 // hasn't been authorized, prompt the user for authorization.
+                //
+                // 信任模式（trust_sandbox = true）下，沙箱外访问自动授权，不弹窗确认。
+                // In trust mode (trust_sandbox = true), out-of-sandbox access is
+                // auto-authorized without prompting the user.
                 if let Some(sandbox_err) = self.sandbox.check_tool(tool_name, args) {
-                    let desc = format!(
-                        "\u{1f512} \u{6c99}\u{7bb1}\u{5916}\u{8bbf}\u{95ee}\u{6388}\u{6743}\n\n{}\n\n\
-                         \u{662f}\u{5426}\u{5141}\u{8bb8}\u{8bbf}\u{95ee}\u{6b64}\u{8def}\u{5f84}\u{ff1f}",
-                        sandbox_err
-                    );
-                    if self.confirm(tool_name, &desc).await {
-                        // 用户授权——将涉及的目录加入授权列表
-                        // User authorized — add the involved directories to the authorized list
+                    if self.trust_sandbox.load(Ordering::Relaxed) {
+                        // 信任模式：自动授权，不弹窗
+                        // Trust mode: auto-authorize without prompting
                         self.sandbox.authorize_tool(tool_name, args);
                         let _ = self.tx.send(AgentEvent::Info(format!(
-                            "  [\u{6c99}\u{7bb1}] \u{5df2}\u{6388}\u{6743}\u{8bbf}\u{95ee}: {sandbox_err}"
+                            "  [\u{6c99}\u{7bb1}] \u{4fe1}\u{4efb}\u{6a21}\u{5f0f}\u{81ea}\u{52a8}\u{6388}\u{6743}: {sandbox_err}"
                         )));
                         // 授权后继续进入权限分级检查
                         // After authorization, fall through to the permission tier check
                     } else {
-                        let _ = self.tx.send(AgentEvent::Info(
-                            "  [\u{6c99}\u{7bb1}] \u{8bbf}\u{95ee}\u{88ab}\u{62d2}\u{7edd}".into(),
-                        ));
-                        return Flow::Skip {
-                            reason: format!("\u{6c99}\u{7bb1}\u{62d2}\u{7edd}\u{8bbf}\u{95ee}: {sandbox_err}"),
-                        };
+                        let desc = format!(
+                            "\u{1f512} \u{6c99}\u{7bb1}\u{5916}\u{8bbf}\u{95ee}\u{6388}\u{6743}\n\n{}\n\n\
+                             \u{662f}\u{5426}\u{5141}\u{8bb8}\u{8bbf}\u{95ee}\u{6b64}\u{8def}\u{5f84}\u{ff1f}\n\
+                             \u{ff08}\u{8f93}\u{5165} /trust \u{53ef}\u{5f00}\u{542f}\u{4fe1}\u{4efb}\u{6a21}\u{5f0f}\u{ff0c}\u{81ea}\u{52a8}\u{6388}\u{6743}\u{6c99}\u{7bb1}\u{5916}\u{8bbf}\u{95ee}\u{ff09}",
+                            sandbox_err
+                        );
+                        if self.confirm(tool_name, &desc).await {
+                            // 用户授权——将涉及的目录加入授权列表
+                            // User authorized — add the involved directories to the authorized list
+                            self.sandbox.authorize_tool(tool_name, args);
+                            let _ = self.tx.send(AgentEvent::Info(format!(
+                                "  [\u{6c99}\u{7bb1}] \u{5df2}\u{6388}\u{6743}\u{8bbf}\u{95ee}: {sandbox_err}"
+                            )));
+                            // 授权后继续进入权限分级检查
+                            // After authorization, fall through to the permission tier check
+                        } else {
+                            let _ = self.tx.send(AgentEvent::Info(
+                                "  [\u{6c99}\u{7bb1}] \u{8bbf}\u{95ee}\u{88ab}\u{62d2}\u{7edd}".into(),
+                            ));
+                            return Flow::Skip {
+                                reason: format!("\u{6c99}\u{7bb1}\u{62d2}\u{7edd}\u{8bbf}\u{95ee}: {sandbox_err}"),
+                            };
+                        }
                     }
                 }
 
@@ -290,21 +311,32 @@ impl ContextHook {
     /// Detect overflow and compact if needed, returning `Flow::PatchRequest` or `Flow::Continue`.
     async fn handle_completion_call(&self, history: &[Message], _turn: usize) -> Flow {
         let estimated = crate::context::estimate_history_tokens(history);
-        let is_overflow = {
+        let (is_overflow, last_input, microcompact_threshold) = {
             let budget = self.budget.lock().unwrap();
-            if budget.last_input_tokens() > 0 {
-                budget.is_near_overflow(
-                    budget.last_input_tokens() as usize,
-                    self.config.compaction_threshold,
-                )
+            let last = budget.last_input_tokens();
+            let overflow = if last > 0 {
+                budget.is_near_overflow(last as usize, self.config.compaction_threshold)
             } else {
                 budget.is_near_overflow(estimated, self.config.compaction_threshold)
-            }
+            };
+            let dynamic = budget.effective_budget() / 20;
+            let threshold = self.config.microcompact_threshold.max(dynamic);
+            (overflow, last, threshold)
         };
 
-        // Tier 1 触发：估算 token 超过微压缩阈值。
-        // Tier 1 trigger: estimated tokens exceed microcompact threshold.
-        let need_microcompact = estimated > self.config.microcompact_threshold;
+        // Tier 1 触发：估算 token 超过微压缩阈值（动态 = max(配置值, 有效预算/20)）。
+        // Tier 1 trigger: estimated tokens exceed microcompact threshold (dynamic = max(config, budget/20)).
+        let need_microcompact = estimated > microcompact_threshold;
+
+        info!(
+            history_len = history.len(),
+            estimated_tokens = estimated,
+            last_input_tokens = last_input,
+            is_overflow,
+            need_microcompact,
+            microcompact_threshold,
+            "context check"
+        );
 
         if !is_overflow && !need_microcompact {
             return Flow::Continue;
@@ -631,6 +663,7 @@ fn decide_flow(perms: &ToolPerms, tool_name: &str, args: &str) -> Flow {
 pub async fn run_autonomous(
     registry: &AgentRegistry,
     sandbox: &Sandbox,
+    trust_sandbox: Arc<AtomicBool>,
     role: Role,
     goal: &str,
     tx: &EventSender,
@@ -651,7 +684,7 @@ pub async fn run_autonomous(
         let perms = registry.tool_perms(role);
         let max_turns = registry.max_turns();
         let hitl_waiting = Arc::new(AtomicBool::new(false));
-        let hook = HitlHook::new(perms, hitl_waiting.clone(), tx.clone(), sandbox.clone());
+        let hook = HitlHook::new(perms, hitl_waiting.clone(), tx.clone(), sandbox.clone(), trust_sandbox.clone());
 
         let model = registry
             .session_model()
@@ -681,6 +714,14 @@ pub async fn run_autonomous(
         match consume_stream(stream, Some(hitl_waiting), tx).await {
             Ok(output) => return Ok(output),
             Err(e) if is_stream_error(&e) && attempt < MAX_RETRIES => {
+                warn!(
+                    error = %e,
+                    error_debug = ?e,
+                    attempt = attempt + 1,
+                    max_retries = MAX_RETRIES,
+                    role = ?role,
+                    "SSE disconnect, retrying"
+                );
                 let _ = tx.send(AgentEvent::Info(format!(
                     "[\u{91cd}\u{8bd5}] {role:?} \u{7b2c} {}/{} \u{6b21}\u{ff1a}SSE \u{8fde}\u{63a5}\u{4e2d}\u{65ad}\u{ff0c}\u{91cd}\u{65b0}\u{8c03}\u{7528}",
                     attempt + 1,
@@ -688,7 +729,10 @@ pub async fn run_autonomous(
                 )));
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                warn!(error = %e, error_debug = ?e, role = ?role, "stream error (non-retryable)");
+                return Err(e);
+            }
         }
     }
 
@@ -762,6 +806,10 @@ pub async fn consume_stream<R>(
                             continue;
                         }
                     }
+                    warn!(
+                        timeout_secs = CHUNK_TIMEOUT.as_secs(),
+                        "SSE idle timeout, connection may have dropped"
+                    );
                     return Err(anyhow::anyhow!(
                         "SSE \u{7a7a}\u{95f2}\u{8d85}\u{65f6}\u{ff08}{}\u{79d2}\u{65e0}\u{6570}\u{636e}\u{ff09}\u{ff0c}\u{53ef}\u{80fd}\u{8fde}\u{63a5}\u{5df2}\u{65ad}\u{5f00}",
                         CHUNK_TIMEOUT.as_secs()
@@ -799,6 +847,7 @@ pub async fn consume_stream<R>(
                 output = resp.output;
             }
             Err(e) => {
+                warn!(error = %e, error_debug = ?e, "stream item error");
                 return Err(anyhow::anyhow!(
                     "\u{6d41}\u{5f0f}\u{9519}\u{8bef}: {e}"
                 ));

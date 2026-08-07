@@ -104,6 +104,14 @@ impl Sandbox {
         if !self.enabled {
             return Ok(());
         }
+        // /dev/null, /dev/stdin, /dev/stdout, /dev/stderr 是安全特殊设备文件，无需授权。
+        // /dev/null, /dev/stdin, /dev/stdout, /dev/stderr are safe special device files, no authorization needed.
+        if matches!(
+            self.resolve_path(path).to_str(),
+            Some("/dev/null") | Some("/dev/stdin") | Some("/dev/stdout") | Some("/dev/stderr")
+        ) {
+            return Ok(());
+        }
         let resolved = self.resolve_path(path);
         if self.is_within_sandbox(&resolved) {
             Ok(())

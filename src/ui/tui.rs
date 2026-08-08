@@ -393,10 +393,13 @@ fn render_event(event: &AgentEvent) -> Vec<Line<'static>> {
             } else {
                 result.clone()
             };
-            let mut v = vec![Line::from(vec![
-                Span::styled(format!("{icon} {name}: "), sty),
-                Span::raw(trunc),
-            ])];
+            let mut v = vec![];
+            v.push(Line::from(vec![
+                Span::styled(format!("{icon} {name}"), sty),
+            ]));
+            for line in trunc.lines().take(15) {
+                v.push(Line::from(Span::raw(line.to_string())));
+            }
             v.push(Line::default());
             v
         }

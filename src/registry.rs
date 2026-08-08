@@ -50,6 +50,8 @@ pub struct ToolPerms {
     #[serde(default = "default_ask")]
     pub edit_file: Permission,
     #[serde(default = "default_ask")]
+    pub write_file: Permission,
+    #[serde(default = "default_ask")]
     pub web_fetch: Permission,
     #[serde(default = "default_ask")]
     pub web_search: Permission,
@@ -73,6 +75,7 @@ impl Default for ToolPerms {
             run_bash_readonly: Permission::Allow,
             run_bash_mutating: Permission::Ask,
             edit_file: Permission::Ask,
+            write_file: Permission::Ask,
             web_fetch: Permission::Ask,
             web_search: Permission::Ask,
         }

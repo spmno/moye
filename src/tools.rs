@@ -220,14 +220,27 @@ impl Tool for RunBash {
             .output()
             .await
             .map_err(|e| ToolError(e.to_string()))?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let combined = format!(
-            "exit={}\nstdout:\n{}\nstderr:\n{}",
-            out.status.code().unwrap_or(-1),
-            stdout,
-            stderr
-        );
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let code = out.status.code().unwrap_or(-1);
+        let combined = if code == 0 {
+            if stderr.is_empty() {
+                stdout
+            } else if stdout.is_empty() {
+                format!("(stderr) {}", stderr)
+            } else {
+                format!("{}\n(stderr) {}", stdout, stderr)
+            }
+        } else {
+            let mut parts = vec![format!("(exit {})", code)];
+            if !stdout.is_empty() {
+                parts.push(stdout);
+            }
+            if !stderr.is_empty() {
+                parts.push(format!("(stderr) {}", stderr));
+            }
+            parts.join("\n")
+        };
         Ok(crate::context::truncate_at_char_boundary(
             &combined,
             self.max_bash_output_chars,
@@ -237,6 +250,27 @@ impl Tool for RunBash {
 
 // ─── 联网工具 ───────────────────────────────────────────────────────────
 // ─── Web tools ───────────────────────────────────────────────────────────
+
+/// 构建带代理支持的 reqwest Client。
+/// 优先级：MY_AGENT_PROXY > HTTPS_PROXY > HTTP_PROXY。均未设置时不使用代理。
+/// Builds a reqwest Client with proxy support.
+/// Priority: MY_AGENT_PROXY > HTTPS_PROXY > HTTP_PROXY. No proxy when none are set.
+fn build_web_client() -> std::result::Result<reqwest::Client, ToolError> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("my-agent/0.1 (web tool)");
+    let proxy_url = std::env::var("MY_AGENT_PROXY")
+        .or_else(|_| std::env::var("HTTPS_PROXY"))
+        .or_else(|_| std::env::var("HTTP_PROXY"))
+        .ok();
+    if let Some(url) = proxy_url {
+        let proxy = reqwest::Proxy::https(&url)
+            .or_else(|_| reqwest::Proxy::http(&url))
+            .map_err(|e| ToolError(format!("代理配置无效: {e}")))?;
+        builder = builder.proxy(proxy);
+    }
+    builder.build().map_err(|e| ToolError(e.to_string()))
+}
 
 /// 抓取网页内容并转为纯文本返回。自动去除 HTML 标签、script/style 块，
 /// 解码常见 HTML 实体，截断到合理长度以防 token 洪流。
@@ -282,16 +316,12 @@ impl Tool for WebFetch {
     /// Executes the tool: issues an HTTP request, strips HTML, truncates at char boundary, returns.
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         const MAX_CONTENT: usize = 8000;
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .user_agent("my-agent/0.1 (web_fetch tool)")
-            .build()
-            .map_err(|e| ToolError(e.to_string()))?;
+        let client = build_web_client()?;
         let resp = client
             .get(&args.url)
             .send()
             .await
-            .map_err(|e| ToolError(format!("请求失败: {e}")))?;
+            .map_err(|e| ToolError(format!("请求失败: {e}。提示: 可能需要设置代理，如 export MY_AGENT_PROXY=http://127.0.0.1:7890")))?;
         let status = resp.status();
         let content_type = resp
             .headers()
@@ -369,11 +399,7 @@ impl Tool for WebSearch {
     /// Executes the tool: requests the DuckDuckGo API, extracts abstract/answer/definition/related links, and formats them.
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         const MAX_RESULTS: usize = 8;
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .user_agent("my-agent/0.1 (web_search tool)")
-            .build()
-            .map_err(|e| ToolError(e.to_string()))?;
+        let client = build_web_client()?;
         let resp: serde_json::Value = client
             .get("https://api.duckduckgo.com/")
             .query(&[
@@ -384,7 +410,7 @@ impl Tool for WebSearch {
             ])
             .send()
             .await
-            .map_err(|e| ToolError(format!("搜索请求失败: {e}")))?
+            .map_err(|e| ToolError(format!("搜索请求失败: {e}。提示: 在中国大陆可能需要设置代理，如 export MY_AGENT_PROXY=http://127.0.0.1:7890")))?
             .json()
             .await
             .map_err(|e| ToolError(format!("解析搜索结果失败: {e}")))?;

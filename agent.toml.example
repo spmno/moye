@@ -31,7 +31,7 @@ default_model = "glm-latest"
 max_turns = 30
 
 [context]
-max_output_tokens = 4096
+max_output_tokens = 32768
 compaction_threshold = 0.5
 keep_recent_turns = 2
 max_bash_output_chars = 20000

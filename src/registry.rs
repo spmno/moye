@@ -283,25 +283,28 @@ impl AgentRegistry {
         let params = crate::providers::provider_additional_params();
         let max_turns = self.max_turns();
         info!("[build] role={key} model={model} max_turns={max_turns}");
-        let agent = if with_tools {
-            let tools = crate::tools::builtin_tools(self.context_config())?;
-            client
-                .agent(&model)
-                .preamble(&preamble)
-                .temperature(crate::providers::Provider::clamp_temperature(0.7))
-                .tools(tools)
-                .additional_params(params)
-                .default_max_turns(max_turns)
-                .build()
-        } else {
-            client
-                .agent(&model)
-                .preamble(&preamble)
-                .temperature(crate::providers::Provider::clamp_temperature(0.7))
-                .additional_params(params)
-                .default_max_turns(max_turns)
-                .build()
-        };
+            let max_output = self.context_config().max_output_tokens as u64;
+            let agent = if with_tools {
+                let tools = crate::tools::builtin_tools(self.context_config())?;
+                client
+                    .agent(&model)
+                    .preamble(&preamble)
+                    .temperature(crate::providers::Provider::clamp_temperature(0.7))
+                    .tools(tools)
+                    .additional_params(params)
+                    .default_max_turns(max_turns)
+                    .max_tokens(max_output)
+                    .build()
+            } else {
+                client
+                    .agent(&model)
+                    .preamble(&preamble)
+                    .temperature(crate::providers::Provider::clamp_temperature(0.7))
+                    .additional_params(params)
+                    .default_max_turns(max_turns)
+                    .max_tokens(max_output)
+                    .build()
+            };
         Ok(RoleAgent {
             role,
             agent,

@@ -1105,7 +1105,6 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
             }
             state.thinking = false;
             state.streaming_reasoning.clear();
-            state.current_turn = state.max_turns;
             state.reset_scroll();
         }
         // User and System events are pushed directly by handle_command —

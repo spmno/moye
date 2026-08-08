@@ -139,7 +139,9 @@ impl Tool for WriteFile {
     /// 返回面向 LLM 的工具描述（中文）。
     /// Returns the LLM-facing tool description (Chinese).
     fn description(&self) -> String {
-        "用给定内容创建或覆盖一个文件。".to_string()
+        "创建一个新文件，或用给定的完整内容覆盖已存在的文件。\
+         当用户要求『写/生成/创建一个文件』（如 HTML、脚本、配置、文档等）时，必须使用本工具，\
+         把完整文件内容放入 content 参数，不要只在回复里贴代码。".to_string()
     }
 
     /// 返回 JSON Schema 形式的参数定义。

@@ -681,11 +681,20 @@ pub async fn run_autonomous(
         let prompt = if attempt == 0 {
             goal.to_string()
         } else {
+            let remaining_retries = MAX_RETRIES - attempt;
             format!(
                 "{goal}\n\n\
-                 [\u{7cfb}\u{7edf}\u{63d0}\u{793a}] \u{4e0a}\u{6b21}\u{56e0} SSE \u{8fde}\u{63a5}\u{4e2d}\u{65ad}\u{ff08}\u{7b2c} {attempt} \u{6b21}\u{91cd}\u{8bd5}\u{ff09}\u{ff0c}\u{5df2}\u{4fdd}\u{7559}\u{4e4b}\u{524d}\u{7684}\u{5bf9}\u{8bdd}\u{5386}\u{53f2}\u{3002}\
-                 \u{5df2}\u{7528} {turns_used}/{total_max_turns} \u{8f6e}\u{ff0c}\u{5269}\u{4f59} {max_turns_remaining} \u{8f6e}\u{3002}\
-                 \u{8bf7}\u{57fa}\u{4e8e}\u{5df2}\u{6709}\u{8fdb}\u{5c55}\u{7ee7}\u{7eed}\u{ff0c}\u{8df3}\u{8fc7}\u{5df2}\u{5b8c}\u{6210}\u{7684}\u{63a2}\u{7d22}\u{ff0c}\u{4f18}\u{5148}\u{6536}\u{655b}\u{5230}\u{7ed3}\u{8bba}\u{3002}"
+                 [系统提示 / System] 上次因 SSE 连接中断（第 {attempt}/{MAX_RETRIES} 次重试，剩余 {remaining_retries} 次）。\n\
+                 已保留之前的对话历史（{hist_len} 条消息），已用 {turns_used}/{total_max_turns} 轮，剩余 {max_turns_remaining} 轮。\n\
+                 请基于已有进展继续，注意：\n\
+                 - 跳过已完成的探索和工具调用，不要重复\n\
+                 - 直接从上次断点处继续执行\n\
+                 - 优先收敛到结论，避免过度探索\n\
+                 - 如果上次输出不完整，请从头生成完整版本\n\n\
+                 [System] Previous SSE stream disconnected (attempt {attempt}/{MAX_RETRIES}, {remaining_retries} retries left). \
+                 Conversation history preserved ({hist_len} messages), {turns_used}/{total_max_turns} turns used, {max_turns_remaining} remaining. \
+                 Continue from where you left off — skip completed steps, avoid repetition, and prioritize convergence.",
+                hist_len = captured_history.lock().unwrap().len()
             )
         };
 
@@ -743,7 +752,7 @@ pub async fn run_autonomous(
                     "SSE disconnect, retrying with preserved history"
                 );
                 let _ = tx.send(AgentEvent::Info(format!(
-                    "[\u{91cd}\u{8bd5}] {role:?} \u{7b2c} {}/{} \u{6b21}\u{ff1a}SSE \u{8fde}\u{63a5}\u{4e2d}\u{65ad}\u{ff08}\u{5df2}\u{7528}\u{8f6e}\u{6570}={turns_used}\u{ff09}\u{3002}\u{9519}\u{8bef}: {err_snippet}",
+                    "[重试 / Retry] {role:?} 第 {}/{} 次：SSE 连接中断。\n  · 已用轮数: {turns_used}/{total_max_turns}（剩余 {max_turns_remaining} 轮）\n  · 保留历史: {hist_len} 条消息\n  · 使用模型: {model_for_log}\n  · 错误摘要: {err_snippet}",
                     attempt + 1,
                     MAX_RETRIES
                 )));
@@ -753,7 +762,7 @@ pub async fn run_autonomous(
                 let err_snippet: String = e.to_string().chars().take(300).collect();
                 warn!(error = %e, error_debug = ?e, role = ?role, "stream error (non-retryable)");
                 let _ = tx.send(AgentEvent::Error(format!(
-                    "\u{6d41}\u{9519}\u{8bef}\u{ff08}\u{4e0d}\u{53ef}\u{91cd}\u{8bd5}\u{ff09}: {err_snippet}"
+                    "流错误（不可重试 / Non-retryable stream error）\n  · 角色: {role:?}\n  · 使用模型: {model_for_log}\n  · 已用轮数: {turns_used}/{total_max_turns}\n  · 错误详情: {err_snippet}"
                 )));
                 return Err(e);
             }
@@ -761,7 +770,9 @@ pub async fn run_autonomous(
     }
 
     Err(anyhow::anyhow!(
-        "{role:?} \u{91cd}\u{8bd5} {MAX_RETRIES} \u{6b21}\u{540e}\u{4ecd}\u{5931}\u{8d25}"
+        "{role:?} 重试 {MAX_RETRIES} 次后仍失败（SSE 连接反复中断）。\n  · 已用轮数: {turns_used}/{total_max_turns}\n  · 保留历史: {} 条消息\n建议检查网络或 API 稳定性后重试。\n\
+         [System] {role:?} failed after {MAX_RETRIES} retries (repeated SSE disconnects). Turns used: {turns_used}/{total_max_turns}. Check network/API stability and try again.",
+        captured_history.lock().unwrap().len()
     ))
 }
 
@@ -840,7 +851,12 @@ pub async fn consume_stream<R>(
                         "SSE idle timeout, connection may have dropped"
                     );
                     return Err(anyhow::anyhow!(
-                        "SSE \u{7a7a}\u{95f2}\u{8d85}\u{65f6}\u{ff08}{}\u{79d2}\u{65e0}\u{6570}\u{636e}\u{ff09}\u{ff0c}\u{53ef}\u{80fd}\u{8fde}\u{63a5}\u{5df2}\u{65ad}\u{5f00}\u{3002}\u{5df2}\u{6536}\u{5230} {} \u{5b57}\u{7b26}\u{6587}\u{672c}\u{3001}{} \u{5b57}\u{7b26}\u{63a8}\u{7406}\u{5185}\u{5bb9}",
+                        "SSE 空闲超时 / SSE idle timeout（{} 秒无数据），连接可能已断开。\n  · 已收到: {} 字符文本、{} 字符推理内容\n  · 上层会自动重试（如果是可重试错误）\n\
+                         [System] SSE idle timeout (no data for {}s), connection may have dropped. \
+                         Received {} chars text, {} chars reasoning. Upper layer will auto-retry if applicable.",
+                        CHUNK_TIMEOUT.as_secs(),
+                        output.len(),
+                        all_reasoning.len(),
                         CHUNK_TIMEOUT.as_secs(),
                         output.len(),
                         all_reasoning.len()
@@ -890,7 +906,11 @@ pub async fn consume_stream<R>(
                     return Err(anyhow::anyhow!("{e}"));
                 }
                 return Err(anyhow::anyhow!(
-                    "\u{6d41}\u{5f0f}\u{9519}\u{8bef}: {e}\u{3002}\u{5df2}\u{6536}\u{5230} {} \u{5b57}\u{7b26}\u{6587}\u{672c}\u{3001}{} \u{5b57}\u{7b26}\u{63a8}\u{7406}",
+                    "流式错误 / Stream error: {e}\n  · 已收到: {} 字符文本、{} 字符推理内容\n  · 如果是网络波动导致的断连，上层会自动重试\n\
+                     [System] Stream error: {e}. Received {} chars text, {} chars reasoning. \
+                     Upper layer will auto-retry if this is a transient network issue.",
+                    output.len(),
+                    all_reasoning.len(),
                     output.len(),
                     all_reasoning.len()
                 ));

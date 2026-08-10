@@ -117,7 +117,17 @@ impl RoleAgent {
             let prompt = if attempt == 0 {
                 task.to_string()
             } else {
-                format!("{task}\n\n[\u{7cfb}\u{7edf}\u{63d0}\u{793a}] \u{4e0a}\u{6b21}\u{56e0} SSE \u{8fde}\u{63a5}\u{4e2d}\u{65ad}\u{ff0c}\u{8bf7}\u{91cd}\u{65b0}\u{751f}\u{6210}\u{3002}")
+                let remaining = MAX_RETRIES - attempt;
+                format!(
+                    "{task}\n\n\
+                     [系统提示 / System] 上次因 SSE 连接中断（第 {attempt}/{MAX_RETRIES} 次重试，剩余 {remaining} 次）。\n\
+                     请重新生成完整内容。注意：\n\
+                     - 不要重复上次已完成的步骤或分析\n\
+                     - 直接从断点处继续，输出完整结果\n\
+                     - 如果上次输出不完整，请从头生成完整版本\n\n\
+                     [System] Previous SSE stream disconnected (attempt {attempt}/{MAX_RETRIES}, {remaining} retries left). \
+                     Regenerate the full response. Skip already-completed steps and produce complete output."
+                )
             };
 
             info!("[{:?}] \u{6267}\u{884c}\u{4efb}\u{52a1}\u{ff08}\u{5c1d}\u{8bd5} {}/{}\u{ff09}", self.role, attempt + 1, MAX_RETRIES + 1);
@@ -126,9 +136,11 @@ impl RoleAgent {
             match crate::agent_loop::consume_stream(stream, None, tx).await {
                 Ok(output) => return Ok(output),
                 Err(e) if crate::agent_loop::is_stream_error(&e) && attempt < MAX_RETRIES => {
+                    let remaining = MAX_RETRIES - attempt;
+                    let err_snippet: String = e.to_string().chars().take(200).collect();
                     let _ = tx.send(AgentEvent::Info(format!(
-                        "[\u{91cd}\u{8bd5}] {:?} \u{7b2c} {}/{} \u{6b21}\u{ff1a}SSE \u{8fde}\u{63a5}\u{4e2d}\u{65ad}",
-                        self.role, attempt + 1, MAX_RETRIES
+                        "[重试 / Retry] {:?} 第 {}/{} 次：SSE 连接中断，剩余 {} 次。错误摘要: {}",
+                        self.role, attempt + 1, MAX_RETRIES, remaining, err_snippet
                     )));
                     continue;
                 }
@@ -136,7 +148,12 @@ impl RoleAgent {
             }
         }
 
-        Err(anyhow::anyhow!("{:?} \u{91cd}\u{8bd5} {MAX_RETRIES} \u{6b21}\u{540e}\u{4ecd}\u{5931}\u{8d25}", self.role))
+        Err(anyhow::anyhow!(
+            "{:?} 重试 {MAX_RETRIES} 次后仍失败（SSE 连接反复中断）。建议检查网络或 API 稳定性后重试。\n\
+             [System] {:?} failed after {MAX_RETRIES} retries (repeated SSE disconnects). \
+             Check network/API stability and try again.",
+            self.role, self.role
+        ))
     }
 }
 
@@ -592,9 +609,21 @@ impl Orchestrator {
         match gate.review(message, &built, tx).await? {
             crate::reviewer::Verdict::Approve => Ok(built),
             crate::reviewer::Verdict::Reject(reason) => {
-                let _ = tx.send(AgentEvent::Info(format!("[SDD] \u{5ba1}\u{8ba1}\u{9a73}\u{56de}\u{ff0c}\u{5e26}\u{53cd}\u{9988}\u{91cd}\u{8bd5}\u{4e00}\u{6b21}\u{ff1a}{reason}")));
+                let _ = tx.send(AgentEvent::Info(format!(
+                    "[SDD] 审计驳回，带反馈重试一次 / Audit rejected, retrying with feedback:\n  · 驳回原因: {reason}"
+                )));
                 let retry = format!(
-                    "\u{4e4b}\u{524d}\u{7684}\u{5c1d}\u{8bd5}\u{88ab}\u{9a73}\u{56de}\u{ff1a}{reason}\n\n\u{539f}\u{59cb}\u{4efb}\u{52a1}\u{ff1a}{message}\n\n\u{53c2}\u{8003}\u{8ba1}\u{5212}\u{ff1a}{plan}"
+                    "之前的尝试被审计驳回 / Previous attempt was rejected by audit:\n\
+                     驳回原因 / Rejection reason:\n{reason}\n\n\
+                     原始任务 / Original task:\n{message}\n\n\
+                     参考计划 / Reference plan:\n{plan}\n\n\
+                     上次产出（需修正）/ Previous output (needs fixing):\n{built}\n\n\
+                     请根据驳回原因修正上述产出，注意：\n\
+                     - 逐条对照驳回原因，确保每个问题都已解决\n\
+                     - 不要从头重做，只需修正被指出的问题\n\
+                     - 保持其他正确的部分不变\n\n\
+                     [System] Fix the issues identified in the rejection reason above. \
+                     Address each point, keep correct parts, only change what's rejected."
                 );
                 crate::agent_loop::run_autonomous(
                     &self.registry,

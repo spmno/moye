@@ -76,14 +76,14 @@ impl ToolManifest {
             let mod_name = t.name.replace('-', "_");
             out.push_str(&format!("pub mod {mod_name};\n"));
         }
-        out.push_str("\nuse rig_core::tool::ToolDyn;\n");
-        out.push_str("pub fn load_all() -> Vec<Box<dyn ToolDyn>> {\n");
-        out.push_str("    vec![\n");
+        out.push_str("\nuse rig_agent::tool::ToolSet;\n");
+        out.push_str("pub fn load_all() -> ToolSet {\n");
+        out.push_str("    let mut tools = ToolSet::default();\n");
         for t in &self.tools {
             let mod_name = t.name.replace('-', "_");
-            out.push_str(&format!("        Box::new({mod_name}::{}) ,\n", capitalized(&t.name)));
+            out.push_str(&format!("    tools.add_tool({mod_name}::{});\n", capitalized(&t.name)));
         }
-        out.push_str("    ]\n}\n");
+        out.push_str("    tools\n}\n");
         std::fs::write(MOD_RS, out)?;
         Ok(())
     }
@@ -108,24 +108,24 @@ pub fn add_tool(name: &str, description: &str) -> Result<String> {
     let mod_name = name.replace('-', "_");
     let file = format!("src/tools_ext/{mod_name}.rs");
     let src = format!(
-        "// AUTO-GENERATED tool scaffold. 请编辑 call 函数体补全实现。\n\
-         use rig_core::tool::Tool;\n\
-         use serde::Deserialize;\n\
-         use serde_json::json;\n\n\
-         #[derive(Deserialize)]\n\
-         struct Args {{ }}\n\n\
-         pub struct {struct_name};\n\n\
-         impl Tool for {struct_name} {{\n\
-         \x20   const NAME: &'static str = \"{name}\";\n\
-         \x20   type Error = anyhow::Error;\n\
-         \x20   type Args = Args;\n\
-         \x20   type Output = String;\n\n\
-         \x20   fn description(&self) -> String {{ \"{description}\".to_string() }}\n\n\
-         \x20   fn parameters(&self) -> serde_json::Value {{ json!({{ \"type\": \"object\", \"properties\": {{}}, \"required\": [] }}) }}\n\n\
-         \x20   async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {{\n\
-         \x20       Err(anyhow::anyhow!(\"工具 '{name}' 尚未实现；请编辑此文件补全 call 函数体\"))\n\
-         \x20   }}\n\
-         }}\n"
+         "// AUTO-GENERATED tool scaffold. 请编辑 call 函数体补全实现。\n\
+          use rig_core::tool::PortableTool;\n\
+          use serde::Deserialize;\n\
+          use serde_json::json;\n\n\
+          #[derive(Deserialize)]\n\
+          struct Args {{ }}\n\n\
+          pub struct {struct_name};\n\n\
+          impl PortableTool for {struct_name} {{\n\
+          \x20   const NAME: &'static str = \"{name}\";\n\
+          \x20   type Error = anyhow::Error;\n\
+          \x20   type Args = Args;\n\
+          \x20   type Output = String;\n\n\
+          \x20   fn description(&self) -> String {{ \"{description}\".to_string() }}\n\n\
+          \x20   fn parameters(&self) -> serde_json::Value {{ json!({{ \"type\": \"object\", \"properties\": {{}}, \"required\": [] }}) }}\n\n\
+          \x20   async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {{\n\
+          \x20       Err(anyhow::anyhow!(\"工具 '{name}' 尚未实现；请编辑此文件补全 call 函数体\"))\n\
+          \x20   }}\n\
+          }}\n"
     );
     std::fs::create_dir_all("src/tools_ext")?;
     std::fs::write(&file, src)?;

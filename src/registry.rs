@@ -5,7 +5,7 @@
 use crate::event::{AgentEvent, EventSender};
 use crate::providers::ChatAgent;
 use crate::sandbox::Sandbox;
-use rig_core::client::CompletionClient;
+use rig_agent::client::AgentClientExt;
 use serde::Deserialize;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -284,15 +284,13 @@ impl AgentRegistry {
         let max_turns = self.max_turns();
         info!("[build] role={key} model={model} max_turns={max_turns}");
         let agent = if with_tools {
-            let tools = crate::tools::builtin_tools(self.context_config())?;
-            client
+            let builder = client
                 .agent(&model)
                 .preamble(&preamble)
                 .temperature(crate::providers::Provider::clamp_temperature(0.7))
-                .tools(tools)
                 .additional_params(params)
-                .default_max_turns(max_turns)
-                .build()
+                .default_max_turns(max_turns);
+            crate::tools::add_builtin_tools(builder, self.context_config()).build()
         } else {
             client
                 .agent(&model)
@@ -375,8 +373,8 @@ pub enum Intent {
 pub fn classify(message: &str) -> Intent {
     let m = message.to_lowercase();
     let implement_kws = [
-        "实现", "添加", "创建", "修复", "编写", "构建", "修改", "重构", "删除",
-        "implement", "add", "create", "fix", "write", "build", "refactor",
+        "实现", "添加", "创建", "修复", "编写", "构建", "修改", "重构", "删除", "升级", "更新",
+        "implement", "add", "create", "fix", "write", "build", "refactor", "upgrade", "update",
     ];
     let investigate_kws = [
         "看一下", "调查", "检查", "查找", "怎么", "分析", "对比", "差距",
@@ -523,5 +521,27 @@ impl Orchestrator {
                 Ok(format!("\u{9700}\u{8981}\u{6f84}\u{6e05}\u{ff1a}{q}\n\n\u{5df2}\u{4ea7}\u{51fa}\u{7684}\u{5de5}\u{4f5c}\u{ff1a}\n{built}"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_upgrade_keywords_route_to_implement() {
+        assert_eq!(classify("在cargo 升级各个package最新版本"), Intent::Implement);
+        assert_eq!(classify("更新依赖到最新版本"), Intent::Implement);
+        assert_eq!(classify("upgrade all packages"), Intent::Implement);
+        assert_eq!(classify("update Cargo.toml"), Intent::Implement);
+    }
+
+    #[test]
+    fn classify_existing_keywords_still_route_correctly() {
+        assert_eq!(classify("实现一个新功能"), Intent::Implement);
+        assert_eq!(classify("fix the bug in main"), Intent::Implement);
+        assert_eq!(classify("看一下这个模块怎么工作"), Intent::Investigate);
+        assert_eq!(classify("how does auth work"), Intent::Investigate);
+        assert_eq!(classify("你好"), Intent::Chat);
     }
 }

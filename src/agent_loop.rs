@@ -12,13 +12,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
-use rig_core::agent::{
-    AgentHook, Flow, HookContext, RequestPatch, StepEvent, StepEventKind,
+use rig_agent::agent::hook::CompletionCall;
+use rig_agent::agent::{
+    Agent, AgentHook, HookContext, InvalidToolCallAction, InvalidToolCallContext, ModelTurnAction,
+    ModelTurnFinished, MultiTurnStreamItem, RequestPatch, StepEventKind, StreamingResult,
+    ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent, CompletionCallAction,
 };
-use rig_core::client::CompletionClient;
-use rig_core::completion::{CompletionModel, Message, Usage};
+use rig_agent::client::AgentClientExt;
+use rig_core::completion::{Message, Usage};
 use rig_core::providers::openai::CompletionModel as OpenAiModel;
-use rig_core::tool::ToolDyn;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
@@ -91,7 +93,7 @@ impl HitlHook {
         resp_rx.await.unwrap_or(false)
     }
 
-    async fn maybe_run_interactive(&self, tool_name: &str, args: &str) -> Option<Flow> {
+    async fn maybe_run_interactive(&self, tool_name: &str, args: &str) -> Option<ToolCallAction> {
         if tool_name != "run_bash" {
             return None;
         }
@@ -109,7 +111,7 @@ impl HitlHook {
             responder: resp_tx,
         });
         let output = resp_rx.await.unwrap_or_default();
-        Some(Flow::Skip { reason: output })
+        Some(ToolCallAction::Skip(output))
     }
 }
 
@@ -132,132 +134,143 @@ impl Drop for WaitingGuard {
     }
 }
 
-impl<M: CompletionModel> AgentHook<M> for HitlHook {
-    async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
-        match event {
-            StepEvent::TextDelta { .. } => Flow::Continue,
-
-            StepEvent::ModelTurnFinished { turn, usage, .. } => {
-                let usage_str = format_usage(&usage);
-                let _ = self
-                    .tx
-                    .send(AgentEvent::TurnFinished { turn, usage: usage_str });
-                Flow::Continue
-            }
-
-            StepEvent::ToolCall { tool_name, args, .. } => {
-                // ── 沙箱检查 ──
-                // 在权限分级检查之前，先检查工具调用是否访问沙箱外的路径。
-                // If the path is outside the sandbox and not yet authorized, prompt the user.
-                // Sandbox check: before the permission tier check, verify that the tool call
-                // doesn't access paths outside the sandbox. If it does and the directory
-                // hasn't been authorized, prompt the user for authorization.
-                //
-                // 信任模式（trust_sandbox = true）下，沙箱外访问自动授权，不弹窗确认。
-                // In trust mode (trust_sandbox = true), out-of-sandbox access is
-                // auto-authorized without prompting the user.
-                if let Some(sandbox_err) = self.sandbox.check_tool(tool_name, args) {
-                    if self.trust_sandbox.load(Ordering::Relaxed) {
-                        // 信任模式：自动授权，不弹窗
-                        // Trust mode: auto-authorize without prompting
-                        self.sandbox.authorize_tool(tool_name, args);
-                        let _ = self.tx.send(AgentEvent::Info(format!(
-                            "  [\u{6c99}\u{7bb1}] \u{4fe1}\u{4efb}\u{6a21}\u{5f0f}\u{81ea}\u{52a8}\u{6388}\u{6743}: {sandbox_err}"
-                        )));
-                        // 授权后继续进入权限分级检查
-                        // After authorization, fall through to the permission tier check
-                    } else {
-                        let desc = format!(
-                            "\u{1f512} \u{6c99}\u{7bb1}\u{5916}\u{8bbf}\u{95ee}\u{6388}\u{6743}\n\n{}\n\n\
-                             \u{662f}\u{5426}\u{5141}\u{8bb8}\u{8bbf}\u{95ee}\u{6b64}\u{8def}\u{5f84}\u{ff1f}\n\
-                             \u{ff08}\u{8f93}\u{5165} /trust \u{53ef}\u{5f00}\u{542f}\u{4fe1}\u{4efb}\u{6a21}\u{5f0f}\u{ff0c}\u{81ea}\u{52a8}\u{6388}\u{6743}\u{6c99}\u{7bb1}\u{5916}\u{8bbf}\u{95ee}\u{ff09}",
-                            sandbox_err
-                        );
-                        if self.confirm(tool_name, &desc).await {
-                            // 用户授权——将涉及的目录加入授权列表
-                            // User authorized — add the involved directories to the authorized list
-                            self.sandbox.authorize_tool(tool_name, args);
-                            let _ = self.tx.send(AgentEvent::Info(format!(
-                                "  [\u{6c99}\u{7bb1}] \u{5df2}\u{6388}\u{6743}\u{8bbf}\u{95ee}: {sandbox_err}"
-                            )));
-                            // 授权后继续进入权限分级检查
-                            // After authorization, fall through to the permission tier check
-                        } else {
-                            let _ = self.tx.send(AgentEvent::Info(
-                                "  [\u{6c99}\u{7bb1}] \u{8bbf}\u{95ee}\u{88ab}\u{62d2}\u{7edd}".into(),
-                            ));
-                            return Flow::Skip {
-                                reason: format!("\u{6c99}\u{7bb1}\u{62d2}\u{7edd}\u{8bbf}\u{95ee}: {sandbox_err}"),
-                            };
-                        }
-                    }
-                }
-
-                // ── 权限分级检查（原有逻辑）──
-                // Permission tier check (original logic)
-                let perms = self.perms.lock().unwrap().clone();
-                let tier = decide_tier(&perms, tool_name, args);
-                match tier {
-                    Permission::Allow => {
-                        let _ = self.tx.send(AgentEvent::Info(
-                            "  [HITL] \u{81ea}\u{52a8}\u{5141}\u{8bb8}".into(),
-                        ));
-                        if let Some(flow) = self.maybe_run_interactive(tool_name, args).await {
-                            return flow;
-                        }
-                        Flow::Continue
-                    }
-                    Permission::Deny => {
-                        let _ = self.tx.send(AgentEvent::Info(
-                            "  [HITL] \u{5df2}\u{62d2}\u{7edd}\u{ff08}\u{5b89}\u{5168}\u{7b56}\u{7565}\u{ff09}".into(),
-                        ));
-                        Flow::Skip {
-                            reason: format!(
-                                "\u{5de5}\u{5177} `{tool_name}` \u{88ab}\u{5f53}\u{524d}\u{89d2}\u{8272}\u{7684}\u{5b89}\u{5168}\u{7b56}\u{7565}\u{7981}\u{6b62}"
-                            ),
-                        }
-                    }
-                    Permission::Ask => {
-                        let desc = format_tool_call_desc(tool_name, args);
-                        if self.confirm(tool_name, &desc).await {
-                            if let Some(flow) = self.maybe_run_interactive(tool_name, args).await {
-                                return flow;
-                            }
-                            Flow::Continue
-                        } else {
-                            Flow::Skip {
-                                reason: format!(
-                                    "\u{7528}\u{6237}\u{62d2}\u{7edd}\u{4e86} `{tool_name}` \u{7684}\u{6267}\u{884c}"
-                                ),
-                            }
-                        }
-                    }
+impl AgentHook for HitlHook {
+    async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
+        let tool_name = event.tool_name;
+        let args = event.args;
+        // ── 沙箱检查 ──
+        // 在权限分级检查之前，先检查工具调用是否访问沙箱外的路径。
+        // If the path is outside the sandbox and not yet authorized, prompt the user.
+        // Sandbox check: before the permission tier check, verify that the tool call
+        // doesn't access paths outside the sandbox. If it does and the directory
+        // hasn't been authorized, prompt the user for authorization.
+        //
+        // 信任模式（trust_sandbox = true）下，沙箱外访问自动授权，不弹窗确认。
+        // In trust mode (trust_sandbox = true), out-of-sandbox access is
+        // auto-authorized without prompting the user.
+        if let Some(sandbox_err) = self.sandbox.check_tool(tool_name, args) {
+            if self.trust_sandbox.load(Ordering::Relaxed) {
+                // 信任模式：自动授权，不弹窗
+                // Trust mode: auto-authorize without prompting
+                self.sandbox.authorize_tool(tool_name, args);
+                let _ = self.tx.send(AgentEvent::Info(format!(
+                    "  [\u{6c99}\u{7bb1}] \u{4fe1}\u{4efb}\u{6a21}\u{5f0f}\u{81ea}\u{52a8}\u{6388}\u{6743}: {sandbox_err}"
+                )));
+                // 授权后继续进入权限分级检查
+                // After authorization, fall through to the permission tier check
+            } else {
+                let desc = format!(
+                    "\u{1f512} \u{6c99}\u{7bb1}\u{5916}\u{8bbf}\u{95ee}\u{6388}\u{6743}\n\n{}\n\n\
+                     \u{662f}\u{5426}\u{5141}\u{8bb8}\u{8bbf}\u{95ee}\u{6b64}\u{8def}\u{5f84}\u{ff1f}\n\
+                     \u{ff08}\u{8f93}\u{5165} /trust \u{53ef}\u{5f00}\u{542f}\u{4fe1}\u{4efb}\u{6a21}\u{5f0f}\u{ff0c}\u{81ea}\u{52a8}\u{6388}\u{6743}\u{6c99}\u{7bb1}\u{5916}\u{8bbf}\u{95ee}\u{ff09}",
+                    sandbox_err
+                );
+                if self.confirm(tool_name, &desc).await {
+                    // 用户授权——将涉及的目录加入授权列表
+                    // User authorized — add the involved directories to the authorized list
+                    self.sandbox.authorize_tool(tool_name, args);
+                    let _ = self.tx.send(AgentEvent::Info(format!(
+                        "  [\u{6c99}\u{7bb1}] \u{5df2}\u{6388}\u{6743}\u{8bbf}\u{95ee}: {sandbox_err}"
+                    )));
+                    // 授权后继续进入权限分级检查
+                    // After authorization, fall through to the permission tier check
+                } else {
+                    let _ = self.tx.send(AgentEvent::Info(
+                        "  [\u{6c99}\u{7bb1}] \u{8bbf}\u{95ee}\u{88ab}\u{62d2}\u{7edd}".into(),
+                    ));
+                    return ToolCallAction::Skip(
+                        format!("\u{6c99}\u{7bb1}\u{62d2}\u{7edd}\u{8bbf}\u{95ee}: {sandbox_err}"),
+                    );
                 }
             }
-
-            StepEvent::ToolResult {
-                tool_name, result, ..
-            } => {
-                let _ = self.tx.send(AgentEvent::ToolResult {
-                    name: tool_name.to_string(),
-                    result: result.to_string(),
-                    ok: true,
-                });
-                Flow::Continue
-            }
-
-            StepEvent::InvalidToolCall(ctx) => {
-                warn!("[\u{672a}\u{77e5}\u{5de5}\u{5177}] {}", ctx.tool_name);
-                let _ = self.tx.send(AgentEvent::ToolResult {
-                    name: ctx.tool_name.to_string(),
-                    result: "unknown tool".to_string(),
-                    ok: false,
-                });
-                Flow::Continue
-            }
-
-            _ => Flow::Continue,
         }
+
+        // ── 权限分级检查（原有逻辑）──
+        // Permission tier check (original logic)
+        let perms = self.perms.lock().unwrap().clone();
+        let tier = decide_tier(&perms, tool_name, args);
+        match tier {
+            Permission::Allow => {
+                let _ = self.tx.send(AgentEvent::Info(
+                    "  [HITL] \u{81ea}\u{52a8}\u{5141}\u{8bb8}".into(),
+                ));
+                if let Some(action) = self.maybe_run_interactive(tool_name, args).await {
+                    return action;
+                }
+                ToolCallAction::Run
+            }
+            Permission::Deny => {
+                let _ = self.tx.send(AgentEvent::Info(
+                    "  [HITL] \u{5df2}\u{62d2}\u{7edd}\u{ff08}\u{5b89}\u{5168}\u{7b56}\u{7565}\u{ff09}".into(),
+                ));
+                ToolCallAction::Skip(
+                    format!(
+                        "\u{5de5}\u{5177} `{tool_name}` \u{88ab}\u{5f53}\u{524d}\u{89d2}\u{8272}\u{7684}\u{5b89}\u{5168}\u{7b56}\u{7565}\u{7981}\u{6b62}"
+                    ),
+                )
+            }
+            Permission::Ask => {
+                let desc = format_tool_call_desc(tool_name, args);
+                if self.confirm(tool_name, &desc).await {
+                    if let Some(action) = self.maybe_run_interactive(tool_name, args).await {
+                        return action;
+                    }
+                    ToolCallAction::Run
+                } else {
+                    ToolCallAction::Skip(
+                        format!(
+                            "\u{7528}\u{6237}\u{62d2}\u{7edd}\u{4e86} `{tool_name}` \u{7684}\u{6267}\u{884c}"
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    async fn on_tool_result(
+        &self,
+        _ctx: &HookContext,
+        event: ToolResultEvent<'_>,
+    ) -> ToolResultAction {
+        let _ = self.tx.send(AgentEvent::ToolResult {
+            name: event.tool_name.to_string(),
+            result: event
+                .presentation
+                .as_text()
+                .unwrap_or("")
+                .to_string(),
+            ok: true,
+        });
+        ToolResultAction::Keep
+    }
+
+    async fn on_invalid_tool_call(
+        &self,
+        _ctx: &HookContext,
+        event: &InvalidToolCallContext,
+    ) -> Option<InvalidToolCallAction> {
+        warn!("[\u{672a}\u{77e5}\u{5de5}\u{5177}] {}", event.tool_name);
+        let _ = self.tx.send(AgentEvent::ToolResult {
+            name: event.tool_name.clone(),
+            result: "unknown tool".to_string(),
+            ok: false,
+        });
+        None
+    }
+
+    async fn on_model_turn_finished(
+        &self,
+        _ctx: &HookContext,
+        event: ModelTurnFinished<'_>,
+    ) -> ModelTurnAction {
+        let usage_str = format_usage(&event.usage);
+        let _ = self
+            .tx
+            .send(AgentEvent::TurnFinished {
+                turn: event.turn,
+                usage: usage_str,
+            });
+        ModelTurnAction::Continue
     }
 }
 
@@ -265,8 +278,8 @@ impl<M: CompletionModel> AgentHook<M> for HitlHook {
 /// Context management Hook: detects token overflow before each API call,
 /// compacting old conversation history when the threshold is exceeded.
 ///
-/// 利用 rig 的 `Flow::PatchRequest` + `RequestPatch::history()`，
-/// Uses rig's `Flow::PatchRequest` + `RequestPatch::history()`,
+/// 利用 rig 的 `CompletionCallAction::Patch` + `RequestPatch::history()`，
+/// Uses rig's `CompletionCallAction::Patch` + `RequestPatch::history()`,
 /// 替换当轮发送给 API 的历史（不影响 rig 内部持久化的真实历史）。
 /// replacing the history sent to the API for this turn only (without modifying
 /// rig's internally persisted real history).
@@ -347,9 +360,9 @@ impl ContextHook {
         ))
     }
 
-    /// 检测溢出并在必要时压缩历史，返回 `Flow::PatchRequest` 或 `Flow::Continue`。
-    /// Detect overflow and compact if needed, returning `Flow::PatchRequest` or `Flow::Continue`.
-    async fn handle_completion_call(&self, history: &[Message], _turn: usize) -> Flow {
+    /// 检测溢出并在必要时压缩历史，返回 `CompletionCallAction::Patch` 或 `CompletionCallAction::Continue`。
+    /// Detect overflow and compact if needed, returning `CompletionCallAction::Patch` or `CompletionCallAction::Continue`.
+    async fn handle_completion_call(&self, history: &[Message], _turn: usize) -> CompletionCallAction {
         if let Some(hc) = &self.history_capture {
             *hc.lock().unwrap() = history.to_vec();
         }
@@ -379,9 +392,9 @@ impl ContextHook {
             if let Some(reminder) = self.turn_reminder(_turn) {
                 let mut patched = history.to_vec();
                 patched.push(Message::system(&reminder));
-                return Flow::patch_request(RequestPatch::new().history(patched));
+                return CompletionCallAction::Patch(RequestPatch::new().history(patched));
             }
-            return Flow::Continue;
+            return CompletionCallAction::Continue;
         }
 
         let base_history: Vec<Message> = history.to_vec();
@@ -396,7 +409,7 @@ impl ContextHook {
         let (old, recent) =
             crate::context::select_head_tail(&base_history, self.config.keep_recent_turns, tail_budget);
         if old.is_empty() {
-            return Flow::Continue;
+            return CompletionCallAction::Continue;
         }
 
         let previous = crate::context::find_previous_summary(&base_history);
@@ -436,7 +449,7 @@ impl ContextHook {
             "  [上下文压缩 / context compacted] {estimated} → {new_tokens} tokens"
         )));
 
-        Flow::patch_request(RequestPatch::new().history(compacted))
+        CompletionCallAction::Patch(RequestPatch::new().history(compacted))
     }
 
     /// 调用 LLM 生成对话历史摘要。
@@ -471,18 +484,22 @@ impl ContextHook {
     }
 }
 
-impl<M: CompletionModel> AgentHook<M> for ContextHook {
-    async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
-        match event {
-            StepEvent::CompletionCall { history, turn, .. } => {
-                self.handle_completion_call(history, turn).await
-            }
-            StepEvent::ModelTurnFinished { usage, .. } => {
-                self.handle_model_turn_finished(&usage);
-                Flow::Continue
-            }
-            _ => Flow::Continue,
-        }
+impl AgentHook for ContextHook {
+    async fn on_completion_call(
+        &self,
+        _ctx: &HookContext,
+        event: CompletionCall<'_>,
+    ) -> CompletionCallAction {
+        self.handle_completion_call(event.history, event.turn).await
+    }
+
+    async fn on_model_turn_finished(
+        &self,
+        _ctx: &HookContext,
+        event: ModelTurnFinished<'_>,
+    ) -> ModelTurnAction {
+        self.handle_model_turn_finished(&event.usage);
+        ModelTurnAction::Continue
     }
 
     /// 只观察低频事件，跳过高频 delta 事件以提升性能。
@@ -610,20 +627,20 @@ pub fn decide_tier(perms: &ToolPerms, tool_name: &str, args: &str) -> Permission
 
 /// 纯函数形式的流程决策。仅用于单元测试，保证确定性与无 IO 依赖。
 /// Pure-function flow decision. Used only for unit tests, ensuring determinism and no IO dependency.
-/// `Ask` 在此解析为 `Flow::Skip`；线上 hook 应改用 `on_event` 中
-/// `Ask` is resolved as `Flow::Skip` here; the production hook should use the
+/// `Ask` 在此解析为 `ToolCallAction::Skip`；线上 hook 应改用 `on_tool_call` 中
+/// `Ask` is resolved as `ToolCallAction::Skip` here; the production hook should use the
 /// 的 match tier 分支，对 `Ask` 通过 `confirm()` 进行终端交互。
-/// match tier branch in `on_event`, which handles `Ask` via `confirm()` for terminal interaction.
+/// match tier branch in `on_tool_call`, which handles `Ask` via `confirm()` for terminal interaction.
 #[cfg(test)]
-fn decide_flow(perms: &ToolPerms, tool_name: &str, args: &str) -> Flow {
+fn decide_flow(perms: &ToolPerms, tool_name: &str, args: &str) -> ToolCallAction {
     match decide_tier(perms, tool_name, args) {
-        Permission::Allow => Flow::Continue,
-        Permission::Deny => Flow::Skip {
-            reason: format!("tool `{tool_name}` is denied by policy for this role"),
-        },
-        Permission::Ask => Flow::Skip {
-            reason: format!("user declined to run `{tool_name}`"),
-        },
+        Permission::Allow => ToolCallAction::Run,
+        Permission::Deny => ToolCallAction::Skip(
+            format!("tool `{tool_name}` is denied by policy for this role"),
+        ),
+        Permission::Ask => ToolCallAction::Skip(
+            format!("user declined to run `{tool_name}`"),
+        ),
     }
 }
 
@@ -764,11 +781,11 @@ pub fn is_stream_error(e: &anyhow::Error) -> bool {
 /// 用累积的 reasoning 内容作为输出回退，避免下游收到空计划。
 /// the accumulated reasoning content is used as output fallback, avoiding empty plans downstream.
 pub async fn consume_stream<R>(
-    mut stream: rig_core::agent::StreamingResult<R>,
+    mut stream: StreamingResult<R>,
     hitl_waiting: Option<Arc<AtomicBool>>,
     tx: &EventSender,
 ) -> anyhow::Result<String> {
-    use rig_core::agent::MultiTurnStreamItem;
+    use MultiTurnStreamItem;
     use rig_core::streaming::StreamedAssistantContent;
 
     const CHUNK_TIMEOUT: Duration = Duration::from_secs(120);
@@ -880,7 +897,7 @@ pub async fn consume_stream<R>(
 fn build_runner_agent(
     registry: &AgentRegistry,
     role: Role,
-) -> anyhow::Result<rig_core::agent::Agent<OpenAiModel>> {
+) -> anyhow::Result<Agent<OpenAiModel>> {
     let rc = registry
         .role_config(role)
         .ok_or_else(|| anyhow::anyhow!("no config for role {role:?}"))?;
@@ -891,13 +908,12 @@ fn build_runner_agent(
     let model = registry.session_model().unwrap_or_else(|| rc.model.clone());
     let max_turns = registry.max_turns_for_role(role);
     info!("[runner] role={role:?} model={model} max_turns={max_turns}");
-    let tools: Vec<Box<dyn ToolDyn>> = crate::tools::builtin_tools(registry.context_config())?;
     let params = crate::providers::provider_additional_params();
-    let agent = client
+    let builder = client
         .agent(&model)
         .preamble(&preamble)
-        .temperature(crate::providers::Provider::clamp_temperature(0.7))
-        .tools(tools)
+        .temperature(crate::providers::Provider::clamp_temperature(0.7));
+    let agent = crate::tools::add_builtin_tools(builder, registry.context_config())
         .additional_params(params)
         .default_max_turns(max_turns)
         .build();
@@ -907,7 +923,6 @@ fn build_runner_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rig_core::agent::Flow;
 
     fn perms() -> ToolPerms {
         ToolPerms {
@@ -924,7 +939,7 @@ mod tests {
     fn read_file_auto_runs() {
         assert!(matches!(
             decide_flow(&perms(), "read_file", r#"{"path":"x"}"#),
-            Flow::Continue
+            ToolCallAction::Run
         ));
     }
 
@@ -932,7 +947,7 @@ mod tests {
     fn readonly_bash_auto_runs() {
         assert!(matches!(
             decide_flow(&perms(), "run_bash", r#"{"command":"ls -la"}"#),
-            Flow::Continue
+            ToolCallAction::Run
         ));
     }
 
@@ -940,7 +955,7 @@ mod tests {
     fn mutating_bash_asks() {
         assert!(matches!(
             decide_flow(&perms(), "run_bash", r#"{"command":"rm -rf x"}"#),
-            Flow::Skip { .. }
+            ToolCallAction::Skip(..)
         ));
     }
 
@@ -948,7 +963,7 @@ mod tests {
     fn edit_file_asks() {
         assert!(matches!(
             decide_flow(&perms(), "edit_file", r#"{"path":"x","old":"a","new":"b"}"#),
-            Flow::Skip { .. }
+            ToolCallAction::Skip(..)
         ));
     }
 
@@ -956,7 +971,7 @@ mod tests {
     fn write_file_asks_like_edit() {
         assert!(matches!(
             decide_flow(&perms(), "write_file", r#"{"path":"x","content":"hi"}"#),
-            Flow::Skip { .. }
+            ToolCallAction::Skip(..)
         ));
     }
 
@@ -966,7 +981,7 @@ mod tests {
         p.run_bash_readonly = Permission::Deny;
         assert!(matches!(
             decide_flow(&p, "run_bash", r#"{"command":"cat x"}"#),
-            Flow::Skip { .. }
+            ToolCallAction::Skip(..)
         ));
     }
 
@@ -974,7 +989,7 @@ mod tests {
     fn unknown_tool_asks() {
         assert!(matches!(
             decide_flow(&perms(), "mystery", r#"{}"#),
-            Flow::Skip { .. }
+            ToolCallAction::Skip(..)
         ));
     }
 }

@@ -235,7 +235,7 @@ pub fn provider_additional_params() -> serde_json::Value {
 
 /// 对话型 Agent 别名：基于 OpenAI CompletionModel 的 rig Agent（兼容所有供应商）。
 /// Chat Agent alias: a rig Agent based on OpenAI CompletionModel (compatible with all providers).
-pub type ChatAgent = rig_core::agent::Agent<openai::CompletionModel>;
+pub type ChatAgent = rig_agent::agent::Agent<openai::CompletionModel>;
 
 /// 模型目录条目：slug + 面向用户的中文说明。
 /// Model catalog entry: slug + user-facing Chinese description.

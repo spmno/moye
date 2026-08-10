@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use rmcp::ServiceExt;
@@ -8,9 +9,93 @@ use rmcp::model::{
 use rmcp::service::{PeerRequestOptions, ServerSink};
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use tokio::process::Command;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::McpServerConfig;
+
+fn mcp_home() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".my-agent"))
+}
+
+fn local_bin_path(command: &str) -> Option<PathBuf> {
+    mcp_home().map(|d| d.join("node_modules").join(".bin").join(command))
+}
+
+async fn ensure_installed(command: &str, package: &str) -> Result<PathBuf> {
+    let bin = local_bin_path(command)
+        .with_context(|| "HOME not set; cannot resolve ~/.my-agent path")?;
+
+    if bin.exists() {
+        return Ok(bin);
+    }
+
+    let dir = mcp_home()
+        .with_context(|| "HOME not set; cannot resolve ~/.my-agent path")?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create directory {:?}", dir))?;
+
+    eprintln!("[mcp] First-time setup: installing '{package}' to {dir:?} ...");
+    let output = tokio::process::Command::new("npm")
+        .arg("install")
+        .arg("--prefix")
+        .arg(&dir)
+        .arg(package)
+        .output()
+        .await
+        .with_context(|| "run npm install")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("npm install '{}' failed: {}", package, stderr.trim());
+    }
+
+    if !bin.exists() {
+        anyhow::bail!(
+            "npm install succeeded but binary '{}' not found at {:?}",
+            command,
+            bin
+        );
+    }
+
+    eprintln!("[mcp] '{package}' installed to {bin:?}");
+    Ok(bin)
+}
+
+async fn ensure_indexed(resolved: &PathBuf, cfg: &McpServerConfig) -> Result<()> {
+    if cfg.init.is_empty() {
+        return Ok(());
+    }
+
+    let check_dir = match &cfg.init_if_missing {
+        Some(d) => PathBuf::from(d),
+        None => return Ok(()),
+    };
+
+    if check_dir.exists() {
+        return Ok(());
+    }
+
+    eprintln!(
+        "[mcp] First-time setup: running '{:?} {}' (indexing project)...",
+        resolved,
+        cfg.init.join(" ")
+    );
+
+    let output = tokio::process::Command::new(resolved)
+        .args(&cfg.init)
+        .output()
+        .await
+        .with_context(|| format!("run init command: {:?} {:?}", resolved, cfg.init))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("init failed: {}", stderr.trim());
+    }
+
+    eprintln!("[mcp] Indexing complete.");
+    Ok(())
+}
 
 pub struct McpConnection {
     name: String,
@@ -100,13 +185,29 @@ impl McpManager {
 
 async fn connect_one(name: &str, cfg: &McpServerConfig) -> Result<McpConnection> {
     let (service, transport_desc) = if let Some(ref cmd) = cfg.command {
-        let mut command = Command::new(cmd);
+        let resolved = if let Some(ref pkg) = cfg.package {
+            match ensure_installed(cmd, pkg).await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("[mcp] '{name}' auto-install failed, falling back to '{cmd}': {e}");
+                    PathBuf::from(cmd)
+                }
+            }
+        } else {
+            PathBuf::from(cmd)
+        };
+
+        if let Err(e) = ensure_indexed(&resolved, cfg).await {
+            warn!("[mcp] '{name}' auto-init failed: {e}");
+        }
+
+        let mut command = Command::new(&resolved);
         command.args(&cfg.args);
         for (k, v) in &cfg.env {
             command.env(k, v);
         }
         let transport = TokioChildProcess::new(command)
-            .with_context(|| format!("spawn MCP server '{name}': {cmd}"))?;
+            .with_context(|| format!("spawn MCP server '{name}': {:?}", resolved))?;
         let service = ClientInfo::default()
             .serve(transport)
             .await

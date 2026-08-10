@@ -56,8 +56,8 @@ pub struct Config {
 /// Config for a single MCP server. Transport is selected by `command` (stdio) or `url` (HTTP/SSE).
 #[derive(Debug, Deserialize, Default)]
 pub struct McpServerConfig {
-    /// stdio 传输：要执行的命令（如 `codegraph`、`npx`）。
-    /// stdio transport: the command to execute (e.g. `codegraph`, `npx`).
+    /// stdio 传输：要执行的命令（如 `codegraph`、`context7-mcp`）。
+    /// stdio transport: the command to execute (e.g. `codegraph`, `context7-mcp`).
     pub command: Option<String>,
     /// stdio 传输：传给命令的参数。
     /// stdio transport: arguments passed to the command.
@@ -70,6 +70,18 @@ pub struct McpServerConfig {
     /// stdio transport: environment variables for the child process.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// npm 包名：设置后，首次使用时自动安装到 `~/.my-agent/`，后续直接使用本地二进制。
+    /// npm package name: when set, auto-installs to `~/.my-agent/` on first use, then runs the local binary.
+    pub package: Option<String>,
+    /// 初始化参数：设置后，若 `init_if_missing` 指定的目录不存在，则在启动 MCP server 之前
+    /// 用这些参数运行一次初始化命令（如 `["init"]` → `codegraph init`）。
+    /// Init args: when set, if the directory specified by `init_if_missing` doesn't exist,
+    /// runs `<command> <init_args>` before starting the MCP server (e.g. `["init"]` → `codegraph init`).
+    #[serde(default)]
+    pub init: Vec<String>,
+    /// 触发初始化的条件：检查此路径（相对当前工作目录）是否存在，不存在则运行 init。
+    /// Condition for triggering init: checks if this path (relative to CWD) exists; if not, runs init.
+    pub init_if_missing: Option<String>,
 }
 
 impl McpServerConfig {
@@ -377,16 +389,17 @@ rule_escalation_threshold = 3
 [sandbox]
 authorized_dirs = []
 
-# MCP 服务器配置（可选）。
-# MCP server configs (optional).
-# 通过 `command`+`args`（stdio）或 `url`（HTTP/SSE）指定传输方式。
-# Transport is selected by `command`+`args` (stdio) or `url` (HTTP/SSE).
-# [mcp.codegraph]
-# command = "codegraph"
-# args = ["serve"]
-#
-# [mcp.context7]
-# url = "https://context7.com/api/v2/mcp"
+[mcp.codegraph]
+command = "codegraph"
+args = ["serve", "--mcp"]
+package = "@colbymchenry/codegraph"
+init = ["init"]
+init_if_missing = ".codegraph"
+
+[mcp.context7]
+command = "context7-mcp"
+args = []
+package = "@upstash/context7-mcp"
 "#
     );
 

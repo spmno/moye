@@ -6,6 +6,7 @@ use crate::event::{AgentEvent, EventSender};
 use crate::providers::ChatAgent;
 use crate::sandbox::Sandbox;
 use rig_agent::client::AgentClientExt;
+use rig_core::completion::Message;
 use serde::Deserialize;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -504,6 +505,9 @@ pub struct Orchestrator {
     /// 信任模式标志：为 true 时沙箱外访问自动授权，不弹窗确认。
     /// Trust-mode flag: when true, out-of-sandbox access is auto-authorized without prompting.
     trust_sandbox: Arc<AtomicBool>,
+    /// 跨消息对话历史：让 SDD 管线中各子 agent 能看到之前的对话。
+    /// Cross-message conversation history: lets sub-agents in the SDD pipeline see prior turns.
+    history: Arc<Mutex<Vec<Message>>>,
 }
 
 impl Orchestrator {
@@ -527,6 +531,7 @@ impl Orchestrator {
             registry,
             sandbox,
             trust_sandbox: Arc::new(AtomicBool::new(trust)),
+            history: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -541,15 +546,19 @@ impl Orchestrator {
         match intent {
             Intent::Implement => self.run_sdd_pipeline(message, tx).await,
             Intent::Investigate => {
-                crate::agent_loop::run_autonomous(
+                let prior = self.history.lock().unwrap().clone();
+                let (out, new_hist) = crate::agent_loop::run_autonomous(
                     &self.registry,
                     &self.sandbox,
                     self.trust_sandbox.clone(),
                     Role::Investigator,
                     message,
                     tx,
+                    prior,
                 )
-                .await
+                .await?;
+                *self.history.lock().unwrap() = new_hist;
+                Ok(out)
             }
             Intent::Chat => {
                 let agent = self.registry.build(Role::Builder)?;
@@ -561,7 +570,8 @@ impl Orchestrator {
     async fn run_sdd_pipeline(&self, message: &str, tx: &EventSender) -> anyhow::Result<String> {
         // 调查步骤：先让调查者判断是否需要调查并探索代码库。
         // Investigation step: let the Investigator decide whether to investigate and explore the codebase.
-        let investigation = crate::agent_loop::run_autonomous(
+        let prior = self.history.lock().unwrap().clone();
+        let (investigation, inv_hist) = crate::agent_loop::run_autonomous(
             &self.registry,
             &self.sandbox,
             self.trust_sandbox.clone(),
@@ -573,11 +583,13 @@ impl Orchestrator {
                  否则，探索相关代码，理解架构与依赖，产出结构化调查报告。"
             ),
             tx,
+            prior,
         )
         .await?;
 
         // 问答逃生口：如果调查者判断用户消息是问答/咨询，直接返回答案，跳过规划/构建/审计。
         if investigation.contains("无需实现") {
+            *self.history.lock().unwrap() = inv_hist;
             return Ok(investigation);
         }
 
@@ -595,19 +607,23 @@ impl Orchestrator {
         let planner = self.registry.build(Role::Planner)?;
         let plan = planner.run(&plan_prompt, tx).await?;
 
-        let built = crate::agent_loop::run_autonomous(
+        let (built, builder_hist) = crate::agent_loop::run_autonomous(
             &self.registry,
             &self.sandbox,
             self.trust_sandbox.clone(),
             Role::Builder,
             &format!("{message}\n\n\u{53c2}\u{8003}\u{8ba1}\u{5212}\u{ff1a}\n{plan}"),
             tx,
+            inv_hist,
         )
         .await?;
 
         let gate = crate::reviewer::ReviewGate::new(self.registry.clone());
         match gate.review(message, &built, tx).await? {
-            crate::reviewer::Verdict::Approve => Ok(built),
+            crate::reviewer::Verdict::Approve => {
+                *self.history.lock().unwrap() = builder_hist;
+                Ok(built)
+            }
             crate::reviewer::Verdict::Reject(reason) => {
                 let _ = tx.send(AgentEvent::Info(format!(
                     "[SDD] 审计驳回，带反馈重试一次 / Audit rejected, retrying with feedback:\n  · 驳回原因: {reason}"
@@ -625,18 +641,22 @@ impl Orchestrator {
                      [System] Fix the issues identified in the rejection reason above. \
                      Address each point, keep correct parts, only change what's rejected."
                 );
-                crate::agent_loop::run_autonomous(
+                let (retry_out, retry_hist) = crate::agent_loop::run_autonomous(
                     &self.registry,
                     &self.sandbox,
                     self.trust_sandbox.clone(),
                     Role::Builder,
                     &retry,
                     tx,
+                    builder_hist,
                 )
-                .await
+                .await?;
+                *self.history.lock().unwrap() = retry_hist;
+                Ok(retry_out)
             }
             crate::reviewer::Verdict::Clarify(q) => {
-                Ok(format!("\u{9700}\u{8981}\u{6f84}\u{6e05}\u{ff1a}{q}\n\n\u{5df2}\u{4ea7}\u{51fa}\u{7684}\u{5de5}\u{4f5c}\u{ff1a}\n{built}"))
+                *self.history.lock().unwrap() = builder_hist;
+                Ok(format!("\u{9700}\u{9700}\u{8981}\u{6f84}\u{6e05}\u{ff1a}{q}\n\n\u{5df2}\u{4ea7}\u{51fa}\u{7684}\u{5de5}\u{4f5c}\u{ff1a}\n{built}"))
             }
         }
     }

@@ -673,10 +673,11 @@ pub async fn run_autonomous(
     role: Role,
     goal: &str,
     tx: &EventSender,
-) -> anyhow::Result<String> {
+    prior_history: Vec<Message>,
+) -> anyhow::Result<(String, Vec<Message>)> {
     const MAX_RETRIES: usize = 3;
 
-    let captured_history: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_history: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(prior_history));
     let captured_turn: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let mut turns_used: usize = 0;
     let total_max_turns = registry.max_turns_for_role(role);
@@ -745,7 +746,7 @@ pub async fn run_autonomous(
         let stream = runner.stream().await;
 
         match consume_stream(stream, Some(hitl_waiting), tx).await {
-            Ok(output) => return Ok(output),
+            Ok(output) => return Ok((output, captured_history.lock().unwrap().clone())),
             Err(e) if is_stream_error(&e) && attempt < MAX_RETRIES => {
                 turns_used = *captured_turn.lock().unwrap();
                 let hist_len = captured_history.lock().unwrap().len();

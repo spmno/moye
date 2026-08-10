@@ -356,10 +356,10 @@ impl AgentRegistry {
             .unwrap_or_default()
     }
 
-    /// 返回所有已连接 MCP 服务器的工具名称（供侧边栏显示）。
-    /// Returns tool names from all connected MCP servers (for sidebar display).
-    pub fn mcp_tool_names(&self) -> Vec<String> {
-        self.mcp.tool_names()
+    /// 返回所有 MCP 服务器的显示信息（名称、状态、工具列表、错误信息）。
+    /// Returns display info for all MCP servers (name, status, tools, error).
+    pub fn mcp_server_displays(&self) -> Vec<crate::mcp::McpServerDisplay> {
+        self.mcp.server_displays()
     }
 
     /// 取某角色的配置，供自主循环重建"可运行"的 Agent

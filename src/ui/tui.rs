@@ -218,6 +218,7 @@ struct TuiState {
     total_tokens: u64,
     last_usage: String,
     tool_names: Vec<String>,
+    mcp_servers: Vec<crate::mcp::McpServerDisplay>,
     skill_names: Vec<String>,
     /// 当前运行中的后台任务句柄。按 Esc 可 abort 中断。
     /// Handle to the currently running background task. Press Esc to abort.
@@ -240,7 +241,7 @@ struct TuiState {
 }
 
 impl TuiState {
-    fn new(provider: String, model: String, max_turns: usize, tool_names: Vec<String>, skill_names: Vec<String>) -> Self {
+    fn new(provider: String, model: String, max_turns: usize, tool_names: Vec<String>, mcp_servers: Vec<crate::mcp::McpServerDisplay>, skill_names: Vec<String>) -> Self {
         Self {
             messages: Vec::new(),
             input: InputState::new(),
@@ -259,6 +260,7 @@ impl TuiState {
             total_tokens: 0,
             last_usage: String::new(),
             tool_names,
+            mcp_servers,
             skill_names,
             task_handle: None,
         needs_full_redraw: false,
@@ -510,8 +512,8 @@ pub async fn run_tui(ctx: Arc<AppContext>) -> anyhow::Result<()> {
     let provider = format!("{:?}", crate::providers::current_provider());
     let model = ctx.current_model();
     let max_turns = ctx.registry.max_turns();
-    let mut tool_names: Vec<String> = crate::tools::tool_names().iter().map(|s| s.to_string()).collect();
-    tool_names.extend(ctx.registry.mcp_tool_names());
+    let tool_names: Vec<String> = crate::tools::tool_names().iter().map(|s| s.to_string()).collect();
+    let mcp_servers = ctx.registry.mcp_server_displays();
     let skill_names: Vec<String> = crate::skills::SkillManifest::load()
         .map(|m| m.list())
         .unwrap_or_default();
@@ -522,7 +524,7 @@ pub async fn run_tui(ctx: Arc<AppContext>) -> anyhow::Result<()> {
 
     let (action_tx, mut action_rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    let mut state = TuiState::new(provider, model, max_turns, tool_names, skill_names);
+    let mut state = TuiState::new(provider, model, max_turns, tool_names, mcp_servers, skill_names);
     state.push_event(AgentEvent::System(format!(
         "my-agent ({}) | model: {}",
         state.provider, state.model
@@ -1507,6 +1509,40 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
         lines.push(Line::raw(format!(" \u{2022} {name}")));
     }
     lines.push(Line::default());
+
+    if !state.mcp_servers.is_empty() {
+        let connected = state.mcp_servers.iter().filter(|s| s.connected).count();
+        let total_tools: usize = state.mcp_servers.iter().map(|s| s.tool_names.len()).sum();
+        lines.push(Line::styled(
+            format!("MCP ({connected}/{} servers, {total_tools} tools)", state.mcp_servers.len()),
+            theme::status_dim(),
+        ));
+        for server in &state.mcp_servers {
+            if server.connected {
+                lines.push(Line::styled(
+                    format!(" \u{2713} {} ({} tools)", server.name, server.tool_names.len()),
+                    theme::mcp_connected(),
+                ));
+                for tn in &server.tool_names {
+                    lines.push(Line::styled(format!("   \u{2022} {tn}"), theme::mcp_tool()));
+                }
+            } else {
+                lines.push(Line::styled(
+                    format!(" \u{2717} {}", server.name),
+                    theme::mcp_failed(),
+                ));
+                if let Some(ref err) = server.error {
+                    let truncated = if err.len() > 40 {
+                        format!("   {err:.40}...")
+                    } else {
+                        format!("   {err}")
+                    };
+                    lines.push(Line::styled(truncated, theme::mcp_error_detail()));
+                }
+            }
+        }
+        lines.push(Line::default());
+    }
 
     if !state.skill_names.is_empty() {
         lines.push(Line::styled(

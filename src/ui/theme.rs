@@ -119,6 +119,22 @@ pub fn status_hitl() -> Style {
     Style::new().fg(Color::LightRed).add_modifier(Modifier::BOLD)
 }
 
+pub fn mcp_connected() -> Style {
+    Style::new().fg(Color::Green)
+}
+
+pub fn mcp_failed() -> Style {
+    Style::new().fg(Color::LightRed)
+}
+
+pub fn mcp_tool() -> Style {
+    Style::new().fg(Color::DarkGray)
+}
+
+pub fn mcp_error_detail() -> Style {
+    Style::new().fg(Color::DarkGray)
+}
+
 // ===== 选择器样式 =====
 // ===== Selector styles =====
 

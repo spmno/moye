@@ -24,13 +24,22 @@ impl McpConnection {
     }
 }
 
+pub struct McpServerDisplay {
+    pub name: String,
+    pub connected: bool,
+    pub tool_names: Vec<String>,
+    pub error: Option<String>,
+}
+
 pub struct McpManager {
     connections: Vec<McpConnection>,
+    failed: Vec<(String, String)>,
 }
 
 impl McpManager {
     pub async fn connect_all(configs: &HashMap<String, McpServerConfig>) -> Self {
         let mut connections = Vec::new();
+        let mut failed = Vec::new();
         for (name, cfg) in configs {
             match connect_one(name, cfg).await {
                 Ok(conn) => {
@@ -46,11 +55,13 @@ impl McpManager {
                     connections.push(conn);
                 }
                 Err(e) => {
-                    error!("[mcp] '{name}' failed: {e}");
+                    let msg = e.to_string();
+                    error!("[mcp] '{name}' failed: {msg}");
+                    failed.push((name.clone(), msg));
                 }
             }
         }
-        Self { connections }
+        Self { connections, failed }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -64,11 +75,26 @@ impl McpManager {
             .collect()
     }
 
-    pub fn tool_names(&self) -> Vec<String> {
-        self.connections
+    pub fn server_displays(&self) -> Vec<McpServerDisplay> {
+        let mut displays: Vec<McpServerDisplay> = self
+            .connections
             .iter()
-            .flat_map(|c| c.tool_names())
-            .collect()
+            .map(|c| McpServerDisplay {
+                name: c.name.clone(),
+                connected: true,
+                tool_names: c.tool_names(),
+                error: None,
+            })
+            .collect();
+        for (name, error) in &self.failed {
+            displays.push(McpServerDisplay {
+                name: name.clone(),
+                connected: false,
+                tool_names: vec![],
+                error: Some(error.clone()),
+            });
+        }
+        displays
     }
 }
 

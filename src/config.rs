@@ -208,7 +208,7 @@ fn default_model_for_provider(provider: &str) -> &'static str {
 fn generate_agent_toml(path: &str) -> anyhow::Result<()> {
     // 尝试读取全局配置获取 provider 信息；全局配置不存在时用 deepseek 默认。
     // Try to read the global config for provider settings; fall back to deepseek.
-    let (provider, base_url, api_key_env) = if let Some(global_path) = global_config_path() {
+    let (provider, base_url, api_key_env, global_model) = if let Some(global_path) = global_config_path() {
         if global_path.exists() {
             match Config::load(global_path.to_string_lossy().as_ref()) {
                 Ok(global) => (
@@ -218,17 +218,22 @@ fn generate_agent_toml(path: &str) -> anyhow::Result<()> {
                         .unwrap_or_else(|| "deepseek".to_string()),
                     global.provider.base_url,
                     global.provider.api_key_env,
+                    global.agent.default_model,
                 ),
-                Err(_) => ("deepseek".to_string(), None, None),
+                Err(_) => ("deepseek".to_string(), None, None, String::new()),
             }
         } else {
-            ("deepseek".to_string(), None, None)
+            ("deepseek".to_string(), None, None, String::new())
         }
     } else {
-        ("deepseek".to_string(), None, None)
+        ("deepseek".to_string(), None, None, String::new())
     };
 
-    let model = default_model_for_provider(&provider);
+    let model = if !global_model.is_empty() {
+        global_model
+    } else {
+        default_model_for_provider(&provider).to_string()
+    };
 
     // 构建 [provider] 小节：只包含全局配置中实际存在的字段。
     // Build the [provider] section: only include fields actually present in the global config.
@@ -506,11 +511,10 @@ MOONSHOT_API_KEY = "global-moon"
         assert!(cfg.roles.contains_key("planner"));
         assert!(cfg.roles.contains_key("builder"));
         assert!(cfg.roles.contains_key("auditor"));
-        // 默认模型应与 provider 匹配。
-        let provider = cfg.provider.provider.as_deref().unwrap_or("deepseek");
-        let expected_model = default_model_for_provider(provider);
-        assert_eq!(cfg.agent.default_model, expected_model);
-        assert_eq!(cfg.roles.get("builder").unwrap().model, expected_model);
+        // 模型应有值（来自全局配置或供应商默认）。
+        // Model should be set (from global config or provider default).
+        assert!(!cfg.agent.default_model.is_empty());
+        assert_eq!(cfg.roles.get("builder").unwrap().model, cfg.agent.default_model);
         // builder 应有写权限。
         assert_eq!(
             cfg.roles.get("builder").unwrap().permissions.write_file,

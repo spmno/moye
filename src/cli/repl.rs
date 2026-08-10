@@ -12,6 +12,9 @@ pub enum ReplCommand {
     /// `/models`：打开交互式模型选择器（opencode 风格）。
     /// `/models`: open the interactive model selector (opencode-style).
     Models,
+    /// `/plan [standard|coding|agent]`：查看或切换 API 套餐。
+    /// `/plan [standard|coding|agent]`: show or switch the API plan.
+    Plan { plan: Option<String> },
     /// `/evolve`：触发提示词进化。
     /// `/evolve`: trigger prompt evolution.
     Evolve,
@@ -88,6 +91,9 @@ impl ReplCommand {
                 slug: rest.first().map(|s| s.as_str()).map(str::to_owned),
             },
             "/models" => Self::Models,
+            "/plan" => Self::Plan {
+                plan: rest.first().map(|s| s.as_str()).map(str::to_owned),
+            },
             "/evolve" | "/e" => Self::Evolve,
             "/evolve-code" | "/ec" => match rest {
                 [file, old, new, ..] if !file.is_empty() => Self::EvolveCode {

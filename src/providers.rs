@@ -37,12 +37,101 @@ pub enum Provider {
     Custom,
 }
 
+/// API 套餐类型：按量付费（标准）/ Coding Plan / Agent Plan。
+/// 各厂商套餐端点不同，且 Coding/Agent Plan 的 API Key 与按量付费 Key 不互通。
+/// API plan type: pay-as-you-go (standard) / Coding Plan / Agent Plan.
+/// Plan endpoints differ per vendor, and plan API keys are not interchangeable
+/// with pay-as-you-go keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiPlan {
+    Standard,
+    Coding,
+    Agent,
+}
+
+impl ApiPlan {
+    pub fn parse(raw: &str) -> Self {
+        match raw.to_lowercase().as_str() {
+            "coding" | "code" => ApiPlan::Coding,
+            "agent" => ApiPlan::Agent,
+            _ => ApiPlan::Standard,
+        }
+    }
+
+    pub fn slug(&self) -> &'static str {
+        match self {
+            ApiPlan::Standard => "standard",
+            ApiPlan::Coding => "coding",
+            ApiPlan::Agent => "agent",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            ApiPlan::Standard => "按量付费 / Standard",
+            ApiPlan::Coding => "Coding Plan",
+            ApiPlan::Agent => "Agent Plan",
+        }
+    }
+}
+
+impl Provider {
+    /// 返回该供应商支持的套餐列表。无套餐端点的供应商只返回 Standard。
+    /// Returns the plans supported by this provider. Providers without plan
+    /// endpoints return only Standard.
+    pub fn supported_plans(&self) -> &'static [ApiPlan] {
+        match self {
+            Provider::Volcengine => &[ApiPlan::Standard, ApiPlan::Coding, ApiPlan::Agent],
+            Provider::Bailian | Provider::Moonshot | Provider::Zhipu => {
+                &[ApiPlan::Standard, ApiPlan::Coding]
+            }
+            _ => &[ApiPlan::Standard],
+        }
+    }
+
+    /// 是否支持非标准套餐。
+    /// Whether this provider supports any non-standard plan.
+    #[allow(dead_code)]
+    pub fn has_plans(&self) -> bool {
+        self.supported_plans().len() > 1
+    }
+
+    /// 解析当前套餐：MY_AGENT_PLAN 环境变量优先，其次 agent.toml 的
+    /// `[provider].plan`；均缺失时默认 Standard。
+    /// Resolves the active plan: MY_AGENT_PLAN env var wins, then
+    /// `[provider].plan` from agent.toml; defaults to Standard.
+    pub fn plan_from_env() -> ApiPlan {
+        if let Ok(raw) = std::env::var("MY_AGENT_PLAN") {
+            return ApiPlan::parse(&raw);
+        }
+        if let Some(raw) = crate::config::config().and_then(|c| c.provider.plan.clone()) {
+            return ApiPlan::parse(&raw);
+        }
+        ApiPlan::Standard
+    }
+
+    /// 给定套餐对应的 base URL。Standard 使用厂商默认；Coding/Agent 使用套餐专属端点。
+    /// The base URL for the given plan. Standard uses the vendor default;
+    /// Coding/Agent use plan-specific endpoints.
+    pub fn base_url_for_plan(&self, plan: ApiPlan) -> &'static str {
+        match (self, plan) {
+            (Provider::Volcengine, ApiPlan::Standard) => "https://ark.cn-beijing.volces.com/api/v3",
+            (Provider::Volcengine, ApiPlan::Coding) => "https://ark.cn-beijing.volces.com/api/coding/v3",
+            (Provider::Volcengine, ApiPlan::Agent) => "https://ark.cn-beijing.volces.com/api/plan/v3",
+            (Provider::Bailian, ApiPlan::Coding) => "https://coding.dashscope.aliyuncs.com/v1",
+            (Provider::Moonshot, ApiPlan::Coding) => "https://api.kimi.com/coding/v1",
+            (Provider::Zhipu, ApiPlan::Coding) => "https://open.bigmodel.cn/api/coding/paas/v4",
+            (p, _) => p.default_base_url(),
+        }
+    }
+}
+
 impl Provider {
     /// 解析供应商：`MY_AGENT_PROVIDER` 环境变量优先，其次 agent.toml 的
     /// `[provider].provider`；均缺失时默认 deepseek。
     /// Resolves the provider: `MY_AGENT_PROVIDER` env var wins, then the
     /// `[provider].provider` from agent.toml; defaults to deepseek when absent.
-    fn from_env() -> Self {
+    pub fn from_env() -> Self {
         let configured = crate::config::config().and_then(|c| c.provider.provider.clone());
         let raw = std::env::var("MY_AGENT_PROVIDER")
             .ok()
@@ -88,9 +177,9 @@ impl Provider {
     }
 
     /// OpenAI 兼容 base URL。优先级：`MY_AGENT_BASE_URL` env → `[provider].base_url`
-    /// → 供应商默认。
+    /// → 当前套餐专属端点 → 供应商默认。
     /// OpenAI-compatible base URL. Precedence: `MY_AGENT_BASE_URL` env →
-    /// `[provider].base_url` → provider default.
+    /// `[provider].base_url` → active plan endpoint → provider default.
     fn base_url(&self) -> String {
         if let Ok(url) = std::env::var("MY_AGENT_BASE_URL") {
             return url;
@@ -101,18 +190,7 @@ impl Provider {
         {
             return url;
         }
-        match self {
-            Provider::DeepSeek => "https://api.deepseek.com/v1".to_string(),
-            Provider::Bailian => "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
-            Provider::Moonshot => "https://api.moonshot.cn/v1".to_string(),
-            Provider::Volcengine => "https://ark.cn-beijing.volces.com/api/plan/v3".to_string(),
-            Provider::OpenAI => "https://api.openai.com/v1".to_string(),
-            Provider::Claude => "https://api.anthropic.com/v1/".to_string(),
-            Provider::MiMo => "https://api.xiaomimimo.com/v1".to_string(),
-            Provider::Gemini => "https://generativelanguage.googleapis.com/v1beta/openai/".to_string(),
-            Provider::Zhipu => "https://open.bigmodel.cn/api/paas/v4".to_string(),
-            Provider::Custom => "https://api.openai.com/v1".to_string(),
-        }
+        self.base_url_for_plan(Self::plan_from_env()).to_string()
     }
 
     /// 该供应商的默认 API key 环境变量名（不含 config 自定义覆盖）。
@@ -137,7 +215,7 @@ impl Provider {
             Provider::DeepSeek => "https://api.deepseek.com/v1",
             Provider::Bailian => "https://dashscope.aliyuncs.com/compatible-mode/v1",
             Provider::Moonshot => "https://api.moonshot.cn/v1",
-            Provider::Volcengine => "https://ark.cn-beijing.volces.com/api/plan/v3",
+            Provider::Volcengine => "https://ark.cn-beijing.volces.com/api/v3",
             Provider::OpenAI => "https://api.openai.com/v1",
             Provider::Claude => "https://api.anthropic.com/v1/",
             Provider::MiMo => "https://api.xiaomimimo.com/v1",
@@ -190,6 +268,7 @@ pub fn create_client_with(
     let provider = provider_override
         .map(parse_provider)
         .unwrap_or_else(Provider::from_env);
+    let plan = Provider::plan_from_env();
     let base_url = base_url_override
         .map(str::to_string)
         .or_else(|| std::env::var("MY_AGENT_BASE_URL").ok())
@@ -198,7 +277,7 @@ pub fn create_client_with(
                 .and_then(|c| c.provider.base_url.clone())
                 .filter(|u| !u.trim().is_empty())
         })
-        .unwrap_or_else(|| provider.default_base_url().to_string());
+        .unwrap_or_else(|| provider.base_url_for_plan(plan).to_string());
     let api_key_env: String = if provider_override.is_some() {
         provider.default_api_key_env().to_string()
     } else {
@@ -218,8 +297,9 @@ pub fn create_client_with(
             api_key_env
         ))?;
     info!(
-        "[provider] {:?} | base_url={} | api_key={}...{}",
+        "[provider] {:?} plan={} | base_url={} | api_key={}...{}",
         provider,
+        plan.slug(),
         base_url,
         &api_key[..8.min(api_key.len())],
         &api_key[api_key.len().saturating_sub(4)..],
@@ -241,6 +321,12 @@ pub fn create_client_with(
 /// Return the currently active provider.
 pub fn current_provider() -> Provider {
     Provider::from_env()
+}
+
+/// 返回当前生效的套餐。
+/// Return the currently active plan.
+pub fn current_plan() -> ApiPlan {
+    Provider::plan_from_env()
 }
 
 /// 返回当前生效的供应商（小写 slug 字符串），供模型历史记录展示。
@@ -288,48 +374,95 @@ pub struct ModelInfo {
 /// Returns the recommended model catalog for a provider, used by the /models selector.
 /// Custom 供应商无内置清单——选择器允许直接输入任意 OpenAI 兼容模型 ID。
 /// Custom has no built-in list — the selector allows typing any OpenAI-compatible model ID.
+#[allow(dead_code)]
 pub fn provider_models(provider: Provider) -> Vec<ModelInfo> {
-    match provider {
-        Provider::DeepSeek => vec![
-            ModelInfo { slug: "deepseek-v4-pro".into(), desc: "旗舰推理模型" },
-            ModelInfo { slug: "deepseek-v4-flash".into(), desc: "快速响应，成本低" },
+    provider_models_for_plan(provider, Provider::plan_from_env())
+}
+
+/// 返回指定供应商 + 套餐的推荐模型目录。
+/// Coding/Agent Plan 的可用模型与按量付费不同（端点也不同）。
+/// Returns the recommended model catalog for a provider + plan.
+/// Coding/Agent Plan models differ from pay-as-you-go.
+pub fn provider_models_for_plan(provider: Provider, plan: ApiPlan) -> Vec<ModelInfo> {
+    match (provider, plan) {
+        (Provider::Volcengine, ApiPlan::Agent) => vec![
+            ModelInfo { slug: "doubao-seed-evolving".into(), desc: "Doubao Seed Evolving · 周迭代旗舰" },
+            ModelInfo { slug: "deepseek-v4-pro".into(), desc: "DeepSeek V4 Pro · 尝鲜版，1M 上下文" },
+            ModelInfo { slug: "deepseek-v4-flash".into(), desc: "DeepSeek V4 Flash · 快速，1M 上下文" },
+            ModelInfo { slug: "kimi-k3".into(), desc: "Kimi K3 · 1M 上下文" },
+            ModelInfo { slug: "glm-5.2".into(), desc: "GLM-5.2 · 1M 上下文" },
+            ModelInfo { slug: "kimi-k2.7-code".into(), desc: "Kimi K2.7 Code · 256K" },
+            ModelInfo { slug: "minimax-m3".into(), desc: "MiniMax M3 · 1M 上下文" },
+            ModelInfo { slug: "ark-code-latest".into(), desc: "Ark Code · 路由模型（后台可切换）" },
         ],
-        Provider::Bailian => vec![
-            ModelInfo { slug: "kimi/kimi-k3".into(), desc: "Kimi K3 · 长上下文" },
-            ModelInfo { slug: "qwen-plus".into(), desc: "通义千问 Plus" },
-            ModelInfo { slug: "qwen-max".into(), desc: "通义千问 Max" },
+        (Provider::Volcengine, ApiPlan::Coding) => vec![
+            ModelInfo { slug: "doubao-seed-2.0-code".into(), desc: "Doubao Seed 2.0 Code · 编程专用" },
+            ModelInfo { slug: "doubao-seed-2.0-pro".into(), desc: "Doubao Seed 2.0 Pro · 旗舰" },
+            ModelInfo { slug: "doubao-seed-2.0-lite".into(), desc: "Doubao Seed 2.0 Lite · 轻量" },
+            ModelInfo { slug: "ark-code-latest".into(), desc: "Ark Code · 路由模型（后台可切换）" },
         ],
-        Provider::Moonshot => vec![
-            ModelInfo { slug: "kimi-k3".into(), desc: "Kimi K3 · 长上下文" },
-            ModelInfo { slug: "kimi-k2.7-code-highspeed".into(), desc: "代码加速版" },
-        ],
-        Provider::Volcengine => vec![
-            ModelInfo { slug: "doubao-1-5-pro-256k".into(), desc: "豆包 1.5 Pro · 长上下文" },
-            ModelInfo { slug: "doubao-1-5-lite-32k".into(), desc: "豆包 1.5 Lite · 轻量快速" },
+        (Provider::Volcengine, ApiPlan::Standard) => vec![
+            ModelInfo { slug: "doubao-seed-evolving".into(), desc: "Doubao Seed Evolving · 周迭代旗舰" },
+            ModelInfo { slug: "doubao-seed-2-1-pro-260628".into(), desc: "Doubao Seed 2.1 Pro · 旗舰，256K" },
+            ModelInfo { slug: "doubao-seed-2-1-turbo-260628".into(), desc: "Doubao Seed 2.1 Turbo · 快速，256K" },
+            ModelInfo { slug: "doubao-seed-2-0-lite-260428".into(), desc: "Doubao Seed 2.0 Lite · 轻量" },
             ModelInfo { slug: "deepseek-r1-250120".into(), desc: "DeepSeek R1 · 推理模型" },
         ],
-        Provider::OpenAI => vec![
-            ModelInfo { slug: "gpt-4o".into(), desc: "GPT-4o · 旗舰模型" },
-            ModelInfo { slug: "gpt-4o-mini".into(), desc: "GPT-4o mini · 轻量快速" },
-            ModelInfo { slug: "o1".into(), desc: "o1 · 推理模型" },
+        (Provider::Bailian, ApiPlan::Coding) => vec![
+            ModelInfo { slug: "qwen3.7-plus".into(), desc: "Qwen3.7 Plus · 均衡，1M 上下文" },
+            ModelInfo { slug: "qwen3-coder-plus".into(), desc: "Qwen3 Coder Plus · 编程专用" },
+            ModelInfo { slug: "qwen3-coder-flash".into(), desc: "Qwen3 Coder Flash · 编程快速" },
+            ModelInfo { slug: "qwen3.7-flash".into(), desc: "Qwen3.7 Flash · 快速，1M" },
         ],
-        Provider::Claude => vec![
-            ModelInfo { slug: "claude-opus-5".into(), desc: "Claude Opus 5 · 旗舰推理" },
-            ModelInfo { slug: "claude-sonnet-4-6".into(), desc: "Claude Sonnet 4.6 · 均衡" },
-            ModelInfo { slug: "claude-haiku-4-5".into(), desc: "Claude Haiku 4.5 · 快速" },
+        (Provider::Bailian, _) => vec![
+            ModelInfo { slug: "qwen3.8-max".into(), desc: "通义千问 3.8 Max · 旗舰，1M 上下文" },
+            ModelInfo { slug: "qwen3.7-plus".into(), desc: "通义千问 3.7 Plus · 均衡，1M 上下文" },
+            ModelInfo { slug: "qwen3.7-flash".into(), desc: "通义千问 3.7 Flash · 快速，1M 上下文" },
+            ModelInfo { slug: "qwen-plus".into(), desc: "通义千问 Plus（稳定版）" },
         ],
-        Provider::MiMo => vec![
-            ModelInfo { slug: "mimo-v2.5-pro".into(), desc: "MiMo v2.5 Pro · 旗舰" },
+        (Provider::Moonshot, ApiPlan::Coding) => vec![
+            ModelInfo { slug: "kimi-for-coding".into(), desc: "Kimi for Coding · 编程专用，稳定 ID" },
+            ModelInfo { slug: "kimi-for-coding-highspeed".into(), desc: "Kimi for Coding HighSpeed · 5–6× 加速" },
+            ModelInfo { slug: "k3".into(), desc: "Kimi K3 · 旗舰" },
         ],
-        Provider::Gemini => vec![
-            ModelInfo { slug: "gemini-2.5-pro".into(), desc: "Gemini 2.5 Pro · 长上下文" },
-            ModelInfo { slug: "gemini-2.5-flash".into(), desc: "Gemini 2.5 Flash · 快速" },
+        (Provider::Moonshot, _) => vec![
+            ModelInfo { slug: "kimi-k3".into(), desc: "Kimi K3 · 旗舰，2.8T 参数，1M 上下文" },
+            ModelInfo { slug: "kimi-k2.7-code-highspeed".into(), desc: "Kimi K2.7 Code · 代码加速版，256K" },
         ],
-        Provider::Zhipu => vec![
-            ModelInfo { slug: "glm-5.2".into(), desc: "GLM-5.2 · 旗舰" },
-            ModelInfo { slug: "glm-4-flash".into(), desc: "GLM-4 Flash · 轻量" },
+        (Provider::Zhipu, ApiPlan::Coding) => vec![
+            ModelInfo { slug: "glm-5.2".into(), desc: "GLM-5.2 · 旗舰，1M 上下文" },
+            ModelInfo { slug: "glm-5".into(), desc: "GLM-5 · 混合推理" },
+            ModelInfo { slug: "glm-4.7".into(), desc: "GLM-4.7 · 代码优化" },
         ],
-        Provider::Custom => vec![],
+        (Provider::Zhipu, _) => vec![
+            ModelInfo { slug: "glm-5.2".into(), desc: "GLM-5.2 · 旗舰，1M 上下文" },
+            ModelInfo { slug: "glm-5".into(), desc: "GLM-5 · 混合推理" },
+        ],
+        (Provider::DeepSeek, _) => vec![
+            ModelInfo { slug: "deepseek-v4-pro".into(), desc: "DeepSeek V4 Pro · 旗舰推理，1M 上下文" },
+            ModelInfo { slug: "deepseek-v4-flash".into(), desc: "DeepSeek V4 Flash · 快速经济，1M 上下文" },
+        ],
+        (Provider::OpenAI, _) => vec![
+            ModelInfo { slug: "gpt-5.6-sol".into(), desc: "GPT-5.6 Sol · 旗舰推理与编码" },
+            ModelInfo { slug: "gpt-5.6-terra".into(), desc: "GPT-5.6 Terra · 智能与成本均衡" },
+            ModelInfo { slug: "gpt-5.6-luna".into(), desc: "GPT-5.6 Luna · 高性价比" },
+        ],
+        (Provider::Claude, _) => vec![
+            ModelInfo { slug: "claude-fable-5".into(), desc: "Claude Fable 5 · 长程 Agent 智能" },
+            ModelInfo { slug: "claude-opus-5".into(), desc: "Claude Opus 5 · 旗舰编码，1M 上下文" },
+            ModelInfo { slug: "claude-sonnet-5".into(), desc: "Claude Sonnet 5 · 速度与智能均衡" },
+            ModelInfo { slug: "claude-haiku-4-5".into(), desc: "Claude Haiku 4.5 · 最快，200K" },
+        ],
+        (Provider::MiMo, _) => vec![
+            ModelInfo { slug: "mimo-v2.5-pro".into(), desc: "MiMo v2.5 Pro · 旗舰，1M 上下文" },
+            ModelInfo { slug: "mimo-v2.5".into(), desc: "MiMo v2.5 · 多模态理解，1M 上下文" },
+        ],
+        (Provider::Gemini, _) => vec![
+            ModelInfo { slug: "gemini-3.1-pro-preview".into(), desc: "Gemini 3.1 Pro · 旗舰推理，1M 上下文" },
+            ModelInfo { slug: "gemini-3.6-flash".into(), desc: "Gemini 3.6 Flash · 前沿性能，1M 上下文" },
+            ModelInfo { slug: "gemini-3.5-flash-lite".into(), desc: "Gemini 3.5 Flash-Lite · 低成本高吞吐" },
+        ],
+        (Provider::Custom, _) => vec![],
     }
 }
 
@@ -338,13 +471,13 @@ impl Provider {
     /// Default context window size (tokens) for this provider.
     pub fn context_limit(&self) -> usize {
         match self {
-            Provider::DeepSeek => 128_000,
-            Provider::Bailian => 128_000,
-            Provider::Moonshot => 256_000,
+            Provider::DeepSeek => 1_000_000,
+            Provider::Bailian => 1_000_000,
+            Provider::Moonshot => 1_000_000,
             Provider::Volcengine => 256_000,
-            Provider::OpenAI => 128_000,
-            Provider::Claude => 200_000,
-            Provider::MiMo => 128_000,
+            Provider::OpenAI => 400_000,
+            Provider::Claude => 1_000_000,
+            Provider::MiMo => 1_000_000,
             Provider::Gemini => 1_000_000,
             Provider::Zhipu => 1_000_000,
             Provider::Custom => 128_000,
@@ -359,6 +492,9 @@ pub fn context_limit_for_model(model: &str) -> usize {
     let provider = Provider::from_env();
     let lower = model.to_lowercase();
     // 模型特定的覆盖 / Model-specific overrides
+    if lower.contains("kimi-k3") {
+        return 1_000_000;
+    }
     if lower.contains("kimi") {
         return 256_000;
     }
@@ -370,28 +506,48 @@ pub fn context_limit_for_model(model: &str) -> usize {
     if lower.contains("deepseek") {
         return 128_000;
     }
+    // Doubao Seed 系列上下文 256K。
+    // Doubao Seed series has 256K context.
+    if lower.contains("doubao-seed") {
+        return 256_000;
+    }
+    if lower.contains("doubao") {
+        return 256_000;
+    }
+    // Qwen3 Max/Plus/Flash 系列 1M 上下文。
+    // Qwen3 Max/Plus/Flash series has 1M context.
+    if lower.contains("qwen3") || lower.contains("qwen-plus") || lower.contains("qwen-flash") {
+        return 1_000_000;
+    }
     if lower.contains("qwen-max") {
         return 32_000;
-    }
-    if lower.contains("qwen-plus") {
-        return 128_000;
     }
     if lower.contains("glm") {
         return 1_000_000;
     }
-    if lower.contains("claude") {
+    // Claude Fable/Opus/Sonnet 5 及 4.6+ 系列 1M 上下文；Haiku 4.5 为 200K。
+    // Claude Fable/Opus/Sonnet 5 and 4.6+ series have 1M context; Haiku 4.5 has 200K.
+    if lower.contains("haiku") {
         return 200_000;
+    }
+    if lower.contains("claude") {
+        return 1_000_000;
     }
     if lower.contains("gemini") {
         return 1_000_000;
     }
     if lower.contains("mimo") {
-        return 128_000;
+        return 1_000_000;
+    }
+    // GPT-5.6 系列 400K 上下文。
+    // GPT-5.6 series has 400K context.
+    if lower.contains("gpt-5") {
+        return 400_000;
     }
     if lower.contains("gpt-4o") {
         return 128_000;
     }
-    if lower.contains("o1") {
+    if lower.contains("o1") || lower.contains("o3") {
         return 200_000;
     }
     // 回退到供应商默认值 / Fall back to provider default
@@ -404,35 +560,58 @@ mod tests {
 
     #[test]
     fn deepseek_provider_context_limit() {
-        assert_eq!(Provider::DeepSeek.context_limit(), 128_000);
+        assert_eq!(Provider::DeepSeek.context_limit(), 1_000_000);
     }
 
     #[test]
     fn moonshot_provider_context_limit() {
-        assert_eq!(Provider::Moonshot.context_limit(), 256_000);
+        assert_eq!(Provider::Moonshot.context_limit(), 1_000_000);
     }
 
     #[test]
     fn new_provider_context_limits() {
-        assert_eq!(Provider::OpenAI.context_limit(), 128_000);
-        assert_eq!(Provider::Claude.context_limit(), 200_000);
-        assert_eq!(Provider::MiMo.context_limit(), 128_000);
+        assert_eq!(Provider::OpenAI.context_limit(), 400_000);
+        assert_eq!(Provider::Claude.context_limit(), 1_000_000);
+        assert_eq!(Provider::MiMo.context_limit(), 1_000_000);
         assert_eq!(Provider::Gemini.context_limit(), 1_000_000);
         assert_eq!(Provider::Zhipu.context_limit(), 1_000_000);
+        assert_eq!(Provider::Volcengine.context_limit(), 256_000);
+        assert_eq!(Provider::Bailian.context_limit(), 1_000_000);
     }
 
     #[test]
     fn context_limit_for_kimi_model() {
-        assert_eq!(context_limit_for_model("kimi-k3"), 256_000);
+        assert_eq!(context_limit_for_model("kimi-k3"), 1_000_000);
+        assert_eq!(context_limit_for_model("kimi-k2.7-code-highspeed"), 256_000);
     }
 
     #[test]
     fn context_limit_for_new_models() {
-        assert_eq!(context_limit_for_model("claude-opus-5"), 200_000);
-        assert_eq!(context_limit_for_model("gemini-2.5-pro"), 1_000_000);
-        assert_eq!(context_limit_for_model("mimo-v2.5-pro"), 128_000);
-        assert_eq!(context_limit_for_model("gpt-4o"), 128_000);
-        assert_eq!(context_limit_for_model("o1"), 200_000);
+        assert_eq!(context_limit_for_model("claude-opus-5"), 1_000_000);
+        assert_eq!(context_limit_for_model("claude-fable-5"), 1_000_000);
+        assert_eq!(context_limit_for_model("claude-sonnet-5"), 1_000_000);
+        assert_eq!(context_limit_for_model("claude-haiku-4-5"), 200_000);
+        assert_eq!(context_limit_for_model("gemini-3.1-pro-preview"), 1_000_000);
+        assert_eq!(context_limit_for_model("gemini-3.6-flash"), 1_000_000);
+        assert_eq!(context_limit_for_model("mimo-v2.5-pro"), 1_000_000);
+        assert_eq!(context_limit_for_model("gpt-5.6-sol"), 400_000);
+        assert_eq!(context_limit_for_model("gpt-5.6-terra"), 400_000);
+        assert_eq!(context_limit_for_model("gpt-5.6-luna"), 400_000);
+    }
+
+    #[test]
+    fn context_limit_for_doubao_seed_models() {
+        assert_eq!(context_limit_for_model("doubao-seed-evolving"), 256_000);
+        assert_eq!(context_limit_for_model("doubao-seed-2-1-pro-260628"), 256_000);
+        assert_eq!(context_limit_for_model("doubao-seed-2-1-turbo-260628"), 256_000);
+    }
+
+    #[test]
+    fn context_limit_for_qwen3_models() {
+        assert_eq!(context_limit_for_model("qwen3.8-max"), 1_000_000);
+        assert_eq!(context_limit_for_model("qwen3.7-plus"), 1_000_000);
+        assert_eq!(context_limit_for_model("qwen3.7-flash"), 1_000_000);
+        assert_eq!(context_limit_for_model("qwen-plus"), 1_000_000);
     }
 
     #[test]

@@ -69,7 +69,54 @@ impl AppContext {
         }
     }
 
-    /// `/evolve`：触发提示词进化（注入经验教训 → 评估后择优采纳），返回面向用户的提示文本。
+    /// `/plan [standard|coding|agent]`：查看当前套餐或切换套餐（写入 agent.toml，需重启生效）。
+    /// `/plan [standard|coding|agent]`: show the current plan or switch it (writes to agent.toml; restart required).
+    pub fn cmd_plan(&self, plan: Option<String>) -> String {
+        use crate::providers::{ApiPlan, Provider};
+
+        let provider = Provider::from_env();
+        let supported = provider.supported_plans();
+
+        if let Some(p) = plan {
+            let new_plan = ApiPlan::parse(&p);
+            if !supported.contains(&new_plan) {
+                return format!(
+                    "供应商 {:?} 不支持 {} 套餐。支持的套餐：{}",
+                    provider,
+                    new_plan.slug(),
+                    supported
+                        .iter()
+                        .map(|p| p.slug())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            if let Err(e) = write_plan_to_config(new_plan.slug()) {
+                return format!("写入 agent.toml 失败: {e}");
+            }
+            return format!(
+                "套餐已切换为 {}（{}）。请重启 my-agent 生效。",
+                new_plan.slug(),
+                new_plan.label()
+            );
+        }
+
+        let current = Provider::plan_from_env();
+        let mut out = format!(
+            "当前供应商: {:?} | 当前套餐: {} ({})",
+            provider,
+            current.slug(),
+            current.label()
+        );
+        out.push_str("\n支持的套餐:");
+        for sp in supported {
+            let marker = if *sp == current { " ← 当前" } else { "" };
+            out.push_str(&format!("\n  /plan {}  →  {}{}", sp.slug(), sp.label(), marker));
+        }
+        out
+    }
+
+
     /// `/evolve`: trigger prompt evolution (inject lessons → evaluate → adopt best), returning user-facing text.
     pub async fn cmd_evolve(&self, tx: &EventSender) -> String {
         let lessons = self.memory.load_lessons().unwrap_or_default();
@@ -138,6 +185,7 @@ impl AppContext {
              \u{2500}\u{2500}\u{2500} \u{547d}\u{4ee4} \u{2500}\u{2500}\u{2500}\n\
              /model [slug]       \u{67e5}\u{770b}\u{6216}\u{5207}\u{6362}\u{5f53}\u{524d}\u{4f1a}\u{8bdd}\u{6a21}\u{578b}\n\
              /models             \u{6253}\u{5f00}\u{4ea4}\u{4e92}\u{5f0f}\u{6a21}\u{578b}\u{9009}\u{62e9}\u{5668}\n\
+             /plan [plan]        \u{67e5}\u{770b}\u{6216}\u{5207}\u{6362} API \u{5957}\u{9910}\u{ff08}standard/coding/agent\u{ff0c}\u{9700}\u{91cd}\u{542f}\u{751f}\u{6548}\u{ff09}\n\
              /evolve             \u{89e6}\u{53d1}\u{63d0}\u{793a}\u{8bcd}\u{8fdb}\u{5316}\u{ff08}\u{8bc4}\u{4f30}\u{540e}\u{62e9}\u{4f18}\u{91c7}\u{7eb3}\u{ff09}\n\
              /evolve-code <f> <old> <new>  \u{4ee3}\u{7801}\u{81ea}\u{4fee}\u{6539}\u{ff08}\u{7f16}\u{8bd1}\u{9a8c}\u{8bc1} + \u{56de}\u{9000}\u{ff09}\n\
              /add-tool <name> <desc>  \u{751f}\u{6210}\u{65b0}\u{5de5}\u{5177}\u{811a}\u{624b}\u{67b6}\u{ff08}\u{9700}\u{91cd}\u{65b0}\u{7f16}\u{8bd1}\u{751f}\u{6548}\u{ff09}\n\
@@ -248,6 +296,35 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}\u{2026}", &s[..s.floor_char_boundary(max)])
     }
+}
+
+fn write_plan_to_config(plan: &str) -> std::io::Result<()> {
+    let path = "agent.toml";
+    let content = std::fs::read_to_string(path)?;
+    let mut out = String::with_capacity(content.len() + 32);
+    let mut in_provider = false;
+    let mut written = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            if in_provider && !written {
+                out.push_str(&format!("plan = \"{plan}\"\n"));
+                written = true;
+            }
+            in_provider = trimmed == "[provider]";
+        }
+        if in_provider && trimmed.starts_with("plan") && trimmed.contains('=') {
+            out.push_str(&format!("plan = \"{plan}\"\n"));
+            written = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if in_provider && !written {
+        out.push_str(&format!("plan = \"{plan}\"\n"));
+    }
+    std::fs::write(path, out)
 }
 
 #[cfg(test)]

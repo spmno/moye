@@ -455,12 +455,23 @@ struct WebSearchArgs {
     query: String,
 }
 
-/// 用 DuckDuckGo Instant Answer API 搜索网络。返回摘要文本与相关链接。
-/// Searches the web via the DuckDuckGo Instant Answer API. Returns summary text and related links.
+/// 用 DuckDuckGo HTML 端点（lite 版）搜索网络，返回标题、摘要与链接。
+/// Searches the web via the DuckDuckGo HTML (lite) endpoint, returning title, snippet, and URL.
+///
+/// 历史背景：早期使用 Instant Answer API（api.duckduckgo.com/?format=json），
+/// 但该 API 只对维基百科类实体查询有效，对绝大多数普通查询返回空结果——
+/// 这就是"搜索不好用"的根本原因。HTML 端点 `html.duckduckgo.com/html/` 返回
+/// 真正的搜索结果页，我们手写一个极简解析器提取 `<a class="result__a">`
+/// 和 `<a class="result__snippet">`，无需引入 HTML 解析库。
+/// Historical note: the previous Instant Answer JSON API only returned useful
+/// results for Wikipedia-style entities and was empty for most queries — that
+/// was the root cause of "search doesn't work". The HTML endpoint returns a
+/// real SERP which we parse with a tiny hand-rolled extractor, avoiding a new
+/// HTML-parser dependency.
 struct WebSearch;
 
-/// 实现 `web_search` 工具：调用 DuckDuckGo API 并整理摘要与链接。
-/// Implements the `web_search` tool: calls the DuckDuckGo API and collates summaries and links.
+/// 实现 `web_search` 工具：请求 DuckDuckGo HTML 端点并解析结果。
+/// Implements the `web_search` tool: requests the DuckDuckGo HTML endpoint and parses results.
 impl PortableTool for WebSearch {
     const NAME: &'static str = "web_search";
     type Error = ToolError;
@@ -470,7 +481,7 @@ impl PortableTool for WebSearch {
     /// 返回面向 LLM 的工具描述（中文）。
     /// Returns the LLM-facing tool description (Chinese).
     fn description(&self) -> String {
-        "在互联网上搜索给定查询，返回摘要与相关链接。使用 DuckDuckGo 搜索引擎。"
+        "在互联网上搜索给定查询，返回若干条结果（标题、摘要、链接）。使用 DuckDuckGo 搜索引擎。"
             .to_string()
     }
 
@@ -486,132 +497,284 @@ impl PortableTool for WebSearch {
         })
     }
 
-    /// 执行工具：请求 DuckDuckGo API，提取摘要/回答/定义/相关链接并格式化。
-    /// Executes the tool: requests the DuckDuckGo API, extracts abstract/answer/definition/related links, and formats them.
+    /// 执行工具：POST 到 DuckDuckGo HTML 端点，解析结果块并格式化。
+    /// Executes the tool: POSTs to the DuckDuckGo HTML endpoint, parses result blocks, formats them.
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         const MAX_RESULTS: usize = 8;
         let client = build_web_client()?;
-        let resp: serde_json::Value = client
-            .get("https://api.duckduckgo.com/")
-            .query(&[
-                ("q", args.query.as_str()),
-                ("format", "json"),
-                ("no_html", "1"),
-                ("skip_disambig", "1"),
-            ])
+        let resp = client
+            .get("https://html.duckduckgo.com/html/")
+            .header("Accept", "text/html,application/xhtml+xml")
+            .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+            .query(&[("q", args.query.as_str())])
             .send()
             .await
-            .map_err(|e| ToolError(format!("搜索请求失败: {e}。提示: 在中国大陆可能需要设置代理，如 export MY_AGENT_PROXY=http://127.0.0.1:7890")))?
-            .json()
+            .map_err(|e| ToolError(format!(
+                "搜索请求失败: {e}。提示: 在中国大陆可能需要设置代理，如 export MY_AGENT_PROXY=http://127.0.0.1:7890"
+            )))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ToolError(format!("搜索返回 HTTP {status}")));
+        }
+        let body = resp
+            .text()
             .await
-            .map_err(|e| ToolError(format!("解析搜索结果失败: {e}")))?;
+            .map_err(|e| ToolError(format!("读取搜索响应失败: {e}")))?;
+        let results = parse_ddg_html(&body);
 
-        let mut parts = Vec::new();
-
-        // 1) 摘要（AbstractText / AbstractURL）
-        // 1) Abstract (AbstractText / AbstractURL)
-        if let Some(abs) = resp.get("AbstractText").and_then(|v| v.as_str()) {
-            if !abs.is_empty() {
-                parts.push(format!("摘要: {abs}"));
-            }
-        }
-        if let Some(abs_url) = resp.get("AbstractURL").and_then(|v| v.as_str()) {
-            if !abs_url.is_empty() {
-                parts.push(format!("来源: {abs_url}"));
-            }
-        }
-
-        // 2) Answer（直接回答）
-        // 2) Answer (direct answer)
-        if let Some(ans) = resp.get("Answer").and_then(|v| v.as_str()) {
-            if !ans.is_empty() {
-                parts.push(format!("回答: {ans}"));
-            }
-        }
-
-        // 3) Definition（定义）
-        // 3) Definition
-        if let Some(def) = resp.get("Definition").and_then(|v| v.as_str()) {
-            if !def.is_empty() {
-                parts.push(format!("定义: {def}"));
-            }
-        }
-
-        // 4) RelatedTopics —— 提取文本与链接
-        // 4) RelatedTopics — extract text and links
-        let mut links: Vec<(String, String)> = Vec::new();
-        if let Some(related) = resp.get("RelatedTopics").and_then(|v| v.as_array()) {
-            for item in related {
-                // 直接条目
-                // Direct entry
-                if let Some(text) = item.get("Text").and_then(|v| v.as_str()) {
-                    let url = item
-                        .get("FirstURL")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if !text.is_empty() {
-                        links.push((text.to_string(), url.to_string()));
-                    }
-                }
-                // 嵌套 Topics（子分组）
-                // Nested Topics (sub-groups)
-                if let Some(topics) = item.get("Topics").and_then(|v| v.as_array()) {
-                    for sub in topics {
-                        if let Some(text) = sub.get("Text").and_then(|v| v.as_str()) {
-                            let url = sub
-                                .get("FirstURL")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            if !text.is_empty() {
-                                links.push((text.to_string(), url.to_string()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 5) Results（直接结果）
-        // 5) Results (direct results)
-        if let Some(results) = resp.get("Results").and_then(|v| v.as_array()) {
-            for item in results {
-                if let Some(text) = item.get("Text").and_then(|v| v.as_str()) {
-                    let url = item
-                        .get("FirstURL")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if !text.is_empty() {
-                        links.push((text.to_string(), url.to_string()));
-                    }
-                }
-            }
-        }
-
-        if links.is_empty() && parts.is_empty() {
+        if results.is_empty() {
             return Ok(format!(
-                "未找到与「{}」相关的即时结果。可用 web_fetch 抓取具体网页获取更多信息。",
+                "未找到与「{}」相关的结果。可尝试更换关键词，或用 web_fetch 直接抓取已知 URL。",
                 args.query
             ));
         }
 
-        if !parts.is_empty() {
-            parts.push(String::new()); // 空行分隔
-            // Blank line separator
-        }
-        parts.push(format!("相关结果（共 {} 条）:", links.len()));
-        for (i, (text, url)) in links.iter().take(MAX_RESULTS).enumerate() {
-            if url.is_empty() {
-                parts.push(format!("  {}. {text}", i + 1));
+        let mut parts = Vec::with_capacity(results.len() * 2 + 1);
+        parts.push(format!("搜索结果（共 {} 条，显示前 {} 条）:", results.len(), results.len().min(MAX_RESULTS)));
+        for (i, item) in results.iter().take(MAX_RESULTS).enumerate() {
+            let title = item.title.trim();
+            let snippet = item.snippet.trim();
+            if snippet.is_empty() {
+                parts.push(format!("  {}. {title}\n     {}", i + 1, item.url));
             } else {
-                parts.push(format!("  {}. {text}\n     {url}", i + 1));
+                parts.push(format!("  {}. {title}\n     {snippet}\n     {}", i + 1, item.url));
             }
         }
-        if links.len() > MAX_RESULTS {
-            parts.push(format!("  …（还有 {} 条结果已省略）", links.len() - MAX_RESULTS));
+        if results.len() > MAX_RESULTS {
+            parts.push(format!("  …（还有 {} 条结果已省略）", results.len() - MAX_RESULTS));
         }
-
         Ok(parts.join("\n"))
     }
+}
+
+/// DuckDuckGo HTML 端点解析出的单条搜索结果。
+/// A single parsed search result from the DuckDuckGo HTML endpoint.
+#[derive(Debug, Default)]
+struct SearchResult {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+/// 从 DuckDuckGo HTML 结果页中提取搜索结果。
+/// Extracts search results from a DuckDuckGo HTML SERP.
+///
+/// 页面结构（截至 2026 年）：每条结果包裹在
+/// `<div class="result ..."> ... <a class="result__a" href="...">Title</a>
+/// ... <a class="result__snippet" ...>snippet text</a> ... </div>`。
+/// 链接可能是 `//duckduckgo.com/l/?uddg=<encoded target>&...` 形式的跳转链接，
+/// 需要解码出真实目标 URL。我们用字符串扫描而非正则，避免额外依赖，
+/// 且对 DuckDuckGo 偶尔调整 class 名有一定容忍度（按 result__a / result__snippet 子串匹配）。
+/// Page structure (as of 2026): each result is wrapped in
+/// `<div class="result ..."> ... <a class="result__a" href="...">Title</a>
+/// ... <a class="result__snippet" ...>snippet</a> ... </div>`.
+/// Links may be DDG redirects of the form `//duckduckgo.com/l/?uddg=<encoded>&...`,
+/// which we decode to recover the real target. We scan by string rather than
+/// regex to avoid a new dependency, and match class substrings so minor DDG
+/// markup tweaks don't break us.
+fn parse_ddg_html(html: &str) -> Vec<SearchResult> {
+    let lower = html.to_lowercase();
+    let mut results = Vec::new();
+    let mut pos = 0usize;
+
+    while pos < html.len() {
+        // 找下一条结果块起点：class 中含 "result__a"
+        // Find the next result block anchor: class containing "result__a"
+        let anchor_rel = match lower[pos..].find("result__a") {
+            Some(r) => r,
+            None => break,
+        };
+        // 回退到该锚点所属 `<a ` 标签起点
+        // Walk back to the start of the enclosing `<a ` tag
+        let tag_start_abs = match html[..pos + anchor_rel].rfind("<a ") {
+            Some(s) => s,
+            None => {
+                pos += anchor_rel + "result__a".len();
+                continue;
+            }
+        };
+        // 该 `<a ...>` 标签的闭合 `>`
+        // Closing `>` of this `<a ...>` tag
+        let tag_open_end_abs = match html[tag_start_abs..].find('>') {
+            Some(e) => tag_start_abs + e + 1,
+            None => {
+                pos = tag_start_abs + 3;
+                continue;
+            }
+        };
+        // 从 `<a ...>` 中提取 href="..."
+        // Extract href="..." from the opening tag
+        let open_tag = &html[tag_start_abs..tag_open_end_abs];
+        let raw_url = extract_attr(open_tag, "href").unwrap_or_default();
+        let url = decode_ddg_redirect(&raw_url);
+
+        // 找 </a>，取中间文本作为标题
+        // Find </a>; the inner text is the title
+        let after_close = match lower[tag_open_end_abs..].find("</a>") {
+            Some(c) => tag_open_end_abs + c,
+            None => {
+                pos = tag_open_end_abs;
+                continue;
+            }
+        };
+        let title_html = &html[tag_open_end_abs..after_close];
+        let title = strip_html_inline(title_html);
+
+        // 在该结果块后续一小段窗口内找 result__snippet
+        // Look for result__snippet within a short window after this anchor
+        let window_end = (after_close + 4096).min(html.len());
+        let snippet = lower[after_close..window_end]
+            .find("result__snippet")
+            .and_then(|rel| {
+                let snip_tag_abs = after_close + rel;
+                // 回退到 `<a ` 或 `<div ` 起点
+                // Walk back to the enclosing tag start
+                let snip_open = html[..snip_tag_abs]
+                    .rfind("<a ")
+                    .or_else(|| html[..snip_tag_abs].rfind("<div "))
+                    .unwrap_or(snip_tag_abs);
+                html[snip_open..].find('>').map(|e| snip_open + e + 1)
+            })
+            .and_then(|content_start| {
+                lower[content_start..]
+                    .find("</a>")
+                    .or_else(|| lower[content_start..].find("</div>"))
+                    .map(|end| content_start + end)
+            })
+            .map(|content_end| {
+                let start = content_end.saturating_sub(2048).max(after_close);
+                strip_html_inline(&html[start..content_end])
+            })
+            .unwrap_or_default();
+
+        if !title.is_empty() && !url.is_empty() {
+            results.push(SearchResult { title, url, snippet });
+        }
+
+        pos = after_close + 4;
+        if results.len() >= 32 {
+            break; // 安全上限 / safety cap
+        }
+    }
+
+    results
+}
+
+/// 从一段 HTML 开标签中提取指定属性值（支持单/双引号）。
+/// Extracts an attribute value from an HTML opening tag (supports single/double quotes).
+fn extract_attr(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_lowercase();
+    let pat = format!("{attr}=");
+    let idx = lower.find(&pat)?;
+    let after = &tag[idx + pat.len()..];
+    let bytes = after.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let quote = bytes[0];
+    if quote != b'"' && quote != b'\'' {
+        // 无引号属性，读到空白为止
+        // Unquoted attribute: read until whitespace
+        let end = after
+            .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .unwrap_or(after.len());
+        return Some(after[..end].to_string());
+    }
+    let rest = &after[1..];
+    let end = rest.find(quote as char)?;
+    Some(rest[..end].to_string())
+}
+
+/// 把 DuckDuckGo 的跳转链接 `//duckduckgo.com/l/?uddg=<encoded>&...`
+/// 解码为真实目标 URL；非跳转链接原样返回（补全协议）。
+/// Decodes a DuckDuckGo redirect URL `//duckduckgo.com/l/?uddg=<encoded>&...`
+/// into the real target; non-redirect URLs are returned as-is (with protocol filled in).
+fn decode_ddg_redirect(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // 补全协议前缀 / Normalize protocol-relative URLs
+    let normalized = if trimmed.starts_with("//") {
+        format!("https:{trimmed}")
+    } else if trimmed.starts_with('/') {
+        format!("https://duckduckgo.com{trimmed}")
+    } else {
+        trimmed.to_string()
+    };
+
+    // 在 query 串中找 uddg= 参数 / Find the uddg= query parameter
+    if let Some(qpos) = normalized.find('?') {
+        let query = &normalized[qpos + 1..];
+        for pair in query.split('&') {
+            if let Some(value) = pair.strip_prefix("uddg=") {
+                if let Ok(decoded) = urlencoding_decode(value) {
+                    return decoded;
+                }
+            }
+        }
+    }
+    normalized
+}
+
+/// 极简 percent-decoding：仅处理 %XX 与 '+'，足够用于 DDG 跳转链接。
+/// Minimal percent-decoding: handles %XX and '+', sufficient for DDG redirects.
+fn urlencoding_decode(s: &str) -> Result<String, ToolError> {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = hex_val(bytes[i + 1])?;
+                let lo = hex_val(bytes[i + 2])?;
+                out.push((hi << 4) | lo);
+                i += 3;
+            }
+            b'%' => {
+                return Err(ToolError("不完整的 percent 编码".into()));
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|e| ToolError(format!("UTF-8 解码失败: {e}")))
+}
+
+/// 把单个十六进制 ASCII 字符转为数值。
+/// Converts a single hex ASCII character to its value.
+fn hex_val(c: u8) -> Result<u8, ToolError> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(ToolError(format!("非法十六进制字符: {c}"))),
+    }
+}
+
+/// 去除一段 HTML 片段中的标签并解码实体，用于标题/摘要等行内文本。
+/// Strips tags from an HTML fragment and decodes entities; used for inline title/snippet text.
+fn strip_html_inline(s: &str) -> String {
+    let mut text = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => text.push(c),
+            _ => {}
+        }
+    }
+    decode_html_entities(&text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// 去除 HTML 标签，保留纯文本内容。

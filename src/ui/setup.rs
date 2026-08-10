@@ -19,7 +19,7 @@ use ratatui::{
 };
 
 use crate::config;
-use crate::providers::{provider_models, ModelInfo};
+use crate::providers::{provider_models_for_plan, ApiPlan, Provider};
 use crate::ui::selector::{SelectorItem, SelectorState};
 
 struct ProviderEntry {
@@ -30,20 +30,21 @@ struct ProviderEntry {
 }
 
 const PROVIDERS: &[ProviderEntry] = &[
-    ProviderEntry { slug: "deepseek", label: "DeepSeek", detail: "深度求索 · 旗舰推理", api_key_env: "DEEPSEEK_API_KEY" },
-    ProviderEntry { slug: "openai", label: "OpenAI", detail: "GPT-4o / o1 推理模型", api_key_env: "OPENAI_API_KEY" },
-    ProviderEntry { slug: "claude", label: "Anthropic Claude", detail: "Claude Opus / Sonnet / Haiku", api_key_env: "ANTHROPIC_API_KEY" },
-    ProviderEntry { slug: "mimo", label: "Xiaomi MiMo", detail: "小米 MiMo v2.5 Pro", api_key_env: "MIMO_API_KEY" },
-    ProviderEntry { slug: "gemini", label: "Google Gemini", detail: "Gemini 2.5 Pro / Flash", api_key_env: "GEMINI_API_KEY" },
-    ProviderEntry { slug: "zhipu", label: "Zhipu GLM", detail: "智谱 GLM-5.2", api_key_env: "ZAI_API_KEY" },
-    ProviderEntry { slug: "bailian", label: "Bailian (DashScope)", detail: "百炼 · 通义千问 / Kimi", api_key_env: "DASHSCOPE_API_KEY" },
-    ProviderEntry { slug: "moonshot", label: "Moonshot Kimi", detail: "Kimi K3 · 长上下文", api_key_env: "MOONSHOT_API_KEY" },
-    ProviderEntry { slug: "volcengine", label: "Volcengine Ark", detail: "火山引擎 · 豆包", api_key_env: "ARK_API_KEY" },
+    ProviderEntry { slug: "deepseek", label: "DeepSeek", detail: "V4 Pro / Flash · 1M 上下文", api_key_env: "DEEPSEEK_API_KEY" },
+    ProviderEntry { slug: "openai", label: "OpenAI", detail: "GPT-5.6 Sol / Terra / Luna", api_key_env: "OPENAI_API_KEY" },
+    ProviderEntry { slug: "claude", label: "Anthropic Claude", detail: "Fable 5 / Opus 5 / Sonnet 5", api_key_env: "ANTHROPIC_API_KEY" },
+    ProviderEntry { slug: "mimo", label: "Xiaomi MiMo", detail: "MiMo v2.5 Pro · 1M 上下文", api_key_env: "MIMO_API_KEY" },
+    ProviderEntry { slug: "gemini", label: "Google Gemini", detail: "Gemini 3.1 Pro / 3.6 Flash", api_key_env: "GEMINI_API_KEY" },
+    ProviderEntry { slug: "zhipu", label: "Zhipu GLM", detail: "智谱 GLM-5.2 / GLM-5", api_key_env: "ZAI_API_KEY" },
+    ProviderEntry { slug: "bailian", label: "Bailian (DashScope)", detail: "百炼 · Qwen3.8 Max / Qwen3.7 Plus", api_key_env: "DASHSCOPE_API_KEY" },
+    ProviderEntry { slug: "moonshot", label: "Moonshot Kimi", detail: "Kimi K3 · 1M 上下文", api_key_env: "MOONSHOT_API_KEY" },
+    ProviderEntry { slug: "volcengine", label: "Volcengine Ark", detail: "Doubao Seed Evolving · 周迭代", api_key_env: "ARK_API_KEY" },
     ProviderEntry { slug: "custom", label: "Custom (OpenAI-compatible)", detail: "自定义 base URL + API key", api_key_env: "MY_AGENT_API_KEY" },
 ];
 
 enum Phase {
     Provider,
+    Plan,
     Model,
     CustomUrl,
     CustomModel,
@@ -57,6 +58,7 @@ struct SetupState {
     input: String,
     cursor: usize,
     provider: Option<&'static ProviderEntry>,
+    plan: ApiPlan,
     model: Option<String>,
     base_url: Option<String>,
     api_key: String,
@@ -82,15 +84,40 @@ impl SetupState {
             input: String::new(),
             cursor: 0,
             provider: None,
+            plan: ApiPlan::Standard,
             model: None,
             base_url: None,
             api_key: String::new(),
         }
     }
 
+    fn start_plan_select(&mut self) {
+        let provider = parse_provider_entry(self.provider.unwrap().slug);
+        let plans: Vec<SelectorItem> = provider
+            .supported_plans()
+            .iter()
+            .map(|p| SelectorItem {
+                label: p.label().to_string(),
+                detail: plan_detail(provider, *p).to_string(),
+                data: Some(p.slug().to_string()),
+            })
+            .collect();
+        let only_one = plans.len() == 1;
+        self.selector = Some(SelectorState::new(
+            "Select Plan / 选择套餐".into(),
+            plans,
+            false,
+        ));
+        self.phase = Phase::Plan;
+        if only_one {
+            self.plan = ApiPlan::Standard;
+            self.start_model_select();
+        }
+    }
+
     fn start_model_select(&mut self) {
-        let provider = self.provider.unwrap();
-        let models = provider_models_slug(provider.slug);
+        let provider = parse_provider_entry(self.provider.unwrap().slug);
+        let models = provider_models_for_plan(provider, self.plan);
         let items: Vec<SelectorItem> = models
             .iter()
             .map(|m| SelectorItem {
@@ -100,7 +127,7 @@ impl SetupState {
             })
             .collect();
         self.selector = Some(SelectorState::new(
-            format!("Select Model / 选择模型 ({})", provider.label),
+            format!("Select Model / 选择模型 ({})", self.provider.unwrap().label),
             items,
             true,
         ));
@@ -165,9 +192,23 @@ impl SetupState {
     }
 }
 
-fn provider_models_slug(slug: &str) -> Vec<ModelInfo> {
-    use crate::providers::parse_provider;
-    provider_models(parse_provider(slug))
+fn parse_provider_entry(slug: &str) -> Provider {
+    crate::providers::parse_provider(slug)
+}
+
+fn plan_detail(provider: Provider, plan: ApiPlan) -> &'static str {
+    match (provider, plan) {
+        (Provider::Volcengine, ApiPlan::Agent) => "api/plan/v3 · 订阅制，含多模态",
+        (Provider::Volcengine, ApiPlan::Coding) => "api/coding/v3 · 编程套餐",
+        (Provider::Volcengine, ApiPlan::Standard) => "api/v3 · 按量付费",
+        (Provider::Bailian, ApiPlan::Coding) => "coding.dashscope.aliyuncs.com/v1",
+        (Provider::Bailian, ApiPlan::Standard) => "按量付费",
+        (Provider::Moonshot, ApiPlan::Coding) => "api.kimi.com/coding/v1 · Kimi Code 会员",
+        (Provider::Moonshot, ApiPlan::Standard) => "api.moonshot.cn/v1 · 按量付费",
+        (Provider::Zhipu, ApiPlan::Coding) => "api/coding/paas/v4 · GLM Coding Plan",
+        (Provider::Zhipu, ApiPlan::Standard) => "api/paas/v4 · 按量付费",
+        _ => "",
+    }
 }
 
 pub async fn run_setup() -> Result<()> {
@@ -252,9 +293,15 @@ fn handle_selector_key(key: KeyEvent, state: &mut SetupState) {
                             if p.slug == "custom" {
                                 state.start_custom_url();
                             } else {
-                                state.start_model_select();
+                                state.start_plan_select();
                             }
                         }
+                    }
+                    Phase::Plan => {
+                        if let Some(plan_slug) = item.data.as_deref() {
+                            state.plan = ApiPlan::parse(plan_slug);
+                        }
+                        state.start_model_select();
                     }
                     Phase::Model => {
                         state.model = Some(item.label.clone());
@@ -300,21 +347,36 @@ fn handle_enter(state: &mut SetupState) {
 
 fn write_config(state: &SetupState) -> Result<()> {
     let provider = state.provider.unwrap();
+    let plan = state.plan;
     let model = state
         .model
         .as_deref()
-        .unwrap_or_else(|| config::default_model_for_provider(provider.slug));
+        .unwrap_or_else(|| config::default_model_for_provider_plan(provider.slug, plan.slug()));
     let base_url = state.base_url.as_deref();
     let api_key_env = if provider.slug == "custom" {
         Some("MY_AGENT_API_KEY")
     } else {
         Some(provider.api_key_env)
     };
+    let plan_str = if provider.slug != "custom" && plan != ApiPlan::Standard {
+        Some(plan.slug())
+    } else {
+        None
+    };
 
-    let content = config::render_agent_toml(provider.slug, model, base_url, api_key_env);
+    let content = config::render_agent_toml(
+        provider.slug,
+        model,
+        base_url,
+        api_key_env,
+        plan_str,
+    );
     std::fs::write("agent.toml", &content)?;
 
     let mut env_lines = vec![format!("MY_AGENT_PROVIDER={}", provider.slug)];
+    if plan != ApiPlan::Standard && provider.slug != "custom" {
+        env_lines.push(format!("MY_AGENT_PLAN={}", plan.slug()));
+    }
     if provider.slug == "custom" {
         if let Some(ref url) = state.base_url {
             env_lines.push(format!("MY_AGENT_BASE_URL={url}"));
@@ -326,7 +388,12 @@ fn write_config(state: &SetupState) -> Result<()> {
     std::fs::write(".env", env_lines.join("\n") + "\n")?;
 
     eprintln!("[setup] Configuration written: agent.toml + .env");
-    eprintln!("[setup] Provider: {} | Model: {}", provider.label, model);
+    eprintln!(
+        "[setup] Provider: {} | Plan: {} | Model: {}",
+        provider.label,
+        plan.label(),
+        model
+    );
     Ok(())
 }
 
@@ -335,7 +402,7 @@ fn draw(f: &mut Frame, state: &mut SetupState) {
     f.render_widget(Clear, area);
 
     let (title, lines) = match &state.phase {
-        Phase::Provider | Phase::Model => {
+        Phase::Provider | Phase::Plan | Phase::Model => {
             if let Some(ref sel) = state.selector {
                 draw_selector(f, area, sel);
                 return;

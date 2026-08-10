@@ -19,12 +19,29 @@ base_url = "https://ai-gateway.mxcdp.com"
 # Optional: custom API key env var name (defaults to the provider's standard name).
 api_key_env = "MY_AGENT_API_KEY"
 
+# 可选：API 套餐（standard / coding / agent）。仅部分供应商支持套餐端点：
+#   volcengine: standard(按量 /api/v3) | coding(/api/coding/v3) | agent(/api/plan/v3)
+#   bailian:    standard(按量) | coding(coding.dashscope.aliyuncs.com/v1)
+#   moonshot:   standard(api.moonshot.cn/v1) | coding(api.kimi.com/coding/v1)
+#   zhipu:      standard(api/paas/v4) | coding(api/coding/paas/v4)
+# 注意：套餐 API Key 与按量付费 Key 不互通，需在对应套餐控制台单独创建。
+# 优先级：MY_AGENT_PLAN 环境变量 > 此处配置 > standard。
+# Optional: API plan (standard / coding / agent). Only some providers support plan endpoints.
+# Plan API keys are NOT interchangeable with pay-as-you-go keys.
+# Priority: MY_AGENT_PLAN env > this config > standard.
+# plan = "agent"
+
 [agent]
 # 默认模型：需与供应商匹配。
-# DeepSeek: deepseek-v4-pro / deepseek-v4-flash
-# Bailian: kimi/kimi-k3 / qwen-plus / qwen-max
-# Moonshot: kimi-k3 / kimi-k2.7-code-highspeed
-# Volcengine: doubao-1-5-pro-256k / doubao-1-5-lite-32k / deepseek-r1-250120
+# DeepSeek:  deepseek-v4-pro / deepseek-v4-flash
+# Bailian:   qwen3.8-max / qwen3.7-plus / qwen3.7-flash / qwen-plus
+# Moonshot:  kimi-k3 / kimi-k2.7-code-highspeed
+# Volcengine: doubao-seed-evolving / doubao-seed-2-1-pro-260628 / doubao-seed-2-1-turbo-260628
+# OpenAI:    gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna
+# Claude:    claude-fable-5 / claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5
+# Gemini:    gemini-3.1-pro-preview / gemini-3.6-flash / gemini-3.5-flash-lite
+# MiMo:      mimo-v2.5-pro / mimo-v2.5
+# Zhipu:     glm-5.2 / glm-5
 # 切换模型用 REPL 命令：model <slug>
 default_model = "glm-latest"
 # 自主循环上限：agent 最多执行的轮数。

@@ -143,6 +143,11 @@ pub struct ProviderSection {
     pub base_url: Option<String>,
     /// 自定义 API key 环境变量名；为空时按供应商自动选择。
     pub api_key_env: Option<String>,
+    /// API 套餐：standard（按量付费，默认）/ coding / agent。
+    /// 仅部分供应商支持套餐端点（volcengine / bailian / moonshot / zhipu）。
+    /// `MY_AGENT_PLAN` 环境变量优先于此值。
+    #[serde(default)]
+    pub plan: Option<String>,
 }
 
 /// `[agent]` 小节：默认模型与循环上限。
@@ -224,6 +229,9 @@ fn merge_provider_fallback(project: &mut Config, global: Config) {
     if project.provider.api_key_env.is_none() {
         project.provider.api_key_env = g.api_key_env;
     }
+    if project.provider.plan.is_none() {
+        project.provider.plan = g.plan;
+    }
     // 全局 key 回退：项目 [keys] 没有的条目用全局补全（项目优先，不覆盖已设的）。
     // Global key fallback: entries missing from the project [keys] are backfilled from
     // the global config (project wins; existing entries are not overwritten).
@@ -235,15 +243,31 @@ fn merge_provider_fallback(project: &mut Config, global: Config) {
 /// 根据供应商 slug 返回推荐默认模型。
 /// Return a recommended default model for the given provider slug.
 pub fn default_model_for_provider(provider: &str) -> &'static str {
-    match provider.to_lowercase().as_str() {
-        "bailian" => "kimi/kimi-k3",
-        "moonshot" | "kimi" => "kimi-k3",
-        "volcengine" | "volcanoark" | "ark" | "火山" => "doubao-1-5-pro-256k",
-        "openai" => "gpt-4o",
-        "claude" | "anthropic" => "claude-sonnet-4-6",
-        "mimo" | "xiaomi" => "mimo-v2.5-pro",
-        "gemini" | "google" => "gemini-2.5-pro",
-        "zhipu" | "glm" | "bigmodel" => "glm-5.2",
+    default_model_for_provider_plan(provider, "standard")
+}
+
+/// 根据供应商 slug + 套餐返回推荐默认模型。
+/// Return a recommended default model for the given provider slug and plan.
+pub fn default_model_for_provider_plan(provider: &str, plan: &str) -> &'static str {
+    let p = provider.to_lowercase();
+    let plan = crate::providers::ApiPlan::parse(plan);
+    match (p.as_str(), plan) {
+        ("volcengine" | "volcanoark" | "ark" | "火山", crate::providers::ApiPlan::Agent) => {
+            "doubao-seed-evolving"
+        }
+        ("volcengine" | "volcanoark" | "ark" | "火山", crate::providers::ApiPlan::Coding) => {
+            "doubao-seed-2.0-code"
+        }
+        ("volcengine" | "volcanoark" | "ark" | "火山", _) => "doubao-seed-evolving",
+        ("bailian", crate::providers::ApiPlan::Coding) => "qwen3-coder-plus",
+        ("bailian", _) => "qwen3.7-plus",
+        ("moonshot" | "kimi", crate::providers::ApiPlan::Coding) => "kimi-for-coding",
+        ("moonshot" | "kimi", _) => "kimi-k3",
+        ("zhipu" | "glm" | "bigmodel", _) => "glm-5.2",
+        ("openai", _) => "gpt-5.6-sol",
+        ("claude" | "anthropic", _) => "claude-sonnet-5",
+        ("mimo" | "xiaomi", _) => "mimo-v2.5-pro",
+        ("gemini" | "google", _) => "gemini-3.6-flash",
         _ => "deepseek-v4-pro",
     }
 }
@@ -284,7 +308,13 @@ fn generate_agent_toml(path: &str) -> anyhow::Result<()> {
         default_model_for_provider(&provider).to_string()
     };
 
-    let content = render_agent_toml(&provider, &model, base_url.as_deref(), api_key_env.as_deref());
+    let content = render_agent_toml(
+        &provider,
+        &model,
+        base_url.as_deref(),
+        api_key_env.as_deref(),
+        None,
+    );
     std::fs::write(path, &content)?;
     eprintln!(
         "[config] agent.toml 不存在，已从全局配置自动生成: {path}\n\
@@ -299,8 +329,12 @@ pub(crate) fn render_agent_toml(
     model: &str,
     base_url: Option<&str>,
     api_key_env: Option<&str>,
+    plan: Option<&str>,
 ) -> String {
     let mut provider_lines = vec![format!("provider = \"{provider}\"")];
+    if let Some(p) = plan {
+        provider_lines.push(format!("plan = \"{p}\""));
+    }
     if let Some(url) = base_url {
         provider_lines.push(format!("base_url = \"{url}\""));
     }
@@ -553,15 +587,39 @@ MOONSHOT_API_KEY = "global-moon"
     #[test]
     fn default_model_for_each_provider() {
         assert_eq!(default_model_for_provider("deepseek"), "deepseek-v4-pro");
-        assert_eq!(default_model_for_provider("bailian"), "kimi/kimi-k3");
+        assert_eq!(default_model_for_provider("bailian"), "qwen3.7-plus");
         assert_eq!(default_model_for_provider("moonshot"), "kimi-k3");
-        assert_eq!(default_model_for_provider("volcengine"), "doubao-1-5-pro-256k");
-        assert_eq!(default_model_for_provider("openai"), "gpt-4o");
-        assert_eq!(default_model_for_provider("claude"), "claude-sonnet-4-6");
+        assert_eq!(default_model_for_provider("volcengine"), "doubao-seed-evolving");
+        assert_eq!(default_model_for_provider("openai"), "gpt-5.6-sol");
+        assert_eq!(default_model_for_provider("claude"), "claude-sonnet-5");
         assert_eq!(default_model_for_provider("mimo"), "mimo-v2.5-pro");
-        assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
+        assert_eq!(default_model_for_provider("gemini"), "gemini-3.6-flash");
         assert_eq!(default_model_for_provider("zhipu"), "glm-5.2");
         assert_eq!(default_model_for_provider("unknown"), "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn default_model_respects_plan() {
+        assert_eq!(
+            default_model_for_provider_plan("volcengine", "agent"),
+            "doubao-seed-evolving"
+        );
+        assert_eq!(
+            default_model_for_provider_plan("volcengine", "coding"),
+            "doubao-seed-2.0-code"
+        );
+        assert_eq!(
+            default_model_for_provider_plan("bailian", "coding"),
+            "qwen3-coder-plus"
+        );
+        assert_eq!(
+            default_model_for_provider_plan("moonshot", "coding"),
+            "kimi-for-coding"
+        );
+        assert_eq!(
+            default_model_for_provider_plan("moonshot", "standard"),
+            "kimi-k3"
+        );
     }
 
     #[test]

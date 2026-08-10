@@ -894,7 +894,8 @@ fn handle_command(
         }
         ReplCommand::Models => {
             let provider = crate::providers::current_provider();
-            let mut items: Vec<SelectorItem> = crate::providers::provider_models(provider)
+            let plan = crate::providers::current_plan();
+            let mut items: Vec<SelectorItem> = crate::providers::provider_models_for_plan(provider, plan)
                 .into_iter()
                 .map(|m| SelectorItem {
                     label: m.slug,
@@ -921,6 +922,10 @@ fn handle_command(
                 items,
                 true,
             ));
+        }
+        ReplCommand::Plan { plan } => {
+            let msg = ctx.cmd_plan(plan);
+            state.push_event(AgentEvent::Info(msg));
         }
         ReplCommand::Context => {
             let mut out = format!(
@@ -1455,6 +1460,13 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
 
     lines.push(Line::styled("Provider", theme::status_dim()));
     lines.push(Line::styled(format!(" {}", state.provider), theme::status_model()));
+    let plan = crate::providers::current_plan();
+    if plan != crate::providers::ApiPlan::Standard {
+        lines.push(Line::styled(
+            format!("  ↳ {}", plan.label()),
+            theme::status_dim(),
+        ));
+    }
     lines.push(Line::default());
 
     lines.push(Line::styled("Model", theme::status_dim()));

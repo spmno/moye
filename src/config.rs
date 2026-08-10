@@ -121,7 +121,17 @@ static CONFIG: OnceLock<Arc<Config>> = OnceLock::new();
 /// `[provider]` fields from the global `~/.config/my-agent/config.toml` as a fallback,
 /// before caching and returning the shared Arc.
 /// Precedence: env vars > project agent.toml > global config.toml > provider default.
+///
+/// 如果 `agent.toml` 不存在，先从全局配置 + 默认模板自动生成一个，再继续加载。
+/// If `agent.toml` doesn't exist, auto-generate one from the global config + default
+/// template first, then proceed to load it.
 pub fn init(path: &str) -> anyhow::Result<Arc<Config>> {
+    // agent.toml 不存在时，从全局配置自动生成一个（含全部小节 + 合理默认值）。
+    // When agent.toml is missing, auto-generate one from the global config + defaults.
+    if !std::path::Path::new(path).exists() {
+        generate_agent_toml(path)?;
+    }
+
     let mut cfg = Config::load(path)?;
     // 全局配置仅作为 provider 小节的 fallback（项目优先）。
     // Global config only backfills the provider section (project wins).
@@ -172,6 +182,169 @@ fn merge_provider_fallback(project: &mut Config, global: Config) {
     }
 }
 
+/// 根据供应商 slug 返回推荐默认模型。
+/// Return a recommended default model for the given provider slug.
+fn default_model_for_provider(provider: &str) -> &'static str {
+    match provider.to_lowercase().as_str() {
+        "bailian" => "kimi/kimi-k3",
+        "moonshot" | "kimi" => "kimi-k3",
+        "volcengine" | "volcanoark" | "ark" | "火山" => "doubao-1-5-pro-256k",
+        "custom" | "openai" | "glm" => "gpt-4o",
+        _ => "deepseek-v4-pro",
+    }
+}
+
+/// 当项目根目录没有 `agent.toml` 时，从全局配置 `~/.config/my-agent/config.toml`
+/// 的 `[provider]` 信息 + 合理默认值自动生成一个完整的 `agent.toml`。
+/// When the project root has no `agent.toml`, auto-generate a complete one from
+/// the global config's `[provider]` info + sensible defaults.
+///
+/// 生成的文件包含全部小节（provider / agent / context / agents.* / memory /
+/// evolution / sandbox），API Key 不写入项目文件（仍在全局 config.toml 的 [keys]
+/// 中，运行时通过 merge_provider_fallback 回退读取）。
+/// The generated file includes all sections. API keys are NOT written to the project
+/// file (they stay in the global config.toml's [keys], backfilled at runtime via
+/// merge_provider_fallback).
+fn generate_agent_toml(path: &str) -> anyhow::Result<()> {
+    // 尝试读取全局配置获取 provider 信息；全局配置不存在时用 deepseek 默认。
+    // Try to read the global config for provider settings; fall back to deepseek.
+    let (provider, base_url, api_key_env) = if let Some(global_path) = global_config_path() {
+        if global_path.exists() {
+            match Config::load(global_path.to_string_lossy().as_ref()) {
+                Ok(global) => (
+                    global
+                        .provider
+                        .provider
+                        .unwrap_or_else(|| "deepseek".to_string()),
+                    global.provider.base_url,
+                    global.provider.api_key_env,
+                ),
+                Err(_) => ("deepseek".to_string(), None, None),
+            }
+        } else {
+            ("deepseek".to_string(), None, None)
+        }
+    } else {
+        ("deepseek".to_string(), None, None)
+    };
+
+    let model = default_model_for_provider(&provider);
+
+    // 构建 [provider] 小节：只包含全局配置中实际存在的字段。
+    // Build the [provider] section: only include fields actually present in the global config.
+    let mut provider_lines = vec![format!("provider = \"{provider}\"")];
+    if let Some(ref url) = base_url {
+        provider_lines.push(format!("base_url = \"{url}\""));
+    }
+    if let Some(ref env) = api_key_env {
+        provider_lines.push(format!("api_key_env = \"{env}\""));
+    }
+    let provider_section = provider_lines.join("\n");
+
+    let content = format!(
+        r#"# Agent 运行配置（自动生成）。
+# Auto-generated from global config (~/.config/my-agent/config.toml) + defaults.
+# 可按需修改各参数。agent.toml 已在 .gitignore 中，不会被提交。
+# Edit as needed. agent.toml is git-ignored and won't be committed.
+
+[provider]
+{provider_section}
+
+[agent]
+# 默认模型：需与供应商匹配。请根据你的供应商修改。
+# Default model: must match your provider. Please adjust for your provider.
+default_model = "{model}"
+max_turns = 50
+
+[context]
+max_output_tokens = 4096
+compaction_threshold = 0.5
+keep_recent_turns = 2
+max_bash_output_chars = 20000
+max_read_lines = 500
+microcompact_threshold = 20000
+microcompact_protected_results = 3
+
+[agents.orchestrator]
+model = "{model}"
+preamble = "AGENTS.md"
+permissions.read_file = "allow"
+permissions.run_bash_readonly = "allow"
+permissions.run_bash_mutating = "deny"
+permissions.edit_file = "deny"
+permissions.write_file = "deny"
+permissions.web_fetch = "allow"
+permissions.web_search = "allow"
+
+[agents.investigator]
+model = "{model}"
+preamble = "prompts/investigator.md"
+max_turns = 50
+permissions.read_file = "allow"
+permissions.run_bash_readonly = "allow"
+permissions.run_bash_mutating = "deny"
+permissions.edit_file = "deny"
+permissions.write_file = "deny"
+permissions.web_fetch = "allow"
+permissions.web_search = "allow"
+
+[agents.planner]
+model = "{model}"
+preamble = "prompts/planner.md"
+permissions.read_file = "allow"
+permissions.run_bash_readonly = "allow"
+permissions.run_bash_mutating = "deny"
+permissions.edit_file = "deny"
+permissions.write_file = "deny"
+permissions.web_fetch = "allow"
+permissions.web_search = "allow"
+
+[agents.builder]
+model = "{model}"
+preamble = "prompts/builder.md"
+max_turns = 100
+permissions.read_file = "allow"
+permissions.run_bash_readonly = "allow"
+permissions.run_bash_mutating = "allow"
+permissions.edit_file = "allow"
+permissions.write_file = "allow"
+permissions.web_fetch = "allow"
+permissions.web_search = "allow"
+
+[agents.auditor]
+model = "{model}"
+preamble = "prompts/auditor.md"
+permissions.read_file = "allow"
+permissions.run_bash_readonly = "allow"
+permissions.run_bash_mutating = "deny"
+permissions.edit_file = "deny"
+permissions.write_file = "deny"
+permissions.web_fetch = "deny"
+permissions.web_search = "deny"
+
+[memory]
+dir = "memory"
+conversation_file = "conversations.jsonl"
+lessons_file = "lessons.jsonl"
+rules_file = "rules.json"
+
+[evolution]
+rule_escalation_threshold = 3
+
+[sandbox]
+authorized_dirs = []
+"#
+    );
+
+    std::fs::write(path, &content)?;
+    eprintln!(
+        "[config] agent.toml 不存在，已从全局配置自动生成: {path}\n\
+         [config] Auto-generated agent.toml from global config.\n\
+         [config] 默认模型 = {model}，请确认是否匹配你的供应商，按需修改。"
+    );
+    Ok(())
+}
+
 /// 返回缓存的配置；未初始化（如纯单元测试）时返回 None。
 /// Returns the cached config, or None when not yet initialized (e.g. unit tests).
 pub fn config() -> Option<&'static Config> {
@@ -181,6 +354,7 @@ pub fn config() -> Option<&'static Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::Permission;
     use std::path::PathBuf;
 
     #[test]
@@ -304,5 +478,49 @@ MOONSHOT_API_KEY = "global-moon"
         merge_provider_fallback(&mut project, global);
         assert_eq!(project.keys.get("DEEPSEEK_API_KEY").unwrap(), "project-key");
         assert_eq!(project.keys.get("MOONSHOT_API_KEY").unwrap(), "global-moon");
+    }
+
+    #[test]
+    fn default_model_for_each_provider() {
+        assert_eq!(default_model_for_provider("deepseek"), "deepseek-v4-pro");
+        assert_eq!(default_model_for_provider("bailian"), "kimi/kimi-k3");
+        assert_eq!(default_model_for_provider("moonshot"), "kimi-k3");
+        assert_eq!(default_model_for_provider("volcengine"), "doubao-1-5-pro-256k");
+        assert_eq!(default_model_for_provider("custom"), "gpt-4o");
+        assert_eq!(default_model_for_provider("unknown"), "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn generate_agent_toml_produces_valid_config() {
+        // 生成的 agent.toml 应能被 Config::load 正确解析。
+        // The generated agent.toml should be parseable by Config::load.
+        let tmp = std::env::temp_dir().join("my-agent-test-gen.toml");
+        generate_agent_toml(tmp.to_string_lossy().as_ref()).unwrap();
+        let raw = std::fs::read_to_string(&tmp).unwrap();
+        let cfg: Config = toml::from_str(&raw).unwrap();
+        // provider 应有值（deepseek 或全局配置的值）。
+        assert!(cfg.provider.provider.is_some());
+        // 5 个角色都应存在。
+        assert!(cfg.roles.contains_key("orchestrator"));
+        assert!(cfg.roles.contains_key("investigator"));
+        assert!(cfg.roles.contains_key("planner"));
+        assert!(cfg.roles.contains_key("builder"));
+        assert!(cfg.roles.contains_key("auditor"));
+        // 默认模型应与 provider 匹配。
+        let provider = cfg.provider.provider.as_deref().unwrap_or("deepseek");
+        let expected_model = default_model_for_provider(provider);
+        assert_eq!(cfg.agent.default_model, expected_model);
+        assert_eq!(cfg.roles.get("builder").unwrap().model, expected_model);
+        // builder 应有写权限。
+        assert_eq!(
+            cfg.roles.get("builder").unwrap().permissions.write_file,
+            Permission::Allow
+        );
+        // auditor 应拒绝 web 访问。
+        assert_eq!(
+            cfg.roles.get("auditor").unwrap().permissions.web_fetch,
+            Permission::Deny
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 }

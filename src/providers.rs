@@ -37,7 +37,7 @@ impl Provider {
         match raw.to_lowercase().as_str() {
             "bailian" => Provider::Bailian,
             "moonshot" | "kimi" => Provider::Moonshot,
-            "volcengine" | "ark" | "火山" => Provider::Volcengine,
+            "volcengine" | "volcanoark" | "ark" | "火山" => Provider::Volcengine,
             "custom" | "openai" | "glm" => Provider::Custom,
             _ => Provider::DeepSeek,
         }
@@ -127,7 +127,7 @@ fn parse_provider(raw: &str) -> Provider {
     match raw.to_lowercase().as_str() {
         "bailian" => Provider::Bailian,
         "moonshot" | "kimi" => Provider::Moonshot,
-        "volcengine" | "ark" | "火山" => Provider::Volcengine,
+        "volcengine" | "volcanoark" | "ark" | "火山" => Provider::Volcengine,
         "custom" | "openai" | "glm" => Provider::Custom,
         _ => Provider::DeepSeek,
     }
@@ -355,5 +355,27 @@ mod tests {
         // Unknown model should fall back to provider default, no panic.
         let limit = context_limit_for_model("unknown-model-xyz");
         assert!(limit > 0);
+    }
+
+    #[test]
+    fn parse_provider_accepts_volcanoark_alias() {
+        assert_eq!(parse_provider("volcanoark"), Provider::Volcengine);
+        assert_eq!(parse_provider("VOLCANOARK"), Provider::Volcengine);
+        assert_eq!(parse_provider("volcengine"), Provider::Volcengine);
+        assert_eq!(parse_provider("ark"), Provider::Volcengine);
+    }
+
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn from_env_accepts_volcanoark_alias() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("MY_AGENT_PROVIDER", "volcanoark");
+        }
+        assert_eq!(Provider::from_env(), Provider::Volcengine);
+        unsafe {
+            std::env::remove_var("MY_AGENT_PROVIDER");
+        }
     }
 }

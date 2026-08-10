@@ -50,6 +50,8 @@ pub struct ToolPerms {
     #[serde(default = "default_ask")]
     pub edit_file: Permission,
     #[serde(default = "default_ask")]
+    pub write_file: Permission,
+    #[serde(default = "default_ask")]
     pub web_fetch: Permission,
     #[serde(default = "default_ask")]
     pub web_search: Permission,
@@ -73,6 +75,7 @@ impl Default for ToolPerms {
             run_bash_readonly: Permission::Allow,
             run_bash_mutating: Permission::Ask,
             edit_file: Permission::Ask,
+            write_file: Permission::Ask,
             web_fetch: Permission::Ask,
             web_search: Permission::Ask,
         }
@@ -283,6 +286,7 @@ impl AgentRegistry {
         let params = crate::providers::provider_additional_params();
         let max_turns = self.max_turns();
         info!("[build] role={key} model={model} max_turns={max_turns}");
+        let max_output = self.context_config().max_output_tokens as u64;
         let agent = if with_tools {
             let builder = client
                 .agent(&model)
@@ -290,7 +294,9 @@ impl AgentRegistry {
                 .temperature(crate::providers::Provider::clamp_temperature(0.7))
                 .additional_params(params)
                 .default_max_turns(max_turns);
-            crate::tools::add_builtin_tools(builder, self.context_config()).build()
+            crate::tools::add_builtin_tools(builder, self.context_config())
+                .max_tokens(max_output)
+                .build()
         } else {
             client
                 .agent(&model)
@@ -298,6 +304,7 @@ impl AgentRegistry {
                 .temperature(crate::providers::Provider::clamp_temperature(0.7))
                 .additional_params(params)
                 .default_max_turns(max_turns)
+                .max_tokens(max_output)
                 .build()
         };
         Ok(RoleAgent {

@@ -607,7 +607,8 @@ fn format_usage(usage: &Usage) -> String {
 pub fn decide_tier(perms: &ToolPerms, tool_name: &str, args: &str) -> Permission {
     match tool_name {
         "read_file" => perms.read_file,
-        "edit_file" | "write_file" => perms.edit_file,
+        "edit_file" => perms.edit_file,
+        "write_file" => perms.write_file,
         "web_fetch" => perms.web_fetch,
         "web_search" => perms.web_search,
         "run_bash" => {
@@ -696,6 +697,7 @@ pub async fn run_autonomous(
             .session_model()
             .or_else(|| registry.role_config(role).map(|c| c.model.clone()))
             .unwrap_or_else(|| registry.effective_model());
+        let model_for_log = model.clone();
         let context_limit = crate::providers::context_limit_for_model(&model);
         let context_config = registry.context_config().clone();
         let context_client = registry.create_client()?;
@@ -727,6 +729,7 @@ pub async fn run_autonomous(
             Err(e) if is_stream_error(&e) && attempt < MAX_RETRIES => {
                 turns_used = *captured_turn.lock().unwrap();
                 let hist_len = captured_history.lock().unwrap().len();
+                let err_snippet: String = e.to_string().chars().take(200).collect();
                 warn!(
                     error = %e,
                     error_debug = ?e,
@@ -736,17 +739,22 @@ pub async fn run_autonomous(
                     turns_used,
                     total_max_turns,
                     captured_history_len = hist_len,
+                    model = %model_for_log,
                     "SSE disconnect, retrying with preserved history"
                 );
                 let _ = tx.send(AgentEvent::Info(format!(
-                    "[\u{91cd}\u{8bd5}] {role:?} \u{7b2c} {}/{} \u{6b21}\u{ff1a}SSE \u{8fde}\u{63a5}\u{4e2d}\u{65ad}\u{ff0c}\u{5df2}\u{4fdd}\u{7559}\u{5bf9}\u{8bdd}\u{5386}\u{53f2}\u{ff0c}\u{7ee7}\u{7eed}\u{6267}\u{884c}",
+                    "[\u{91cd}\u{8bd5}] {role:?} \u{7b2c} {}/{} \u{6b21}\u{ff1a}SSE \u{8fde}\u{63a5}\u{4e2d}\u{65ad}\u{ff08}\u{5df2}\u{7528}\u{8f6e}\u{6570}={turns_used}\u{ff09}\u{3002}\u{9519}\u{8bef}: {err_snippet}",
                     attempt + 1,
                     MAX_RETRIES
                 )));
                 continue;
             }
             Err(e) => {
+                let err_snippet: String = e.to_string().chars().take(300).collect();
                 warn!(error = %e, error_debug = ?e, role = ?role, "stream error (non-retryable)");
+                let _ = tx.send(AgentEvent::Error(format!(
+                    "\u{6d41}\u{9519}\u{8bef}\u{ff08}\u{4e0d}\u{53ef}\u{91cd}\u{8bd5}\u{ff09}: {err_snippet}"
+                )));
                 return Err(e);
             }
         }
@@ -827,11 +835,15 @@ pub async fn consume_stream<R>(
                     }
                     warn!(
                         timeout_secs = CHUNK_TIMEOUT.as_secs(),
+                        accumulated_output_chars = output.len(),
+                        accumulated_reasoning_chars = all_reasoning.len(),
                         "SSE idle timeout, connection may have dropped"
                     );
                     return Err(anyhow::anyhow!(
-                        "SSE \u{7a7a}\u{95f2}\u{8d85}\u{65f6}\u{ff08}{}\u{79d2}\u{65e0}\u{6570}\u{636e}\u{ff09}\u{ff0c}\u{53ef}\u{80fd}\u{8fde}\u{63a5}\u{5df2}\u{65ad}\u{5f00}",
-                        CHUNK_TIMEOUT.as_secs()
+                        "SSE \u{7a7a}\u{95f2}\u{8d85}\u{65f6}\u{ff08}{}\u{79d2}\u{65e0}\u{6570}\u{636e}\u{ff09}\u{ff0c}\u{53ef}\u{80fd}\u{8fde}\u{63a5}\u{5df2}\u{65ad}\u{5f00}\u{3002}\u{5df2}\u{6536}\u{5230} {} \u{5b57}\u{7b26}\u{6587}\u{672c}\u{3001}{} \u{5b57}\u{7b26}\u{63a8}\u{7406}\u{5185}\u{5bb9}",
+                        CHUNK_TIMEOUT.as_secs(),
+                        output.len(),
+                        all_reasoning.len()
                     ));
                 }
             },
@@ -866,13 +878,21 @@ pub async fn consume_stream<R>(
                 output = resp.output;
             }
             Err(e) => {
-                warn!(error = %e, error_debug = ?e, "stream item error");
+                warn!(
+                    error = %e,
+                    error_debug = ?e,
+                    accumulated_output_chars = output.len(),
+                    accumulated_reasoning_chars = all_reasoning.len(),
+                    "stream item error"
+                );
                 let msg = e.to_string();
                 if msg.contains("MaxTurnsError") {
                     return Err(anyhow::anyhow!("{e}"));
                 }
                 return Err(anyhow::anyhow!(
-                    "\u{6d41}\u{5f0f}\u{9519}\u{8bef}: {e}"
+                    "\u{6d41}\u{5f0f}\u{9519}\u{8bef}: {e}\u{3002}\u{5df2}\u{6536}\u{5230} {} \u{5b57}\u{7b26}\u{6587}\u{672c}\u{3001}{} \u{5b57}\u{7b26}\u{63a8}\u{7406}",
+                    output.len(),
+                    all_reasoning.len()
                 ));
             }
             _ => {}
@@ -909,6 +929,7 @@ fn build_runner_agent(
     let max_turns = registry.max_turns_for_role(role);
     info!("[runner] role={role:?} model={model} max_turns={max_turns}");
     let params = crate::providers::provider_additional_params();
+    let max_output = registry.context_config().max_output_tokens as u64;
     let builder = client
         .agent(&model)
         .preamble(&preamble)
@@ -916,6 +937,7 @@ fn build_runner_agent(
     let agent = crate::tools::add_builtin_tools(builder, registry.context_config())
         .additional_params(params)
         .default_max_turns(max_turns)
+        .max_tokens(max_output)
         .build();
     Ok(agent)
 }
@@ -930,6 +952,7 @@ mod tests {
             run_bash_readonly: Permission::Allow,
             run_bash_mutating: Permission::Ask,
             edit_file: Permission::Ask,
+            write_file: Permission::Ask,
             web_fetch: Permission::Allow,
             web_search: Permission::Allow,
         }

@@ -31,7 +31,7 @@ default_model = "glm-latest"
 max_turns = 30
 
 [context]
-max_output_tokens = 4096
+max_output_tokens = 32768
 compaction_threshold = 0.5
 keep_recent_turns = 2
 max_bash_output_chars = 20000
@@ -51,6 +51,7 @@ permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
 permissions.run_bash_mutating = "deny"
 permissions.edit_file = "deny"
+permissions.write_file = "deny"
 permissions.web_fetch = "allow"
 permissions.web_search = "allow"
 
@@ -62,6 +63,7 @@ permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
 permissions.run_bash_mutating = "deny"
 permissions.edit_file = "deny"
+permissions.write_file = "deny"
 permissions.web_fetch = "allow"
 permissions.web_search = "allow"
 
@@ -72,6 +74,7 @@ permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
 permissions.run_bash_mutating = "deny"
 permissions.edit_file = "deny"
+permissions.write_file = "deny"
 permissions.web_fetch = "allow"
 permissions.web_search = "allow"
 
@@ -82,6 +85,7 @@ permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
 permissions.run_bash_mutating = "allow"
 permissions.edit_file = "allow"
+permissions.write_file = "allow"
 permissions.web_fetch = "allow"
 permissions.web_search = "allow"
 
@@ -92,6 +96,7 @@ permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
 permissions.run_bash_mutating = "deny"
 permissions.edit_file = "deny"
+permissions.write_file = "deny"
 permissions.web_fetch = "deny"
 permissions.web_search = "deny"
 

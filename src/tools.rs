@@ -248,6 +248,97 @@ impl PortableTool for RunBash {
     }
 }
 
+/// `run_file` 工具的输入参数：脚本文件路径。
+/// Input args for the `run_file` tool: a script file path.
+#[derive(Deserialize)]
+struct RunFileArgs {
+    path: String,
+}
+
+/// 执行脚本文件的工具。按扩展名自动选择解释器：
+/// `.sh` → bash, `.py` → python3, `.js` → node。
+/// Tool that executes a script file. Auto-selects interpreter by extension:
+/// `.sh` → bash, `.py` → python3, `.js` → node.
+struct RunFile {
+    max_output_chars: usize,
+}
+
+impl PortableTool for RunFile {
+    const NAME: &'static str = "run_file";
+    type Error = ToolError;
+    type Args = RunFileArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        format!(
+            "执行脚本文件并返回 stdout+stderr。按扩展名自动选择解释器：.sh→bash, .py→python3, .js→node。输出截断到 {} 字符。",
+            self.max_output_chars
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "脚本文件路径（支持 .sh / .py / .js）" }
+            },
+            "required": ["path"],
+        })
+    }
+
+    /// 执行脚本：按扩展名选择解释器，收集退出码与输出，截断到 max_output_chars 字符。
+    /// Executes the script: selects interpreter by extension, collects exit code and output,
+    /// truncating combined stdout+stderr to max_output_chars.
+    ///
+    /// 与 RunBash 相同：使用 tokio::process + kill_on_drop 确保 Esc 中断时子进程被清理。
+    /// Same as RunBash: uses tokio::process + kill_on_drop so Esc-abort kills the child process.
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let path = std::path::Path::new(&args.path);
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let interpreter = match ext {
+            "sh" => "bash",
+            "py" => "python3",
+            "js" => "node",
+            _ => {
+                return Err(ToolError(format!(
+                    "不支持的文件类型: .{ext}。支持 .sh / .py / .js"
+                )));
+            }
+        };
+        let out = tokio::process::Command::new(interpreter)
+            .arg(&args.path)
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| ToolError(e.to_string()))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let code = out.status.code().unwrap_or(-1);
+        let combined = if code == 0 {
+            if stderr.is_empty() {
+                stdout
+            } else if stdout.is_empty() {
+                format!("(stderr) {}", stderr)
+            } else {
+                format!("{}\n(stderr) {}", stdout, stderr)
+            }
+        } else {
+            let mut parts = vec![format!("(exit {})", code)];
+            if !stdout.is_empty() {
+                parts.push(stdout);
+            }
+            if !stderr.is_empty() {
+                parts.push(format!("(stderr) {}", stderr));
+            }
+            parts.join("\n")
+        };
+        Ok(crate::context::truncate_at_char_boundary(
+            &combined,
+            self.max_output_chars,
+        ))
+    }
+}
+
 // ─── 联网工具 ───────────────────────────────────────────────────────────
 // ─── Web tools ───────────────────────────────────────────────────────────
 
@@ -855,6 +946,9 @@ pub fn builtin_tools(
     tools.add_tool(RunBash {
         max_bash_output_chars: config.max_bash_output_chars,
     });
+    tools.add_tool(RunFile {
+        max_output_chars: config.max_bash_output_chars,
+    });
     tools.add_tool(WebFetch);
     tools.add_tool(WebSearch);
     // 加载动态工具（由 ToolManifest 重新生成的 mod.rs 提供）
@@ -884,6 +978,9 @@ where
         .tool(WriteFile)
         .tool(RunBash {
             max_bash_output_chars: config.max_bash_output_chars,
+        })
+        .tool(RunFile {
+            max_output_chars: config.max_bash_output_chars,
         })
         .tool(WebFetch)
         .tool(WebSearch)

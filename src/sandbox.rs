@@ -166,7 +166,7 @@ impl Sandbox {
         }
         let parsed = serde_json::from_str::<serde_json::Value>(args).ok()?;
         match tool_name {
-            "read_file" | "edit_file" | "write_file" => {
+            "read_file" | "edit_file" | "write_file" | "run_file" => {
                 let path = parsed.get("path")?.as_str()?;
                 self.check_path(path).err()
             }
@@ -192,7 +192,7 @@ impl Sandbox {
         }
         let parsed = serde_json::from_str::<serde_json::Value>(args).ok();
         match tool_name {
-            "read_file" | "edit_file" | "write_file" => {
+            "read_file" | "edit_file" | "write_file" | "run_file" => {
                 if let Some(path) = parsed
                     .as_ref()
                     .and_then(|v| v.get("path"))

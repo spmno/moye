@@ -255,7 +255,13 @@ impl AgentHook for HitlHook {
             result: "unknown tool".to_string(),
             ok: false,
         });
-        None
+        Some(InvalidToolCallAction::Skip {
+            reason: format!(
+                "\u{5de5}\u{5177} `{}` \u{4e0d}\u{5b58}\u{5728}\u{3002}\u{53ef}\u{7528}\u{5de5}\u{5177}\u{ff1a}{}\u{3002}\u{8bf7}\u{7528}\u{6b63}\u{786e}\u{7684}\u{5de5}\u{5177}\u{540d}\u{91cd}\u{8bd5}\u{3002}",
+                event.tool_name,
+                event.available_tools.join(", "),
+            ),
+        })
     }
 
     async fn on_model_turn_finished(
@@ -567,6 +573,10 @@ fn format_tool_call_desc(tool_name: &str, args: &str) -> String {
             let command = get_str("command").unwrap_or_default();
             format!("run_bash \u{2192} \u{6267}\u{884c}\u{547d}\u{4ee4}: {command}")
         }
+        "run_file" => {
+            let path = get_str("path").unwrap_or_default();
+            format!("run_file \u{2192} \u{6267}\u{884c}\u{811a}\u{672c}: {path}")
+        }
         "web_fetch" => {
             let url = get_str("url").unwrap_or_default();
             format!("web_fetch \u{2192} \u{6293}\u{53d6}\u{7f51}\u{9875}: {url}")
@@ -611,6 +621,7 @@ pub fn decide_tier(perms: &ToolPerms, tool_name: &str, args: &str) -> Permission
         "write_file" => perms.write_file,
         "web_fetch" => perms.web_fetch,
         "web_search" => perms.web_search,
+        "run_file" => perms.run_bash_mutating,
         "run_bash" => {
             let command = serde_json::from_str::<serde_json::Value>(args)
                 .ok()

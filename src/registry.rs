@@ -373,15 +373,33 @@ pub enum Intent {
     Chat,
 }
 
-/// 将用户消息分类为意图，驱动 SDD 管线路由。
-/// Classifies a user message into an intent, driving SDD pipeline routing.
-/// 关键词同时覆盖中文和英文，适配中文模型（DeepSeek/GLM/Kimi）为主的使用场景。
-/// Keywords cover both Chinese and English, adapting to usage scenarios primarily with Chinese models (DeepSeek/GLM/Kimi).
-pub fn classify(message: &str) -> Intent {
+/// 快速路径：明显问句模式直接返回 Chat，跳过 LLM 调用。
+/// Fast path: obvious question patterns return Chat, skipping the LLM call.
+fn is_obvious_question(message: &str) -> bool {
+    let m = message.trim();
+    if m.ends_with('?') || m.ends_with('？') {
+        return true;
+    }
+    let question_markers = [
+        "吗", "么", "呢", "吧", "怎么", "如何", "是否", "会不会",
+        "能不能", "为什么", "是什么", "哪个", "哪些", "哪里", "多少",
+    ];
+    if question_markers.iter().any(|k| m.contains(k)) {
+        return true;
+    }
+    if m.chars().count() <= 4 {
+        return true;
+    }
+    false
+}
+
+/// 关键词降级匹配（LLM 不可用时的 fallback）。
+/// Keyword fallback matching (used when LLM is unavailable).
+pub fn classify_keyword_fallback(message: &str) -> Intent {
     let m = message.to_lowercase();
     let implement_kws = [
         "实现", "添加", "创建", "修复", "编写", "构建", "修改", "重构", "删除", "升级", "更新",
-        "implement", "add", "create", "fix", "write", "build", "refactor", "upgrade", "update",
+        "implement", "refactor", "upgrade", "update",
     ];
     let investigate_kws = [
         "看一下", "调查", "检查", "查找", "怎么", "分析", "对比", "差距",
@@ -394,6 +412,65 @@ pub fn classify(message: &str) -> Intent {
     } else {
         Intent::Chat
     }
+}
+
+/// LLM 意图分类：构建无工具 Agent，发送短 prompt，解析单词响应。
+/// LLM intent classification: builds a tool-less Agent, sends a short prompt, parses the single-word response.
+async fn classify_with_llm(message: &str, registry: &AgentRegistry) -> Option<Intent> {
+    let client = registry.create_client().ok()?;
+    let model = registry
+        .session_model()
+        .or_else(|| registry.role_config(Role::Orchestrator).map(|rc| rc.model.clone()))
+        .unwrap_or_else(|| registry.config.agent.default_model.clone());
+
+    let preamble = "你是一个意图分类器。判断用户消息的意图，只回复一个英文词：\n\
+                    - implement: 要求修改、创建、删除代码或文件\n\
+                    - investigate: 要求查看、分析、理解代码\n\
+                    - chat: 聊天、问答、闲聊\n\
+                    只回复一个词，不要任何解释。";
+
+    let params = crate::providers::provider_additional_params();
+    let agent = client
+        .agent(&model)
+        .preamble(preamble)
+        .temperature(crate::providers::Provider::clamp_temperature(0.0))
+        .additional_params(params)
+        .default_max_turns(1)
+        .max_tokens(20)
+        .build();
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    let stream = agent.runner(message).stream().await;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        crate::agent_loop::consume_stream(stream, None, &tx),
+    )
+    .await
+    .ok()?
+    .ok()?;
+
+    let lower = output.to_lowercase();
+    if lower.contains("implement") {
+        Some(Intent::Implement)
+    } else if lower.contains("investigate") {
+        Some(Intent::Investigate)
+    } else if lower.contains("chat") {
+        Some(Intent::Chat)
+    } else {
+        None
+    }
+}
+
+/// 意图分类入口：快速路径 → LLM → 关键词降级。
+/// Intent classification entry point: fast path → LLM → keyword fallback.
+pub async fn classify_intent(message: &str, registry: &AgentRegistry) -> Intent {
+    if is_obvious_question(message) {
+        return Intent::Chat;
+    }
+    if let Some(intent) = classify_with_llm(message, registry).await {
+        return intent;
+    }
+    classify_keyword_fallback(message)
 }
 
 /// 编排者：先分类意图，再按 SDD 纪律委派给对应的角色 Agent。
@@ -443,7 +520,7 @@ impl Orchestrator {
     }
 
     pub async fn handle(&self, message: &str, tx: &EventSender) -> anyhow::Result<String> {
-        let intent = classify(message);
+        let intent = classify_intent(message, &self.registry).await;
         match intent {
             Intent::Implement => self.run_sdd_pipeline(message, tx).await,
             Intent::Investigate => {
@@ -481,6 +558,11 @@ impl Orchestrator {
             tx,
         )
         .await?;
+
+        // 问答逃生口：如果调查者判断用户消息是问答/咨询，直接返回答案，跳过规划/构建/审计。
+        if investigation.contains("无需实现") {
+            return Ok(investigation);
+        }
 
         // 规划步骤：将调查发现注入 Planner 的 prompt。
         // Planning step: inject investigation findings into Planner's prompt.
@@ -536,19 +618,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classify_upgrade_keywords_route_to_implement() {
-        assert_eq!(classify("在cargo 升级各个package最新版本"), Intent::Implement);
-        assert_eq!(classify("更新依赖到最新版本"), Intent::Implement);
-        assert_eq!(classify("upgrade all packages"), Intent::Implement);
-        assert_eq!(classify("update Cargo.toml"), Intent::Implement);
+    fn keyword_fallback_upgrade_keywords() {
+        assert_eq!(classify_keyword_fallback("在cargo 升级各个package最新版本"), Intent::Implement);
+        assert_eq!(classify_keyword_fallback("更新依赖到最新版本"), Intent::Implement);
+        assert_eq!(classify_keyword_fallback("upgrade all packages"), Intent::Implement);
+        assert_eq!(classify_keyword_fallback("update Cargo.toml"), Intent::Implement);
     }
 
     #[test]
-    fn classify_existing_keywords_still_route_correctly() {
-        assert_eq!(classify("实现一个新功能"), Intent::Implement);
-        assert_eq!(classify("fix the bug in main"), Intent::Implement);
-        assert_eq!(classify("看一下这个模块怎么工作"), Intent::Investigate);
-        assert_eq!(classify("how does auth work"), Intent::Investigate);
-        assert_eq!(classify("你好"), Intent::Chat);
+    fn keyword_fallback_remaining_keywords() {
+        assert_eq!(classify_keyword_fallback("实现一个新功能"), Intent::Implement);
+        assert_eq!(classify_keyword_fallback("重构这段代码"), Intent::Implement);
+        assert_eq!(classify_keyword_fallback("看一下这个模块怎么工作"), Intent::Investigate);
+        assert_eq!(classify_keyword_fallback("how does auth work"), Intent::Investigate);
+        assert_eq!(classify_keyword_fallback("你好"), Intent::Chat);
+    }
+
+    #[test]
+    fn keyword_fallback_removed_generic_english() {
+        assert_eq!(classify_keyword_fallback("cargo build之后"), Intent::Chat);
+        assert_eq!(classify_keyword_fallback("how to fix this?"), Intent::Chat);
+        assert_eq!(classify_keyword_fallback("add a section"), Intent::Chat);
+    }
+
+    #[test]
+    fn obvious_question_detection() {
+        assert!(is_obvious_question("cargo build之后,都会编译吗?"));
+        assert!(is_obvious_question("这个功能怎么用？"));
+        assert!(is_obvious_question("是否支持多线程"));
+        assert!(is_obvious_question("你好"));
+        assert!(!is_obvious_question("实现一个新功能"));
+        assert!(!is_obvious_question("修复登录bug"));
     }
 }

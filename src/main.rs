@@ -43,7 +43,12 @@ async fn main() -> Result<()> {
     }
 
     // 统一解析 agent.toml（仅此一处），各模块共享同一份配置。
+    // 若 agent.toml 不存在，启动首次配置向导（交互式选择供应商、模型、输入 API key）。
     // Parse agent.toml once here; all modules share this single config.
+    // If agent.toml is missing, launch the first-time setup wizard.
+    if !std::path::Path::new("agent.toml").exists() {
+        crate::ui::setup::run_setup().await?;
+    }
     let config = crate::config::init("agent.toml")?;
     let mcp_manager = crate::mcp::McpManager::connect_all(&config.mcp).await;
     let registry = AgentRegistry::new(config.clone(), Arc::new(mcp_manager));

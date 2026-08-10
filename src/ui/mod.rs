@@ -5,5 +5,6 @@ pub mod clipboard;
 pub mod markdown;
 pub mod selection;
 pub mod selector;
+pub mod setup;
 pub mod theme;
 pub mod tui;

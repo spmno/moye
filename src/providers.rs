@@ -18,6 +18,20 @@ pub enum Provider {
     /// 火山引擎 Ark 平台（https://www.volcengine.com/product/ark）。通过 OpenAI 兼容接口接入。
     /// Volcengine Ark platform (https://www.volcengine.com/product/ark). OpenAI-compatible API.
     Volcengine,
+    /// OpenAI（https://platform.openai.com）。
+    OpenAI,
+    /// Anthropic Claude（https://platform.claude.com）。官方提供 OpenAI 兼容层。
+    /// Anthropic Claude (https://platform.claude.com). Official OpenAI-compatible layer.
+    Claude,
+    /// 小米 MiMo（https://mimo.mi.com）。OpenAI + Anthropic 双兼容。
+    /// Xiaomi MiMo (https://mimo.mi.com). OpenAI + Anthropic dual-compatible.
+    MiMo,
+    /// Google Gemini（https://ai.google.dev）。通过官方 OpenAI 兼容端点接入。
+    /// Google Gemini (https://ai.google.dev). Via official OpenAI-compatible endpoint.
+    Gemini,
+    /// 智谱 GLM（https://open.bigmodel.cn）。OpenAI 兼容接口。
+    /// Zhipu GLM (https://open.bigmodel.cn). OpenAI-compatible API.
+    Zhipu,
     /// 自定义 OpenAI 兼容供应商。通过 MY_AGENT_BASE_URL + MY_AGENT_API_KEY 配置。
     /// Custom OpenAI-compatible provider. Configured via MY_AGENT_BASE_URL + MY_AGENT_API_KEY.
     Custom,
@@ -38,7 +52,11 @@ impl Provider {
             "bailian" => Provider::Bailian,
             "moonshot" | "kimi" => Provider::Moonshot,
             "volcengine" | "volcanoark" | "ark" | "火山" => Provider::Volcengine,
-            "custom" | "openai" | "glm" => Provider::Custom,
+            "openai" => Provider::OpenAI,
+            "claude" | "anthropic" => Provider::Claude,
+            "mimo" | "xiaomi" => Provider::MiMo,
+            "gemini" | "google" => Provider::Gemini,
+            "zhipu" | "glm" | "bigmodel" => Provider::Zhipu,
             _ => Provider::DeepSeek,
         }
     }
@@ -59,6 +77,11 @@ impl Provider {
             Provider::Bailian => "DASHSCOPE_API_KEY",
             Provider::Moonshot => "MOONSHOT_API_KEY",
             Provider::Volcengine => "ARK_API_KEY",
+            Provider::OpenAI => "OPENAI_API_KEY",
+            Provider::Claude => "ANTHROPIC_API_KEY",
+            Provider::MiMo => "MIMO_API_KEY",
+            Provider::Gemini => "GEMINI_API_KEY",
+            Provider::Zhipu => "ZAI_API_KEY",
             Provider::Custom => "MY_AGENT_API_KEY",
         }
         .to_string()
@@ -83,6 +106,11 @@ impl Provider {
             Provider::Bailian => "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
             Provider::Moonshot => "https://api.moonshot.cn/v1".to_string(),
             Provider::Volcengine => "https://ark.cn-beijing.volces.com/api/plan/v3".to_string(),
+            Provider::OpenAI => "https://api.openai.com/v1".to_string(),
+            Provider::Claude => "https://api.anthropic.com/v1/".to_string(),
+            Provider::MiMo => "https://api.xiaomimimo.com/v1".to_string(),
+            Provider::Gemini => "https://generativelanguage.googleapis.com/v1beta/openai/".to_string(),
+            Provider::Zhipu => "https://open.bigmodel.cn/api/paas/v4".to_string(),
             Provider::Custom => "https://api.openai.com/v1".to_string(),
         }
     }
@@ -95,18 +123,26 @@ impl Provider {
             Provider::Bailian => "DASHSCOPE_API_KEY",
             Provider::Moonshot => "MOONSHOT_API_KEY",
             Provider::Volcengine => "ARK_API_KEY",
+            Provider::OpenAI => "OPENAI_API_KEY",
+            Provider::Claude => "ANTHROPIC_API_KEY",
+            Provider::MiMo => "MIMO_API_KEY",
+            Provider::Gemini => "GEMINI_API_KEY",
+            Provider::Zhipu => "ZAI_API_KEY",
             Provider::Custom => "MY_AGENT_API_KEY",
         }
     }
 
-    /// 该供应商的默认 OpenAI 兼容 base URL（不含 env/config 覆盖）。
-    /// Default OpenAI-compatible base URL for this provider (without env/config overrides).
     fn default_base_url(&self) -> &'static str {
         match self {
             Provider::DeepSeek => "https://api.deepseek.com/v1",
             Provider::Bailian => "https://dashscope.aliyuncs.com/compatible-mode/v1",
             Provider::Moonshot => "https://api.moonshot.cn/v1",
             Provider::Volcengine => "https://ark.cn-beijing.volces.com/api/plan/v3",
+            Provider::OpenAI => "https://api.openai.com/v1",
+            Provider::Claude => "https://api.anthropic.com/v1/",
+            Provider::MiMo => "https://api.xiaomimimo.com/v1",
+            Provider::Gemini => "https://generativelanguage.googleapis.com/v1beta/openai/",
+            Provider::Zhipu => "https://open.bigmodel.cn/api/paas/v4",
             Provider::Custom => "https://api.openai.com/v1",
         }
     }
@@ -123,13 +159,17 @@ impl Provider {
 
 /// 把 slug 字符串解析为 [`Provider`]；未知值回退 DeepSeek。
 /// Parse a slug string into a [`Provider`]; unknown values fall back to DeepSeek.
-fn parse_provider(raw: &str) -> Provider {
+pub fn parse_provider(raw: &str) -> Provider {
     match raw.to_lowercase().as_str() {
         "bailian" => Provider::Bailian,
         "moonshot" | "kimi" => Provider::Moonshot,
         "volcengine" | "volcanoark" | "ark" | "火山" => Provider::Volcengine,
-        "custom" | "openai" | "glm" => Provider::Custom,
-        _ => Provider::DeepSeek,
+        "openai" => Provider::OpenAI,
+        "claude" | "anthropic" => Provider::Claude,
+        "mimo" | "xiaomi" => Provider::MiMo,
+        "gemini" | "google" => Provider::Gemini,
+        "zhipu" | "glm" | "bigmodel" => Provider::Zhipu,
+        _ => Provider::Custom,
     }
 }
 
@@ -211,6 +251,11 @@ pub fn current_provider_slug() -> String {
         Provider::Bailian => "bailian",
         Provider::Moonshot => "moonshot",
         Provider::Volcengine => "volcengine",
+        Provider::OpenAI => "openai",
+        Provider::Claude => "claude",
+        Provider::MiMo => "mimo",
+        Provider::Gemini => "gemini",
+        Provider::Zhipu => "zhipu",
         Provider::Custom => "custom",
     }
     .to_string()
@@ -225,12 +270,7 @@ pub fn current_base_url() -> String {
 /// 返回当前供应商需要的额外请求参数。
 /// Return the extra request parameters required by the current provider.
 pub fn provider_additional_params() -> serde_json::Value {
-    match Provider::from_env() {
-        Provider::Moonshot => serde_json::json!({}),
-        Provider::Bailian | Provider::DeepSeek | Provider::Volcengine | Provider::Custom => {
-            serde_json::json!({})
-        }
-    }
+    serde_json::json!({})
 }
 
 /// 对话型 Agent 别名：基于 OpenAI CompletionModel 的 rig Agent（兼容所有供应商）。
@@ -268,6 +308,27 @@ pub fn provider_models(provider: Provider) -> Vec<ModelInfo> {
             ModelInfo { slug: "doubao-1-5-lite-32k".into(), desc: "豆包 1.5 Lite · 轻量快速" },
             ModelInfo { slug: "deepseek-r1-250120".into(), desc: "DeepSeek R1 · 推理模型" },
         ],
+        Provider::OpenAI => vec![
+            ModelInfo { slug: "gpt-4o".into(), desc: "GPT-4o · 旗舰模型" },
+            ModelInfo { slug: "gpt-4o-mini".into(), desc: "GPT-4o mini · 轻量快速" },
+            ModelInfo { slug: "o1".into(), desc: "o1 · 推理模型" },
+        ],
+        Provider::Claude => vec![
+            ModelInfo { slug: "claude-opus-5".into(), desc: "Claude Opus 5 · 旗舰推理" },
+            ModelInfo { slug: "claude-sonnet-4-6".into(), desc: "Claude Sonnet 4.6 · 均衡" },
+            ModelInfo { slug: "claude-haiku-4-5".into(), desc: "Claude Haiku 4.5 · 快速" },
+        ],
+        Provider::MiMo => vec![
+            ModelInfo { slug: "mimo-v2.5-pro".into(), desc: "MiMo v2.5 Pro · 旗舰" },
+        ],
+        Provider::Gemini => vec![
+            ModelInfo { slug: "gemini-2.5-pro".into(), desc: "Gemini 2.5 Pro · 长上下文" },
+            ModelInfo { slug: "gemini-2.5-flash".into(), desc: "Gemini 2.5 Flash · 快速" },
+        ],
+        Provider::Zhipu => vec![
+            ModelInfo { slug: "glm-5.2".into(), desc: "GLM-5.2 · 旗舰" },
+            ModelInfo { slug: "glm-4-flash".into(), desc: "GLM-4 Flash · 轻量" },
+        ],
         Provider::Custom => vec![],
     }
 }
@@ -281,6 +342,11 @@ impl Provider {
             Provider::Bailian => 128_000,
             Provider::Moonshot => 256_000,
             Provider::Volcengine => 256_000,
+            Provider::OpenAI => 128_000,
+            Provider::Claude => 200_000,
+            Provider::MiMo => 128_000,
+            Provider::Gemini => 1_000_000,
+            Provider::Zhipu => 1_000_000,
             Provider::Custom => 128_000,
         }
     }
@@ -313,6 +379,21 @@ pub fn context_limit_for_model(model: &str) -> usize {
     if lower.contains("glm") {
         return 1_000_000;
     }
+    if lower.contains("claude") {
+        return 200_000;
+    }
+    if lower.contains("gemini") {
+        return 1_000_000;
+    }
+    if lower.contains("mimo") {
+        return 128_000;
+    }
+    if lower.contains("gpt-4o") {
+        return 128_000;
+    }
+    if lower.contains("o1") {
+        return 200_000;
+    }
     // 回退到供应商默认值 / Fall back to provider default
     provider.context_limit()
 }
@@ -332,8 +413,26 @@ mod tests {
     }
 
     #[test]
+    fn new_provider_context_limits() {
+        assert_eq!(Provider::OpenAI.context_limit(), 128_000);
+        assert_eq!(Provider::Claude.context_limit(), 200_000);
+        assert_eq!(Provider::MiMo.context_limit(), 128_000);
+        assert_eq!(Provider::Gemini.context_limit(), 1_000_000);
+        assert_eq!(Provider::Zhipu.context_limit(), 1_000_000);
+    }
+
+    #[test]
     fn context_limit_for_kimi_model() {
         assert_eq!(context_limit_for_model("kimi-k3"), 256_000);
+    }
+
+    #[test]
+    fn context_limit_for_new_models() {
+        assert_eq!(context_limit_for_model("claude-opus-5"), 200_000);
+        assert_eq!(context_limit_for_model("gemini-2.5-pro"), 1_000_000);
+        assert_eq!(context_limit_for_model("mimo-v2.5-pro"), 128_000);
+        assert_eq!(context_limit_for_model("gpt-4o"), 128_000);
+        assert_eq!(context_limit_for_model("o1"), 200_000);
     }
 
     #[test]
@@ -363,6 +462,20 @@ mod tests {
         assert_eq!(parse_provider("VOLCANOARK"), Provider::Volcengine);
         assert_eq!(parse_provider("volcengine"), Provider::Volcengine);
         assert_eq!(parse_provider("ark"), Provider::Volcengine);
+    }
+
+    #[test]
+    fn parse_provider_new_providers() {
+        assert_eq!(parse_provider("openai"), Provider::OpenAI);
+        assert_eq!(parse_provider("claude"), Provider::Claude);
+        assert_eq!(parse_provider("anthropic"), Provider::Claude);
+        assert_eq!(parse_provider("mimo"), Provider::MiMo);
+        assert_eq!(parse_provider("xiaomi"), Provider::MiMo);
+        assert_eq!(parse_provider("gemini"), Provider::Gemini);
+        assert_eq!(parse_provider("google"), Provider::Gemini);
+        assert_eq!(parse_provider("zhipu"), Provider::Zhipu);
+        assert_eq!(parse_provider("glm"), Provider::Zhipu);
+        assert_eq!(parse_provider("bigmodel"), Provider::Zhipu);
     }
 
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());

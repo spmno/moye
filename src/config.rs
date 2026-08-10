@@ -44,6 +44,44 @@ pub struct Config {
     /// valued as the key itself. The project `.env`/export takes priority; this is the fallback.
     #[serde(default)]
     pub keys: HashMap<String, String>,
+    /// MCP 服务器配置：`[mcp.<name>]` 小节，每个小节定义一个 MCP 服务器连接。
+    /// 通过 `command`+`args`（stdio）或 `url`（HTTP/SSE）指定传输方式。
+    /// MCP server configs: `[mcp.<name>]` sections, each defining one MCP server connection.
+    /// Transport is selected by `command`+`args` (stdio) or `url` (HTTP/SSE).
+    #[serde(default)]
+    pub mcp: HashMap<String, McpServerConfig>,
+}
+
+/// 单个 MCP 服务器的配置。通过 `command`（stdio）或 `url`（HTTP/SSE）选择传输方式。
+/// Config for a single MCP server. Transport is selected by `command` (stdio) or `url` (HTTP/SSE).
+#[derive(Debug, Deserialize, Default)]
+pub struct McpServerConfig {
+    /// stdio 传输：要执行的命令（如 `codegraph`、`npx`）。
+    /// stdio transport: the command to execute (e.g. `codegraph`, `npx`).
+    pub command: Option<String>,
+    /// stdio 传输：传给命令的参数。
+    /// stdio transport: arguments passed to the command.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// HTTP/SSE 传输：MCP 服务器 URL（如 `https://mcp.grep.app`）。
+    /// HTTP/SSE transport: the MCP server URL (e.g. `https://mcp.grep.app`).
+    pub url: Option<String>,
+    /// stdio 传输：传给子进程的环境变量。
+    /// stdio transport: environment variables for the child process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
+impl McpServerConfig {
+    /// 返回此配置使用的传输类型（`"stdio"` 或 `"http"`）。
+    /// Returns the transport type this config uses (`"stdio"` or `"http"`).
+    pub fn transport_type(&self) -> &'static str {
+        if self.command.is_some() {
+            "stdio"
+        } else {
+            "http"
+        }
+    }
 }
 
 /// `[sandbox]` 小节：沙箱预授权目录配置。
@@ -338,6 +376,17 @@ rule_escalation_threshold = 3
 
 [sandbox]
 authorized_dirs = []
+
+# MCP 服务器配置（可选）。
+# MCP server configs (optional).
+# 通过 `command`+`args`（stdio）或 `url`（HTTP/SSE）指定传输方式。
+# Transport is selected by `command`+`args` (stdio) or `url` (HTTP/SSE).
+# [mcp.codegraph]
+# command = "codegraph"
+# args = ["serve"]
+#
+# [mcp.context7]
+# url = "https://context7.com/api/v2/mcp"
 "#
     );
 
@@ -526,5 +575,33 @@ MOONSHOT_API_KEY = "global-moon"
             Permission::Deny
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn load_mcp_config() {
+        let toml_str = r#"
+[mcp.codegraph]
+command = "codegraph"
+args = ["serve"]
+
+[mcp.context7]
+url = "https://context7.com/api/v2/mcp"
+
+[mcp.grep_app]
+url = "https://mcp.grep.app"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.mcp.len(), 3);
+
+        let cg = cfg.mcp.get("codegraph").unwrap();
+        assert_eq!(cg.command.as_deref(), Some("codegraph"));
+        assert_eq!(cg.args, vec!["serve"]);
+        assert!(cg.url.is_none());
+        assert_eq!(cg.transport_type(), "stdio");
+
+        let c7 = cfg.mcp.get("context7").unwrap();
+        assert_eq!(c7.url.as_deref(), Some("https://context7.com/api/v2/mcp"));
+        assert!(c7.command.is_none());
+        assert_eq!(c7.transport_type(), "http");
     }
 }

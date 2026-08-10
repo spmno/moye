@@ -3,6 +3,7 @@
 mod agent_loop;
 mod cli;
 mod config;
+mod mcp;
 mod context;
 mod event;
 mod evolution;
@@ -44,7 +45,8 @@ async fn main() -> Result<()> {
     // 统一解析 agent.toml（仅此一处），各模块共享同一份配置。
     // Parse agent.toml once here; all modules share this single config.
     let config = crate::config::init("agent.toml")?;
-    let registry = AgentRegistry::new(config.clone());
+    let mcp_manager = crate::mcp::McpManager::connect_all(&config.mcp).await;
+    let registry = AgentRegistry::new(config.clone(), Arc::new(mcp_manager));
     let orchestrator = Orchestrator::new(registry.clone());
     let evolver = PromptEvolver::new(registry.clone(), "AGENTS.md".to_string());
     let memory = memory::MemoryStore::new(&config.memory)?;

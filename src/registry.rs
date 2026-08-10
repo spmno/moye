@@ -3,6 +3,7 @@
 // 以及构建和管理各角色 Agent 的 AgentRegistry。权限分级驱动自主循环的 HITL（人在环）控制。
 // and AgentRegistry for building and managing role Agents. Permission tiers drive autonomous loop HITL (Human-in-the-Loop) control.
 use crate::event::{AgentEvent, EventSender};
+use crate::mcp::McpManager;
 use crate::providers::ChatAgent;
 use crate::sandbox::Sandbox;
 use rig_agent::client::AgentClientExt;
@@ -162,6 +163,7 @@ impl RoleAgent {
 /// Agent registry: holds shared config, builds Agents per role; also stores session-level model override.
 pub struct AgentRegistry {
     config: Arc<crate::config::Config>,
+    mcp: Arc<McpManager>,
     // 整个会话的运行时模型覆盖。一旦设置，所有角色都使用该 slug 而非各自配置的模型，
     // Runtime model override for the entire session. Once set, all roles use this slug instead of their configured model,
     // 让用户无需改文件即可从 REPL 切换到免费模型（如 tencent/hy3:free）。
@@ -176,7 +178,7 @@ pub struct AgentRegistry {
 }
 
 impl AgentRegistry {
-    pub fn new(config: Arc<crate::config::Config>) -> Self {
+    pub fn new(config: Arc<crate::config::Config>, mcp: Arc<McpManager>) -> Self {
         // MY_AGENT_MODEL 环境变量作为会话级模型覆盖的初始值。
         // The MY_AGENT_MODEL env var serves as the initial session-level model override.
         // 优先级：/model REPL 命令 > MY_AGENT_MODEL env > agent.toml 各角色配置。
@@ -184,6 +186,7 @@ impl AgentRegistry {
         let session_model = std::env::var("MY_AGENT_MODEL").ok();
         Self {
             config,
+            mcp,
             session_model: Arc::new(Mutex::new(session_model)),
             session_provider: Arc::new(Mutex::new(None)),
             session_base_url: Arc::new(Mutex::new(None)),
@@ -195,6 +198,7 @@ impl AgentRegistry {
     pub fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
+            mcp: self.mcp.clone(),
             session_model: self.session_model.clone(),
             session_provider: self.session_provider.clone(),
             session_base_url: self.session_base_url.clone(),
@@ -312,9 +316,17 @@ impl AgentRegistry {
                 .temperature(crate::providers::Provider::clamp_temperature(0.7))
                 .additional_params(params)
                 .default_max_turns(max_turns);
-            crate::tools::add_builtin_tools(builder, self.context_config())
-                .max_tokens(max_output)
-                .build()
+            let builder = crate::tools::add_builtin_tools(builder, self.context_config());
+            let builder = if !self.mcp.is_empty() {
+                let mut b = builder;
+                for (tools, sink) in self.mcp.all_tools_and_sinks() {
+                    b = b.rmcp_tools(tools, sink);
+                }
+                b
+            } else {
+                builder
+            };
+            builder.max_tokens(max_output).build()
         } else {
             client
                 .agent(&model)
@@ -342,6 +354,12 @@ impl AgentRegistry {
             .get(&key)
             .map(|rc| rc.permissions.clone())
             .unwrap_or_default()
+    }
+
+    /// 返回所有已连接 MCP 服务器的工具名称（供侧边栏显示）。
+    /// Returns tool names from all connected MCP servers (for sidebar display).
+    pub fn mcp_tool_names(&self) -> Vec<String> {
+        self.mcp.tool_names()
     }
 
     /// 取某角色的配置，供自主循环重建"可运行"的 Agent

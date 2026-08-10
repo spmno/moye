@@ -510,7 +510,8 @@ pub async fn run_tui(ctx: Arc<AppContext>) -> anyhow::Result<()> {
     let provider = format!("{:?}", crate::providers::current_provider());
     let model = ctx.current_model();
     let max_turns = ctx.registry.max_turns();
-    let tool_names: Vec<String> = crate::tools::tool_names().iter().map(|s| s.to_string()).collect();
+    let mut tool_names: Vec<String> = crate::tools::tool_names().iter().map(|s| s.to_string()).collect();
+    tool_names.extend(ctx.registry.mcp_tool_names());
     let skill_names: Vec<String> = crate::skills::SkillManifest::load()
         .map(|m| m.list())
         .unwrap_or_default();

@@ -528,9 +528,21 @@ fn extract_paths_from_command_inner(command: &str, paths: &mut Vec<String>) {
             continue;
         }
 
+        // Skip comment lines (first token starts with '#').
+        // 跳过注释行（首个 token 以 '#' 开头）。
+        if tokens[0].starts_with('#') {
+            continue;
+        }
+
         let mut i = 0;
         while i < tokens.len() {
             let token = tokens[i];
+
+            // Inline comment: '#' at word boundary starts a comment to end of segment.
+            // 行内注释： '#' 在词边界处开始注释，跳过本段剩余 token。
+            if token.starts_with('#') {
+                break;
+            }
 
             // cd / pushd <dir> —— 检查目标目录
             // cd / pushd <dir> — check the target directory
@@ -545,7 +557,7 @@ fn extract_paths_from_command_inner(command: &str, paths: &mut Vec<String>) {
 
             let cleaned = clean_token(token);
 
-            let candidate = if cleaned.starts_with('/')
+            let candidate = if (cleaned.starts_with('/') && cleaned != "/")
                 || cleaned.starts_with("~/")
                 || cleaned == "~"
                 || cleaned.contains("..")
@@ -995,5 +1007,46 @@ mod tests {
         let policy = sb.seatbelt_policy();
         assert!(policy.contains("deny file-write*"));
         assert!(policy.contains("/home/user/project"));
+    }
+
+    /// Comment lines starting with '#' should not produce paths.
+    /// 以 '#' 开头的注释行不应产生路径。
+    #[test]
+    fn skip_comment_lines() {
+        let paths = extract_paths_from_command("# Test 1: GET / should redirect to /log");
+        assert!(!paths.contains(&"/".to_string()));
+        assert!(!paths.contains(&"/log".to_string()));
+    }
+
+    /// Inline comments after '#' should not produce paths.
+    /// 行内 '#' 之后的注释不应产生路径。
+    #[test]
+    fn skip_inline_comments() {
+        let paths = extract_paths_from_command("echo hello # GET / should redirect");
+        assert!(!paths.contains(&"/".to_string()));
+    }
+
+    /// Bare '/' token should not be treated as an absolute path.
+    /// 裸 '/' token 不应被当作绝对路径。
+    #[test]
+    fn skip_bare_root_slash() {
+        let paths = extract_paths_from_command("echo --- GET / (redirect) ---");
+        assert!(!paths.contains(&"/".to_string()));
+    }
+
+    /// cd / should still extract '/' as a real directory change.
+    /// cd / 仍应提取 '/' 作为真实的目录切换。
+    #[test]
+    fn cd_root_still_extracted() {
+        let paths = extract_paths_from_command("cd / && ls");
+        assert!(paths.contains(&"/".to_string()));
+    }
+
+    /// Real absolute paths should still be extracted even in echo strings.
+    /// 真实的绝对路径即使在 echo 字符串中也应被提取。
+    #[test]
+    fn real_abs_path_still_extracted() {
+        let paths = extract_paths_from_command("echo GET /etc/passwd");
+        assert!(paths.contains(&"/etc/passwd".to_string()));
     }
 }

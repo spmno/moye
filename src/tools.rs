@@ -4,6 +4,8 @@
 // The `description()` of each tool is a natural-language prompt aimed at the model (LLM);
 // （本项目主要使用中文模型：DeepSeek / GLM / Kimi）。
 // (this project primarily uses Chinese models: DeepSeek / GLM / Kimi).
+use std::time::Duration;
+
 use anyhow::Result;
 use rig_core::tool::PortableTool;
 use serde::Deserialize;
@@ -177,6 +179,7 @@ struct BashArgs {
 struct RunBash {
     max_bash_output_chars: usize,
     sandbox: crate::sandbox::Sandbox,
+    timeout_secs: u64,
 }
 
 /// 实现 `run_bash` 工具：运行 shell 命令并返回 stdout+stderr。
@@ -214,6 +217,9 @@ impl PortableTool for RunBash {
     /// async runtime (no TUI redraw, no Esc response during long commands). kill_on_drop
     /// ensures aborting the task (Esc) also kills the child instead of orphaning it.
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let timeout = Duration::from_secs(self.timeout_secs);
+        let timeout_err = || ToolError(format!("command timed out after {}s", self.timeout_secs));
+
         let out = if let Some(bwrap_argv) = self.sandbox.wrap_command() {
             let mut cmd = tokio::process::Command::new(&bwrap_argv[0]);
             for arg in &bwrap_argv[1..] {
@@ -223,17 +229,19 @@ impl PortableTool for RunBash {
                 .arg("sh")
                 .arg("-c")
                 .arg(&args.command)
-                .kill_on_drop(true)
-                .output()
+                .kill_on_drop(true);
+            tokio::time::timeout(timeout, cmd.output())
                 .await
+                .map_err(|_| timeout_err())?
                 .map_err(|e| ToolError(e.to_string()))?
         } else {
-            tokio::process::Command::new("sh")
-                .arg("-c")
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c")
                 .arg(&args.command)
-                .kill_on_drop(true)
-                .output()
+                .kill_on_drop(true);
+            tokio::time::timeout(timeout, cmd.output())
                 .await
+                .map_err(|_| timeout_err())?
                 .map_err(|e| ToolError(e.to_string()))?
         };
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -978,6 +986,7 @@ pub fn builtin_tools(
     tools.add_tool(RunBash {
         max_bash_output_chars: config.max_bash_output_chars,
         sandbox: sandbox.clone(),
+        timeout_secs: 300,
     });
     tools.add_tool(RunFile {
         max_output_chars: config.max_bash_output_chars,
@@ -1012,6 +1021,7 @@ where
         .tool(RunBash {
             max_bash_output_chars: config.max_bash_output_chars,
             sandbox: sandbox.clone(),
+            timeout_secs: 300,
         })
         .tool(RunFile {
             max_output_chars: config.max_bash_output_chars,

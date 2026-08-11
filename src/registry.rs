@@ -8,6 +8,7 @@ use crate::providers::ChatAgent;
 use crate::sandbox::Sandbox;
 use rig_agent::client::AgentClientExt;
 use rig_core::completion::Message;
+use rig_core::completion::message::{AssistantContent, UserContent};
 use serde::Deserialize;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -466,18 +467,25 @@ pub fn classify_keyword_fallback(message: &str) -> Intent {
 
 /// LLM 意图分类：构建无工具 Agent，发送短 prompt，解析单词响应。
 /// LLM intent classification: builds a tool-less Agent, sends a short prompt, parses the single-word response.
-async fn classify_with_llm(message: &str, registry: &AgentRegistry) -> Option<Intent> {
+async fn classify_with_llm(message: &str, history: &[Message], registry: &AgentRegistry) -> Option<Intent> {
     let client = registry.create_client().ok()?;
     let model = registry
         .session_model()
         .or_else(|| registry.role_config(Role::Orchestrator).map(|rc| rc.model.clone()))
         .unwrap_or_else(|| registry.config.agent.default_model.clone());
 
-    let preamble = "你是一个意图分类器。判断用户消息的意图，只回复一个英文词：\n\
+    let preamble = "你是一个意图分类器。根据用户当前消息（结合最近的对话上下文）判断意图，只回复一个英文词：\n\
                     - implement: 要求修改、创建、删除代码或文件\n\
                     - investigate: 要求查看、分析、理解代码\n\
                     - chat: 聊天、问答、闲聊\n\
                     只回复一个词，不要任何解释。";
+
+    let history_ctx = recent_history_text(history, 10);
+    let prompt = if history_ctx.is_empty() {
+        message.to_string()
+    } else {
+        format!("{history_ctx}\n[Current message]\n{message}")
+    };
 
     let params = crate::providers::provider_additional_params();
     let agent = client
@@ -490,7 +498,7 @@ async fn classify_with_llm(message: &str, registry: &AgentRegistry) -> Option<In
         .build();
 
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-    let stream = agent.runner(message).stream().await;
+    let stream = agent.runner(&prompt).stream().await;
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(15),
         crate::agent_loop::consume_stream(stream, None, &tx),
@@ -511,13 +519,46 @@ async fn classify_with_llm(message: &str, registry: &AgentRegistry) -> Option<In
     }
 }
 
+/// 提取最近几条对话的文本摘要，供意图分类器理解上下文。
+/// Extracts a text summary of recent conversation turns for the intent classifier.
+fn recent_history_text(history: &[Message], max_messages: usize) -> String {
+    let start = history.len().saturating_sub(max_messages);
+    let recent = &history[start..];
+    if recent.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("[Recent conversation]\n");
+    for msg in recent {
+        match msg {
+            Message::User { content } => {
+                for item in content.iter() {
+                    if let UserContent::Text(t) = item {
+                        let text: String = t.text.chars().take(500).collect();
+                        s.push_str(&format!("User: {text}\n"));
+                    }
+                }
+            }
+            Message::Assistant { content, .. } => {
+                for item in content.iter() {
+                    if let AssistantContent::Text(t) = item {
+                        let text: String = t.text.chars().take(500).collect();
+                        s.push_str(&format!("Assistant: {text}\n"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    s
+}
+
 /// 意图分类入口：快速路径 → LLM → 关键词降级。
 /// Intent classification entry point: fast path → LLM → keyword fallback.
-pub async fn classify_intent(message: &str, registry: &AgentRegistry) -> Intent {
+pub async fn classify_intent(message: &str, history: &[Message], registry: &AgentRegistry) -> Intent {
     if is_obvious_question(message) {
         return Intent::Chat;
     }
-    if let Some(intent) = classify_with_llm(message, registry).await {
+    if let Some(intent) = classify_with_llm(message, history, registry).await {
         return intent;
     }
     classify_keyword_fallback(message)
@@ -574,11 +615,11 @@ impl Orchestrator {
     }
 
     pub async fn handle(&self, message: &str, tx: &EventSender) -> anyhow::Result<String> {
-        let intent = classify_intent(message, &self.registry).await;
+        let history = self.history.lock().unwrap().clone();
+        let intent = classify_intent(message, &history, &self.registry).await;
         match intent {
             Intent::Implement => self.run_sdd_pipeline(message, tx).await,
             Intent::Investigate => {
-                let prior = self.history.lock().unwrap().clone();
                 let (out, new_hist) = crate::agent_loop::run_autonomous(
                     &self.registry,
                     &self.sandbox,
@@ -586,15 +627,25 @@ impl Orchestrator {
                     Role::Investigator,
                     message,
                     tx,
-                    prior,
+                    history,
                 )
                 .await?;
                 *self.history.lock().unwrap() = new_hist;
                 Ok(out)
             }
             Intent::Chat => {
-                let agent = self.registry.build(Role::Builder)?;
-                agent.run(message, tx).await
+                let (out, new_hist) = crate::agent_loop::run_autonomous(
+                    &self.registry,
+                    &self.sandbox,
+                    self.trust_sandbox.clone(),
+                    Role::Builder,
+                    message,
+                    tx,
+                    history,
+                )
+                .await?;
+                *self.history.lock().unwrap() = new_hist;
+                Ok(out)
             }
         }
     }
@@ -730,5 +781,56 @@ mod tests {
         assert!(is_obvious_question("你好"));
         assert!(!is_obvious_question("实现一个新功能"));
         assert!(!is_obvious_question("修复登录bug"));
+    }
+
+    /// 空历史应返回空字符串。
+    /// Empty history should return an empty string.
+    #[test]
+    fn recent_history_text_empty() {
+        assert_eq!(recent_history_text(&[], 10), "");
+    }
+
+    /// 系统消息应被跳过——只提取 User/Assistant 文本。
+    /// System messages should be skipped — only User/Assistant text is extracted.
+    #[test]
+    fn recent_history_text_skips_system() {
+        let hist = vec![
+            Message::system("system prompt"),
+            Message::system("another system msg"),
+        ];
+        // Non-empty history → header is present, but no user/assistant text
+        let result = recent_history_text(&hist, 10);
+        assert!(result.contains("[Recent conversation]"));
+        assert!(!result.contains("system prompt"));
+    }
+
+    /// 验证 User/Assistant 消息被正确提取并标注角色。
+    /// Verifies User/Assistant messages are extracted and labeled.
+    #[test]
+    fn recent_history_text_extracts_turns() {
+        let hist = vec![
+            Message::user("hello"),
+            Message::assistant("hi there"),
+        ];
+        let result = recent_history_text(&hist, 10);
+        assert!(result.contains("User: hello"));
+        assert!(result.contains("Assistant: hi there"));
+    }
+
+    /// 验证只取最近 N 条消息，更早的会被丢弃。
+    /// Verifies only the last N messages are included; older ones are dropped.
+    #[test]
+    fn recent_history_text_respects_max() {
+        let hist = vec![
+            Message::user("old msg"),
+            Message::assistant("old reply"),
+            Message::user("recent msg"),
+            Message::assistant("recent reply"),
+        ];
+        let result = recent_history_text(&hist, 2);
+        assert!(!result.contains("old msg"));
+        assert!(!result.contains("old reply"));
+        assert!(result.contains("recent msg"));
+        assert!(result.contains("recent reply"));
     }
 }

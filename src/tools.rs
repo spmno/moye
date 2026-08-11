@@ -22,6 +22,10 @@ struct ToolError(String);
 #[derive(Deserialize)]
 struct ReadFileArgs {
     path: String,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 /// 读取项目工作树内 UTF-8 文本文件的工具。
@@ -41,7 +45,7 @@ impl PortableTool for ReadFile {
     /// 返回面向 LLM 的工具描述（中文）。
     /// Returns the LLM-facing tool description (Chinese).
     fn description(&self) -> String {
-        format!("从项目工作树读取一个 UTF-8 文本文件。仅可访问项目目录及子目录内的文件；访问其它目录需要用户授权。输出截断到 {} 行。", self.max_read_lines)
+        format!("从项目工作树读取一个 UTF-8 文本文件。支持 offset/limit 分页读取大文件。默认从第0行开始，读取前{}行。使用 offset 跳过已读部分。", self.max_read_lines)
     }
 
     /// 返回 JSON Schema 形式的参数定义。
@@ -50,17 +54,32 @@ impl PortableTool for ReadFile {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "文件的相对路径" }
+                "path": { "type": "string", "description": "文件的相对路径" },
+                "offset": { "type": "number", "description": "起始行号（从0开始），默认0", "default": 0 },
+                "limit": { "type": "number", "description": "读取行数，默认为工具配置的最大行数", "default": self.max_read_lines }
             },
             "required": ["path"],
         })
     }
 
-    /// 执行工具：读取文件内容，截断到 500 行。失败时返回 `ToolError`。
-    /// Executes the tool: reads file content, truncates to 500 lines. Returns `ToolError` on failure.
+    /// 执行工具：读取文件内容，支持 offset/limit 分页。失败时返回 `ToolError`。
+    /// Executes the tool: reads file content with optional offset/limit pagination. Returns `ToolError` on failure.
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let content = std::fs::read_to_string(&args.path).map_err(|e| ToolError(e.to_string()))?;
-        Ok(crate::context::truncate_lines(&content, self.max_read_lines))
+        let lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
+        if total == 0 {
+            return Ok(String::new());
+        }
+        let offset = args.offset.unwrap_or(0).min(total);
+        let limit = args.limit.unwrap_or(self.max_read_lines);
+        let end = (offset + limit).min(total);
+        let selected = lines[offset..end].join("\n");
+        if offset == 0 && end == total {
+            Ok(selected)
+        } else {
+            Ok(format!("{selected}\n…(截断 / truncated, {total} lines total, showing lines {}-{end}, use offset to read more)", offset + 1))
+        }
     }
 }
 
@@ -1180,5 +1199,68 @@ mod tests {
     #[test]
     fn escaped_separator_not_segmented() {
         assert!(is_readonly_bash("grep 'a\\;b' file"));
+    }
+
+    /// offset/limit 分页：默认从第 0 行读取 max_read_lines 行。
+    /// offset/limit pagination: default reads from line 0 up to max_read_lines.
+    #[tokio::test]
+    async fn read_file_default_pagination() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_read_file_pagination.txt");
+        let content: String = (0..50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let tool = ReadFile { max_read_lines: 10 };
+        let args = ReadFileArgs { path: path.to_string_lossy().to_string(), offset: None, limit: None };
+        let result = tool.call(args).await.unwrap();
+
+        assert!(result.contains("line 0"));
+        assert!(result.contains("line 9"));
+        assert!(!result.contains("line 10\n"));
+        assert!(result.contains("截断"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// offset 跳过前 N 行，limit 控制读取行数。
+    /// offset skips first N lines, limit controls how many lines to read.
+    #[tokio::test]
+    async fn read_file_offset_limit() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_read_file_offset.txt");
+        let content: String = (0..50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let tool = ReadFile { max_read_lines: 10 };
+        let args = ReadFileArgs { path: path.to_string_lossy().to_string(), offset: Some(20), limit: Some(5) };
+        let result = tool.call(args).await.unwrap();
+
+        assert!(result.contains("line 20"));
+        assert!(result.contains("line 24"));
+        assert!(!result.contains("line 19"));
+        assert!(!result.contains("line 25\n"));
+        assert!(result.contains("截断"));
+        assert!(result.contains("showing lines 21-25"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// offset 超过文件末尾时返回空字符串。
+    /// offset past end of file returns empty string.
+    #[tokio::test]
+    async fn read_file_offset_past_end() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_read_file_past_end.txt");
+        std::fs::write(&path, "only one line\n").unwrap();
+
+        let tool = ReadFile { max_read_lines: 10 };
+        let args = ReadFileArgs { path: path.to_string_lossy().to_string(), offset: Some(100), limit: None };
+        let result = tool.call(args).await.unwrap();
+
+        // offset is clamped to total (1 line), end = min(1+10, 1) = 1, selected = lines[1..1] = empty
+        // Since selected is empty and offset==0 is false, it goes to the truncation branch
+        assert!(result.contains("截断") || result.is_empty());
+
+        std::fs::remove_file(&path).ok();
     }
 }

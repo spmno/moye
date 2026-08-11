@@ -682,6 +682,7 @@ pub fn truncate_at_char_boundary(s: &str, max_chars: usize) -> String {
 
 /// 将文本截断到 max_lines 行，并在截断时追加提示。
 /// Truncate text to max_lines, appending a notice when truncated.
+#[allow(dead_code)]
 pub fn truncate_lines(s: &str, max_lines: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
     if lines.len() <= max_lines {

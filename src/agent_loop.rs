@@ -747,6 +747,31 @@ pub async fn run_autonomous(
 
         match consume_stream(stream, Some(hitl_waiting), tx).await {
             Ok(output) => return Ok((output, captured_history.lock().unwrap().clone())),
+            Err(e) if is_context_overflow_error(&e) && attempt < MAX_RETRIES => {
+                let mut hist = captured_history.lock().unwrap();
+                let old_len = hist.len();
+                if old_len > 6 {
+                    let keep = 4;
+                    let retained: Vec<Message> = hist[old_len - keep..].to_vec();
+                    *hist = std::iter::once(Message::system(
+                        "[反应式压缩 / Reactive compaction] 上下文溢出，旧对话历史已截断。请基于保留的近期消息继续。\n\
+                         [System] Context overflow — old history truncated. Continue from the retained recent messages."
+                    ))
+                    .chain(retained)
+                    .collect();
+                    let _ = tx.send(AgentEvent::Info(format!(
+                        "[反应式压缩 / Reactive compaction] 上下文溢出，历史从 {old_len} 条截断为 {} 条消息",
+                        hist.len()
+                    )));
+                    drop(hist);
+                    continue;
+                }
+                drop(hist);
+                let _ = tx.send(AgentEvent::Error(
+                    "上下文溢出且历史过短，无法进一步压缩 / Context overflow with insufficient history to compact".to_string(),
+                ));
+                return Err(e);
+            }
             Err(e) if is_stream_error(&e) && attempt < MAX_RETRIES => {
                 turns_used = *captured_turn.lock().unwrap();
                 let hist_len = captured_history.lock().unwrap().len();
@@ -800,6 +825,21 @@ pub fn is_stream_error(e: &anyhow::Error) -> bool {
         || msg.contains("Reset(StreamId")
         || msg.contains("流式错误")
         || msg.contains("空闲超时")
+}
+
+/// 判断错误是否为上下文窗口溢出（可安全压缩后重试）。
+/// Determines whether an error is a context window overflow (safe to compact and retry).
+pub fn is_context_overflow_error(e: &anyhow::Error) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("context_length_exceeded")
+        || msg.contains("context length")
+        || msg.contains("prompt_too_long")
+        || msg.contains("maximum context")
+        || msg.contains("token limit")
+        || msg.contains("context window")
+        || msg.contains("max_tokens")
+        || msg.contains("上下文")
+        || msg.contains("too long")
 }
 
 /// 消费流式输出：文本增量通过 channel 发送给 TUI，reasoning 实时发送。
@@ -1053,5 +1093,21 @@ mod tests {
             decide_flow(&perms(), "mystery", r#"{}"#),
             ToolCallAction::Skip(..)
         ));
+    }
+
+    #[test]
+    fn overflow_error_detected() {
+        assert!(is_context_overflow_error(&anyhow::anyhow!("context_length_exceeded")));
+        assert!(is_context_overflow_error(&anyhow::anyhow!("prompt_too_long")));
+        assert!(is_context_overflow_error(&anyhow::anyhow!("maximum context window exceeded")));
+        assert!(is_context_overflow_error(&anyhow::anyhow!("token limit reached")));
+        assert!(is_context_overflow_error(&anyhow::anyhow!("上下文超出限制")));
+    }
+
+    #[test]
+    fn non_overflow_error_not_detected() {
+        assert!(!is_context_overflow_error(&anyhow::anyhow!("network timeout")));
+        assert!(!is_context_overflow_error(&anyhow::anyhow!("permission denied")));
+        assert!(!is_context_overflow_error(&anyhow::anyhow!("file not found")));
     }
 }

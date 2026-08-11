@@ -325,7 +325,7 @@ impl ContextHook {
         tx: EventSender,
         max_turns: usize,
     ) -> Self {
-        let budget = crate::context::TokenBudget::new(context_limit, config.max_output_tokens);
+        let budget = crate::context::TokenBudget::new(context_limit);
         Self {
             budget: Arc::new(Mutex::new(budget)),
             config,
@@ -962,15 +962,22 @@ fn build_runner_agent(
     info!("[runner] role={role:?} model={model} max_turns={max_turns}");
     let params = crate::providers::provider_additional_params();
     let max_output = registry.context_config().max_output_tokens as u64;
+    let reasoning = crate::providers::is_reasoning_model(&model);
+    if reasoning {
+        info!("[runner] reasoning model detected, skipping max_tokens (model default applies)");
+    }
     let builder = client
         .agent(&model)
         .preamble(&preamble)
         .temperature(crate::providers::Provider::clamp_temperature(0.7));
-    let agent = crate::tools::add_builtin_tools(builder, registry.context_config(), registry.sandbox())
+    let builder = crate::tools::add_builtin_tools(builder, registry.context_config(), registry.sandbox())
         .additional_params(params)
-        .default_max_turns(max_turns)
-        .max_tokens(max_output)
-        .build();
+        .default_max_turns(max_turns);
+    let agent = if reasoning {
+        builder.build()
+    } else {
+        builder.max_tokens(max_output).build()
+    };
     Ok(agent)
 }
 

@@ -96,20 +96,33 @@ impl McpServerConfig {
     }
 }
 
-/// `[sandbox]` 小节：沙箱预授权目录配置。
-/// The `[sandbox]` section: sandbox pre-authorized directory config.
+/// `[sandbox]` 小节：沙箱配置（后端选择 + 预授权目录）。
+/// The `[sandbox]` section: sandbox config (backend selection + pre-authorized dirs).
 ///
-/// 通过 `authorized_dirs` 可在配置文件中预先授权一组目录，
-/// Agent 访问这些目录及其子目录时不再弹窗确认。
-/// You can pre-authorize a set of directories via `authorized_dirs` in the config file;
-/// the Agent can access these directories and their subdirectories without prompting.
-#[derive(Debug, Deserialize, Default)]
+/// `backend` 控制 OS 级沙箱后端：auto（自动检测）、bwrap、seatbelt、path（仅路径检查）、off。
+/// `backend` selects the OS-level sandbox backend: auto, bwrap, seatbelt, path, or off.
+/// `authorized_dirs` 预授权一组目录，Agent 访问时不再弹窗确认。
+/// `authorized_dirs` pre-authorizes directories so the Agent can access them without prompting.
+#[derive(Debug, Deserialize)]
 pub struct SandboxConfig {
-    /// 预授权目录列表（支持 `~` 展开）。这些目录及其子目录可直接访问，无需确认。
-    /// Pre-authorized directory list (supports `~` expansion). These directories and
-    /// their subdirectories can be accessed without confirmation.
+    #[serde(default = "default_sandbox_backend")]
+    pub backend: String,
+
     #[serde(default)]
     pub authorized_dirs: Vec<String>,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_sandbox_backend(),
+            authorized_dirs: Vec::new(),
+        }
+    }
+}
+
+fn default_sandbox_backend() -> String {
+    "auto".to_string()
 }
 
 impl Config {
@@ -432,6 +445,7 @@ rules_file = "rules.json"
 rule_escalation_threshold = 3
 
 [sandbox]
+backend = "auto"
 authorized_dirs = []
 
 [mcp.codegraph]
@@ -520,6 +534,7 @@ authorized_dirs = ["~/.config", "/tmp/my-agent"]
         assert_eq!(cfg.evolution.rule_escalation_threshold, 0);
         assert_eq!(cfg.context.max_output_tokens, 4096);
         assert!(cfg.sandbox.authorized_dirs.is_empty());
+        assert_eq!(cfg.sandbox.backend, "auto");
         assert_eq!(cfg.memory.rules_file, "rules.json");
     }
 

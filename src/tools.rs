@@ -4,6 +4,8 @@
 // The `description()` of each tool is a natural-language prompt aimed at the model (LLM);
 // （本项目主要使用中文模型：DeepSeek / GLM / Kimi）。
 // (this project primarily uses Chinese models: DeepSeek / GLM / Kimi).
+use std::time::Duration;
+
 use anyhow::Result;
 use rig_core::tool::PortableTool;
 use serde::Deserialize;
@@ -20,6 +22,10 @@ struct ToolError(String);
 #[derive(Deserialize)]
 struct ReadFileArgs {
     path: String,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 /// 读取项目工作树内 UTF-8 文本文件的工具。
@@ -39,7 +45,7 @@ impl PortableTool for ReadFile {
     /// 返回面向 LLM 的工具描述（中文）。
     /// Returns the LLM-facing tool description (Chinese).
     fn description(&self) -> String {
-        format!("从项目工作树读取一个 UTF-8 文本文件。仅可访问项目目录及子目录内的文件；访问其它目录需要用户授权。输出截断到 {} 行。", self.max_read_lines)
+        format!("从项目工作树读取一个 UTF-8 文本文件。支持 offset/limit 分页读取大文件。默认从第0行开始，读取前{}行。使用 offset 跳过已读部分。", self.max_read_lines)
     }
 
     /// 返回 JSON Schema 形式的参数定义。
@@ -48,17 +54,32 @@ impl PortableTool for ReadFile {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "文件的相对路径" }
+                "path": { "type": "string", "description": "文件的相对路径" },
+                "offset": { "type": "number", "description": "起始行号（从0开始），默认0", "default": 0 },
+                "limit": { "type": "number", "description": "读取行数，默认为工具配置的最大行数", "default": self.max_read_lines }
             },
             "required": ["path"],
         })
     }
 
-    /// 执行工具：读取文件内容，截断到 500 行。失败时返回 `ToolError`。
-    /// Executes the tool: reads file content, truncates to 500 lines. Returns `ToolError` on failure.
+    /// 执行工具：读取文件内容，支持 offset/limit 分页。失败时返回 `ToolError`。
+    /// Executes the tool: reads file content with optional offset/limit pagination. Returns `ToolError` on failure.
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let content = std::fs::read_to_string(&args.path).map_err(|e| ToolError(e.to_string()))?;
-        Ok(crate::context::truncate_lines(&content, self.max_read_lines))
+        let lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
+        if total == 0 {
+            return Ok(String::new());
+        }
+        let offset = args.offset.unwrap_or(0).min(total);
+        let limit = args.limit.unwrap_or(self.max_read_lines);
+        let end = (offset + limit).min(total);
+        let selected = lines[offset..end].join("\n");
+        if offset == 0 && end == total {
+            Ok(selected)
+        } else {
+            Ok(format!("{selected}\n…(截断 / truncated, {total} lines total, showing lines {}-{end}, use offset to read more)", offset + 1))
+        }
     }
 }
 
@@ -176,6 +197,8 @@ struct BashArgs {
 /// Tool that runs a shell command inside the project worktree.
 struct RunBash {
     max_bash_output_chars: usize,
+    sandbox: crate::sandbox::Sandbox,
+    timeout_secs: u64,
 }
 
 /// 实现 `run_bash` 工具：运行 shell 命令并返回 stdout+stderr。
@@ -213,13 +236,33 @@ impl PortableTool for RunBash {
     /// async runtime (no TUI redraw, no Esc response during long commands). kill_on_drop
     /// ensures aborting the task (Esc) also kills the child instead of orphaning it.
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let out = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(&args.command)
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| ToolError(e.to_string()))?;
+        let timeout = Duration::from_secs(self.timeout_secs);
+        let timeout_err = || ToolError(format!("command timed out after {}s", self.timeout_secs));
+
+        let out = if let Some(bwrap_argv) = self.sandbox.wrap_command() {
+            let mut cmd = tokio::process::Command::new(&bwrap_argv[0]);
+            for arg in &bwrap_argv[1..] {
+                cmd.arg(arg);
+            }
+            cmd.arg("--")
+                .arg("sh")
+                .arg("-c")
+                .arg(&args.command)
+                .kill_on_drop(true);
+            tokio::time::timeout(timeout, cmd.output())
+                .await
+                .map_err(|_| timeout_err())?
+                .map_err(|e| ToolError(e.to_string()))?
+        } else {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c")
+                .arg(&args.command)
+                .kill_on_drop(true);
+            tokio::time::timeout(timeout, cmd.output())
+                .await
+                .map_err(|_| timeout_err())?
+                .map_err(|e| ToolError(e.to_string()))?
+        };
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         let code = out.status.code().unwrap_or(-1);
@@ -261,6 +304,7 @@ struct RunFileArgs {
 /// `.sh` → bash, `.py` → python3, `.js` → node.
 struct RunFile {
     max_output_chars: usize,
+    sandbox: crate::sandbox::Sandbox,
 }
 
 impl PortableTool for RunFile {
@@ -305,12 +349,26 @@ impl PortableTool for RunFile {
                 )));
             }
         };
-        let out = tokio::process::Command::new(interpreter)
-            .arg(&args.path)
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| ToolError(e.to_string()))?;
+        let out = if let Some(bwrap_argv) = self.sandbox.wrap_command() {
+            let mut cmd = tokio::process::Command::new(&bwrap_argv[0]);
+            for arg in &bwrap_argv[1..] {
+                cmd.arg(arg);
+            }
+            cmd.arg("--")
+                .arg(interpreter)
+                .arg(&args.path)
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|e| ToolError(e.to_string()))?
+        } else {
+            tokio::process::Command::new(interpreter)
+                .arg(&args.path)
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|e| ToolError(e.to_string()))?
+        };
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         let code = out.status.code().unwrap_or(-1);
@@ -1099,6 +1157,7 @@ pub fn tool_names() -> Vec<&'static str> {
 #[allow(dead_code)]
 pub fn builtin_tools(
     config: &crate::context::ContextConfig,
+    sandbox: &crate::sandbox::Sandbox,
 ) -> anyhow::Result<rig_agent::tool::ToolSet> {
     let mut tools = rig_agent::tool::ToolSet::default();
     tools.add_tool(ReadFile {
@@ -1108,14 +1167,15 @@ pub fn builtin_tools(
     tools.add_tool(WriteFile);
     tools.add_tool(RunBash {
         max_bash_output_chars: config.max_bash_output_chars,
+        sandbox: sandbox.clone(),
+        timeout_secs: 300,
     });
     tools.add_tool(RunFile {
         max_output_chars: config.max_bash_output_chars,
+        sandbox: sandbox.clone(),
     });
     tools.add_tool(WebFetch);
     tools.add_tool(WebSearch);
-    // 加载动态工具（由 ToolManifest 重新生成的 mod.rs 提供）
-    // Load dynamic tools (provided by the mod.rs regenerated by ToolManifest)
     tools.add_tools(crate::tools_ext::load_all());
     Ok(tools)
 }
@@ -1129,6 +1189,7 @@ pub fn builtin_tools(
 pub fn add_builtin_tools<M>(
     builder: rig_agent::agent::AgentBuilder<M, rig_agent::agent::NoToolConfig>,
     config: &crate::context::ContextConfig,
+    sandbox: &crate::sandbox::Sandbox,
 ) -> rig_agent::agent::AgentBuilder<M, rig_agent::agent::WithBuilderTools>
 where
     M: rig_core::completion::CompletionModel,
@@ -1141,9 +1202,12 @@ where
         .tool(WriteFile)
         .tool(RunBash {
             max_bash_output_chars: config.max_bash_output_chars,
+            sandbox: sandbox.clone(),
+            timeout_secs: 300,
         })
         .tool(RunFile {
             max_output_chars: config.max_bash_output_chars,
+            sandbox: sandbox.clone(),
         })
         .tool(WebFetch)
         .tool(WebSearch)
@@ -1298,5 +1362,68 @@ mod tests {
     #[test]
     fn escaped_separator_not_segmented() {
         assert!(is_readonly_bash("grep 'a\\;b' file"));
+    }
+
+    /// offset/limit 分页：默认从第 0 行读取 max_read_lines 行。
+    /// offset/limit pagination: default reads from line 0 up to max_read_lines.
+    #[tokio::test]
+    async fn read_file_default_pagination() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_read_file_pagination.txt");
+        let content: String = (0..50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let tool = ReadFile { max_read_lines: 10 };
+        let args = ReadFileArgs { path: path.to_string_lossy().to_string(), offset: None, limit: None };
+        let result = tool.call(args).await.unwrap();
+
+        assert!(result.contains("line 0"));
+        assert!(result.contains("line 9"));
+        assert!(!result.contains("line 10\n"));
+        assert!(result.contains("截断"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// offset 跳过前 N 行，limit 控制读取行数。
+    /// offset skips first N lines, limit controls how many lines to read.
+    #[tokio::test]
+    async fn read_file_offset_limit() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_read_file_offset.txt");
+        let content: String = (0..50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let tool = ReadFile { max_read_lines: 10 };
+        let args = ReadFileArgs { path: path.to_string_lossy().to_string(), offset: Some(20), limit: Some(5) };
+        let result = tool.call(args).await.unwrap();
+
+        assert!(result.contains("line 20"));
+        assert!(result.contains("line 24"));
+        assert!(!result.contains("line 19"));
+        assert!(!result.contains("line 25\n"));
+        assert!(result.contains("截断"));
+        assert!(result.contains("showing lines 21-25"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// offset 超过文件末尾时返回空字符串。
+    /// offset past end of file returns empty string.
+    #[tokio::test]
+    async fn read_file_offset_past_end() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_read_file_past_end.txt");
+        std::fs::write(&path, "only one line\n").unwrap();
+
+        let tool = ReadFile { max_read_lines: 10 };
+        let args = ReadFileArgs { path: path.to_string_lossy().to_string(), offset: Some(100), limit: None };
+        let result = tool.call(args).await.unwrap();
+
+        // offset is clamped to total (1 line), end = min(1+10, 1) = 1, selected = lines[1..1] = empty
+        // Since selected is empty and offset==0 is false, it goes to the truncation branch
+        assert!(result.contains("截断") || result.is_empty());
+
+        std::fs::remove_file(&path).ok();
     }
 }

@@ -48,6 +48,10 @@ default_model = "glm-latest"
 max_turns = 30
 
 [context]
+# 仅对非推理模型生效（作为 API 的 max_tokens 参数）。
+# 推理模型（glm-/deepseek-r1/o系列/gpt-5+等）跳过此参数，使用模型默认输出预算。
+# Only applies to non-reasoning models (as the API max_tokens parameter).
+# Reasoning models (glm-/deepseek-r1/o-series/gpt-5+ etc) skip this, using the model's default output budget.
 max_output_tokens = 32768
 compaction_threshold = 0.5
 keep_recent_turns = 2

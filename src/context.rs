@@ -113,10 +113,6 @@ pub struct TokenBudget {
     /// Model's context window size (tokens).
     context_limit: usize,
 
-    /// 预留给模型输出的 token 数。
-    /// Tokens reserved for model output.
-    max_output_tokens: usize,
-
     /// 最近一次 API 返回的输入 token 数（校准估算用）。
     /// Last API-reported input token count (for calibrating estimates).
     last_input_tokens: u64,
@@ -129,19 +125,18 @@ pub struct TokenBudget {
 impl TokenBudget {
     /// 创建预算追踪器。
     /// Create a budget tracker.
-    pub fn new(context_limit: usize, max_output_tokens: usize) -> Self {
+    pub fn new(context_limit: usize) -> Self {
         Self {
             context_limit,
-            max_output_tokens,
             last_input_tokens: 0,
             accumulated_input: 0,
         }
     }
 
-    /// 有效预算 = 上下文窗口 - 输出预留。
-    /// Effective budget = context window - output reservation.
+    /// 有效预算 = 上下文窗口的 85%（预留 15% 给模型输出）。
+    /// Effective budget = 85% of context window (reserve 15% for model output).
     pub fn effective_budget(&self) -> usize {
-        self.context_limit.saturating_sub(self.max_output_tokens)
+        self.context_limit * 85 / 100
     }
 
     /// 记录一轮 API 返回的实际 token 用量。
@@ -687,6 +682,7 @@ pub fn truncate_at_char_boundary(s: &str, max_chars: usize) -> String {
 
 /// 将文本截断到 max_lines 行，并在截断时追加提示。
 /// Truncate text to max_lines, appending a notice when truncated.
+#[allow(dead_code)]
 pub fn truncate_lines(s: &str, max_lines: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
     if lines.len() <= max_lines {
@@ -754,39 +750,39 @@ mod tests {
 
     #[test]
     fn token_budget_effective_budget() {
-        let budget = TokenBudget::new(128_000, 4096);
-        assert_eq!(budget.effective_budget(), 123_904);
+        let budget = TokenBudget::new(128_000);
+        assert_eq!(budget.effective_budget(), 108_800);
     }
 
     #[test]
-    fn token_budget_effective_budget_saturating() {
-        let budget = TokenBudget::new(100, 200);
+    fn token_budget_effective_budget_zero_context() {
+        let budget = TokenBudget::new(0);
         assert_eq!(budget.effective_budget(), 0);
     }
 
     #[test]
     fn token_budget_near_overflow_below_threshold() {
-        let budget = TokenBudget::new(128_000, 4096);
-        // 50% of 123904 = 61952
+        let budget = TokenBudget::new(128_000);
+        // 50% of 108800 = 54400
         assert!(!budget.is_near_overflow(50_000, 0.75));
     }
 
     #[test]
     fn token_budget_near_overflow_at_threshold() {
-        let budget = TokenBudget::new(128_000, 4096);
-        // 80% of 123904 ≈ 99123
+        let budget = TokenBudget::new(128_000);
+        // 80% of 108800 ≈ 87040
         assert!(budget.is_near_overflow(100_000, 0.75));
     }
 
     #[test]
     fn token_budget_near_overflow_unknown_limit() {
-        let budget = TokenBudget::new(0, 4096);
+        let budget = TokenBudget::new(0);
         assert!(!budget.is_near_overflow(999_999, 0.75));
     }
 
     #[test]
     fn token_budget_record_usage() {
-        let mut budget = TokenBudget::new(128_000, 4096);
+        let mut budget = TokenBudget::new(128_000);
         let usage = Usage {
             input_tokens: 5000,
             output_tokens: 800,

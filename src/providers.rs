@@ -359,6 +359,36 @@ pub fn provider_additional_params() -> serde_json::Value {
     serde_json::json!({})
 }
 
+/// 判断模型是否为推理模型（产生独立 reasoning token）。
+///
+/// 推理模型的 `max_tokens` 限制"推理+可见输出+工具调用"的总和。
+/// 如果 `max_tokens` 设置过小，模型可能在推理阶段就用完预算，
+/// 导致没有任何可见输出或工具调用。
+///
+/// 对推理模型应跳过 `.max_tokens()`，让模型使用自身默认输出预算。
+///
+/// Detect whether a model is a reasoning model (produces separate reasoning tokens).
+///
+/// For reasoning models, `max_tokens` limits reasoning + visible output + tool calls combined.
+/// A small `max_tokens` may cause the model to exhaust its budget on reasoning alone,
+/// leaving nothing for visible output or tool calls.
+///
+/// Skip `.max_tokens()` for reasoning models to let them use their default output budget.
+pub fn is_reasoning_model(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    // GLM 系列（glm-latest, glm-4.7, glm-5, glm-5.2 等）支持 thinking 模式
+    // GLM series supports thinking mode
+    lower.contains("glm-")
+        // DeepSeek R1 是推理模型 / DeepSeek R1 is a reasoning model
+        || lower.contains("deepseek-r1")
+        // OpenAI o 系列（o1, o3, o4）/ OpenAI o-series
+        || lower.starts_with("o1") || lower.starts_with("o3") || lower.starts_with("o4")
+        // GPT-5+ 系列 / GPT-5+ series
+        || lower.contains("gpt-5")
+        // Claude 3.7+ / 4+ 支持扩展思考 / supports extended thinking
+        || lower.contains("claude-3.7") || lower.contains("claude-4")
+}
+
 /// 对话型 Agent 别名：基于 OpenAI CompletionModel 的 rig Agent（兼容所有供应商）。
 /// Chat Agent alias: a rig Agent based on OpenAI CompletionModel (compatible with all providers).
 pub type ChatAgent = rig_agent::agent::Agent<openai::CompletionModel>;
@@ -669,5 +699,29 @@ mod tests {
         unsafe {
             std::env::remove_var("MY_AGENT_PROVIDER");
         }
+    }
+
+    #[test]
+    fn is_reasoning_model_detects_known_reasoning_models() {
+        assert!(is_reasoning_model("glm-latest"));
+        assert!(is_reasoning_model("GLM-5.2"));
+        assert!(is_reasoning_model("glm-4.7"));
+        assert!(is_reasoning_model("deepseek-r1-250120"));
+        assert!(is_reasoning_model("o1-mini"));
+        assert!(is_reasoning_model("o3-mini"));
+        assert!(is_reasoning_model("o4-mini"));
+        assert!(is_reasoning_model("gpt-5"));
+        assert!(is_reasoning_model("claude-3.7-sonnet"));
+        assert!(is_reasoning_model("claude-4-opus"));
+    }
+
+    #[test]
+    fn is_reasoning_model_rejects_non_reasoning_models() {
+        assert!(!is_reasoning_model("kimi-k3"));
+        assert!(!is_reasoning_model("deepseek-v4-pro"));
+        assert!(!is_reasoning_model("gpt-4o"));
+        assert!(!is_reasoning_model("qwen-plus"));
+        assert!(!is_reasoning_model("doubao-1-5-pro-256k"));
+        assert!(!is_reasoning_model("claude-3-haiku"));
     }
 }

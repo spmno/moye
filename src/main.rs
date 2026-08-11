@@ -51,7 +51,14 @@ async fn main() -> Result<()> {
     }
     let config = crate::config::init("agent.toml")?;
     let mcp_manager = crate::mcp::McpManager::connect_all(&config.mcp).await;
-    let registry = AgentRegistry::new(config.clone(), Arc::new(mcp_manager));
+    let sandbox_backend =
+        crate::sandbox::SandboxBackend::parse(&config.sandbox.backend);
+    let sandbox = crate::sandbox::Sandbox::with_backend(
+        &config.sandbox.authorized_dirs,
+        sandbox_backend,
+    );
+    info!("[sandbox] backend={:?} root={}", sandbox.backend(), sandbox.root().display());
+    let registry = AgentRegistry::new(config.clone(), Arc::new(mcp_manager), sandbox);
     let orchestrator = Orchestrator::new(registry.clone());
     let evolver = PromptEvolver::new(registry.clone(), "AGENTS.md".to_string());
     let memory = memory::MemoryStore::new(&config.memory)?;

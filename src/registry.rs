@@ -164,10 +164,7 @@ impl RoleAgent {
 pub struct AgentRegistry {
     config: Arc<crate::config::Config>,
     mcp: Arc<McpManager>,
-    // 整个会话的运行时模型覆盖。一旦设置，所有角色都使用该 slug 而非各自配置的模型，
-    // Runtime model override for the entire session. Once set, all roles use this slug instead of their configured model,
-    // 让用户无需改文件即可从 REPL 切换到免费模型（如 tencent/hy3:free）。
-    // letting users switch to a free model (e.g. tencent/hy3:free) from REPL without editing files.
+    sandbox: crate::sandbox::Sandbox,
     session_model: Arc<Mutex<Option<String>>>,
     /// 会话级供应商覆盖（切回历史模型时恢复）。None 时走 env > config。
     /// Session-level provider override (restored when switching back). None falls through.
@@ -178,15 +175,16 @@ pub struct AgentRegistry {
 }
 
 impl AgentRegistry {
-    pub fn new(config: Arc<crate::config::Config>, mcp: Arc<McpManager>) -> Self {
-        // MY_AGENT_MODEL 环境变量作为会话级模型覆盖的初始值。
-        // The MY_AGENT_MODEL env var serves as the initial session-level model override.
-        // 优先级：/model REPL 命令 > MY_AGENT_MODEL env > agent.toml 各角色配置。
-        // Priority: /model REPL command > MY_AGENT_MODEL env > agent.toml per-role config.
+    pub fn new(
+        config: Arc<crate::config::Config>,
+        mcp: Arc<McpManager>,
+        sandbox: crate::sandbox::Sandbox,
+    ) -> Self {
         let session_model = std::env::var("MY_AGENT_MODEL").ok();
         Self {
             config,
             mcp,
+            sandbox,
             session_model: Arc::new(Mutex::new(session_model)),
             session_provider: Arc::new(Mutex::new(None)),
             session_base_url: Arc::new(Mutex::new(None)),
@@ -199,6 +197,7 @@ impl AgentRegistry {
         Self {
             config: self.config.clone(),
             mcp: self.mcp.clone(),
+            sandbox: self.sandbox.clone(),
             session_model: self.session_model.clone(),
             session_provider: self.session_provider.clone(),
             session_base_url: self.session_base_url.clone(),
@@ -249,6 +248,10 @@ impl AgentRegistry {
     /// The autonomous loop's max turns, passed through from config.
     pub fn max_turns(&self) -> usize {
         self.config.max_turns()
+    }
+
+    pub fn sandbox(&self) -> &crate::sandbox::Sandbox {
+        &self.sandbox
     }
 
     pub fn max_turns_for_role(&self, role: Role) -> usize {
@@ -316,7 +319,7 @@ impl AgentRegistry {
                 .temperature(crate::providers::Provider::clamp_temperature(0.7))
                 .additional_params(params)
                 .default_max_turns(max_turns);
-            let builder = crate::tools::add_builtin_tools(builder, self.context_config());
+            let builder = crate::tools::add_builtin_tools(builder, self.context_config(), &self.sandbox);
             let builder = if !self.mcp.is_empty() {
                 let mut b = builder;
                 for (tools, sink) in self.mcp.all_tools_and_sinks() {

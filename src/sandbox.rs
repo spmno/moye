@@ -7,8 +7,17 @@
 // If access to other directories is needed, the Agent prompts the user via the HITL mechanism;
 // once the user confirms, that directory is added to the authorized list.
 //
+// 两层防护：
+// Two layers of protection:
+// 1. 路径检查（HITL 门控）——所有工具调用前检查路径是否在沙箱内。
+//    Path check (HITL gate) — checks all paths before tool execution.
+// 2. OS 级沙箱（进程隔离）——run_bash 命令在 bwrap（Linux）或 sandbox-exec（macOS）中执行。
+//    OS-level sandbox (process isolation) — run_bash commands execute inside bwrap (Linux) or sandbox-exec (macOS).
+//
 // 可通过环境变量 MY_AGENT_SANDBOX=off 禁用沙箱（不推荐）。
 // The sandbox can be disabled via the MY_AGENT_SANDBOX=off environment variable (not recommended).
+// 可通过 MY_AGENT_SANDBOX_BACKEND=auto|bwrap|seatbelt|path|off 选择后端。
+// Select the backend via MY_AGENT_SANDBOX_BACKEND=auto|bwrap|seatbelt|path|off.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -22,6 +31,86 @@ pub enum SandboxError {
     /// The path is outside the sandbox; user authorization is required.
     #[error("路径 '{path}' 在沙箱之外，需要用户授权后才能访问")]
     OutsideSandbox { path: String },
+}
+
+/// OS 级沙箱后端。
+/// OS-level sandbox backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxBackend {
+    /// 自动检测可用后端（Linux 优先 bwrap，macOS 优先 Seatbelt）。
+    /// Auto-detect the best available backend (bwrap on Linux, Seatbelt on macOS).
+    Auto,
+    /// Linux: Bubblewrap（bwrap）——通过命名空间隔离文件系统。
+    /// Linux: Bubblewrap (bwrap) — filesystem isolation via namespaces.
+    Bwrap,
+    /// macOS: Seatbelt（sandbox-exec）——系统策略级沙箱。
+    /// macOS: Seatbelt (sandbox-exec) — system policy-level sandbox.
+    Seatbelt,
+    /// 仅路径检查，不使用 OS 级沙箱（原有行为）。
+    /// Path checking only, no OS-level sandbox (original behavior).
+    Path,
+    /// 完全禁用沙箱。
+    /// Sandbox completely disabled.
+    Off,
+}
+
+impl SandboxBackend {
+    /// 从字符串解析后端选择。
+    /// Parse a backend choice from a string.
+    pub fn parse(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "auto" => SandboxBackend::Auto,
+            "bwrap" | "bubblewrap" => SandboxBackend::Bwrap,
+            "seatbelt" | "sandbox-exec" => SandboxBackend::Seatbelt,
+            "path" | "path-only" => SandboxBackend::Path,
+            "off" | "false" | "0" => SandboxBackend::Off,
+            _ => SandboxBackend::Auto,
+        }
+    }
+
+    /// 在当前平台上检测可用的 OS 级沙箱后端。
+    /// Detect the available OS-level sandbox backend on the current platform.
+    pub fn detect() -> SandboxBackend {
+        #[cfg(target_os = "linux")]
+        {
+            if which("bwrap").is_some() {
+                SandboxBackend::Bwrap
+            } else {
+                SandboxBackend::Path
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // sandbox-exec is always present on macOS.
+            SandboxBackend::Seatbelt
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            SandboxBackend::Path
+        }
+    }
+
+    /// 解析为实际使用的后端（Auto → 检测结果）。
+    /// Resolve to the actual backend in use (Auto → detection result).
+    pub fn resolve(self) -> SandboxBackend {
+        match self {
+            SandboxBackend::Auto => Self::detect(),
+            other => other,
+        }
+    }
+}
+
+/// 在 PATH 中查找可执行文件。
+/// Find an executable in PATH.
+fn which(cmd: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let full = dir.join(cmd);
+        if full.is_file() {
+            return Some(full);
+        }
+    }
+    None
 }
 
 /// 沙箱：限制 Agent 的文件系统访问范围。
@@ -43,6 +132,9 @@ pub struct Sandbox {
     /// 是否启用沙箱。
     /// Whether the sandbox is enabled.
     enabled: bool,
+    /// OS 级沙箱后端（已解析，非 Auto）。
+    /// OS-level sandbox backend (resolved, not Auto).
+    backend: SandboxBackend,
 }
 
 impl Sandbox {
@@ -54,6 +146,14 @@ impl Sandbox {
         let enabled = std::env::var("MY_AGENT_SANDBOX")
             .map(|v| !matches!(v.as_str(), "off" | "false" | "0"))
             .unwrap_or(true);
+        let backend_env = std::env::var("MY_AGENT_SANDBOX_BACKEND")
+            .map(|v| SandboxBackend::parse(&v))
+            .unwrap_or(SandboxBackend::Auto);
+        let backend = if !enabled {
+            SandboxBackend::Off
+        } else {
+            backend_env.resolve()
+        };
         let root = std::env::current_dir()
             .and_then(|p| p.canonicalize())
             .unwrap_or_else(|_| PathBuf::from("."));
@@ -61,20 +161,32 @@ impl Sandbox {
             root,
             authorized: Arc::new(Mutex::new(HashSet::new())),
             enabled,
+            backend,
         }
     }
 
-    /// 创建沙箱并预授权一组目录（来自配置文件 `[sandbox].authorized_dirs`）。
+    /// 创建沙箱并预授权一组目录（来自配置文件 `[sandbox]` 配置）。
     /// Creates a sandbox and pre-authorizes a set of directories
-    /// (from the config file's `[sandbox].authorized_dirs`).
+    /// (from the config file's `[sandbox]` section).
     ///
     /// 这些目录及其子目录可直接访问，无需弹窗确认。
     /// These directories and their subdirectories can be accessed without prompting.
     pub fn with_authorized_dirs(dirs: &[String]) -> Self {
-        let sb = Self::new();
+        Self::with_backend(dirs, SandboxBackend::Auto)
+    }
+
+    /// 创建沙箱，指定后端和预授权目录。
+    /// Creates a sandbox with an explicit backend and pre-authorized directories.
+    pub fn with_backend(dirs: &[String], backend: SandboxBackend) -> Self {
+        let mut sb = Self::new();
         if !sb.enabled {
             return sb;
         }
+        sb.backend = if backend == SandboxBackend::Auto {
+            SandboxBackend::detect()
+        } else {
+            backend
+        };
         for dir in dirs {
             sb.authorize(dir);
         }
@@ -93,6 +205,81 @@ impl Sandbox {
     #[allow(dead_code)]
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// 返回 OS 级沙箱后端（已解析）。
+    /// Returns the resolved OS-level sandbox backend.
+    pub fn backend(&self) -> SandboxBackend {
+        self.backend
+    }
+
+    /// 构建 OS 级沙箱的命令前缀 argv。
+    /// Builds the OS-level sandbox command prefix argv.
+    ///
+    /// 返回 `Some(argv)` 时，工具应执行 `argv + [--, sh, -c, <command>]`。
+    /// 返回 `None` 时，工具直接执行 `sh -c <command>`（无 OS 级沙箱）。
+    /// Returns `Some(argv)` → tool runs `argv + [--, sh, -c, <command>]`.
+    /// Returns `None` → tool runs `sh -c <command>` directly (no OS sandbox).
+    ///
+    /// bwrap 策略：只读绑定根文件系统，读写绑定工作区 + 已授权目录，
+    /// 创建独立的 /dev、/proc、/tmp。`--die-with-parent` 确保父进程退出时子进程一并退出。
+    /// bwrap policy: read-only bind of root fs, read-write bind of workspace + authorized dirs,
+    /// fresh /dev, /proc, /tmp. `--die-with-parent` kills children when the parent exits.
+    pub fn wrap_command(&self) -> Option<Vec<String>> {
+        match self.backend {
+            SandboxBackend::Bwrap => {
+                let mut argv = vec!["bwrap".to_string()];
+                argv.push("--ro-bind".into());
+                argv.push("/".into());
+                argv.push("/".into());
+                argv.push("--bind".into());
+                argv.push(self.root.to_string_lossy().to_string());
+                argv.push(self.root.to_string_lossy().to_string());
+                let authorized = self.authorized.lock().unwrap();
+                for dir in authorized.iter() {
+                    argv.push("--bind".into());
+                    argv.push(dir.to_string_lossy().to_string());
+                    argv.push(dir.to_string_lossy().to_string());
+                }
+                drop(authorized);
+                argv.push("--dev".into());
+                argv.push("/dev".into());
+                argv.push("--proc".into());
+                argv.push("/proc".into());
+                argv.push("--tmpfs".into());
+                argv.push("/tmp".into());
+                argv.push("--die-with-parent".into());
+                Some(argv)
+            }
+            SandboxBackend::Seatbelt => {
+                let policy = self.seatbelt_policy();
+                let argv = vec![
+                    "sandbox-exec".to_string(),
+                    "-p".into(),
+                    policy,
+                ];
+                Some(argv)
+            }
+            _ => None,
+        }
+    }
+
+    /// 生成 macOS Seatbelt 策略字符串。
+    /// Generates the macOS Seatbelt policy string.
+    fn seatbelt_policy(&self) -> String {
+        let mut policy = String::from("(version 1)(allow default)(deny file-write*)");
+        policy.push_str(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            self.root.to_string_lossy()
+        ));
+        let authorized = self.authorized.lock().unwrap();
+        for dir in authorized.iter() {
+            policy.push_str(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                dir.to_string_lossy()
+            ));
+        }
+        policy
     }
 
     /// 检查单个路径是否在沙箱内。
@@ -713,9 +900,100 @@ mod tests {
             root: PathBuf::from("."),
             authorized: Arc::new(Mutex::new(HashSet::new())),
             enabled: false,
+            backend: SandboxBackend::Off,
         };
         assert!(sb.check_path("/etc/passwd").is_ok());
         assert!(sb.check_bash("cat /etc/passwd").is_ok());
         assert!(sb.check_tool("read_file", r#"{"path":"/etc/passwd"}"#).is_none());
+    }
+
+    #[test]
+    fn backend_parse_strings() {
+        assert_eq!(SandboxBackend::parse("auto"), SandboxBackend::Auto);
+        assert_eq!(SandboxBackend::parse("BWRAP"), SandboxBackend::Bwrap);
+        assert_eq!(SandboxBackend::parse("bubblewrap"), SandboxBackend::Bwrap);
+        assert_eq!(SandboxBackend::parse("seatbelt"), SandboxBackend::Seatbelt);
+        assert_eq!(SandboxBackend::parse("path"), SandboxBackend::Path);
+        assert_eq!(SandboxBackend::parse("off"), SandboxBackend::Off);
+        assert_eq!(SandboxBackend::parse("unknown"), SandboxBackend::Auto);
+    }
+
+    #[test]
+    fn backend_resolve_auto() {
+        let auto = SandboxBackend::Auto;
+        let resolved = auto.resolve();
+        assert_ne!(resolved, SandboxBackend::Auto);
+    }
+
+    #[test]
+    fn wrap_command_path_backend_returns_none() {
+        let sb = Sandbox {
+            root: PathBuf::from("/tmp"),
+            authorized: Arc::new(Mutex::new(HashSet::new())),
+            enabled: true,
+            backend: SandboxBackend::Path,
+        };
+        assert!(sb.wrap_command().is_none());
+    }
+
+    #[test]
+    fn wrap_command_off_returns_none() {
+        let sb = Sandbox {
+            root: PathBuf::from("/tmp"),
+            authorized: Arc::new(Mutex::new(HashSet::new())),
+            enabled: false,
+            backend: SandboxBackend::Off,
+        };
+        assert!(sb.wrap_command().is_none());
+    }
+
+    #[test]
+    fn wrap_command_bwrap_includes_root_and_workspace() {
+        let workspace = std::env::current_dir().unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let sb = Sandbox {
+            root: workspace.clone(),
+            authorized: Arc::new(Mutex::new(HashSet::new())),
+            enabled: true,
+            backend: SandboxBackend::Bwrap,
+        };
+        let argv = sb.wrap_command().expect("bwrap should produce argv");
+        assert_eq!(argv[0], "bwrap");
+        assert!(argv.contains(&"--ro-bind".to_string()));
+        assert!(argv.contains(&"--dev".to_string()));
+        assert!(argv.contains(&"--proc".to_string()));
+        assert!(argv.contains(&"--tmpfs".to_string()));
+        assert!(argv.contains(&"--die-with-parent".to_string()));
+        let ws_str = workspace.to_string_lossy().to_string();
+        assert!(argv.contains(&ws_str), "workspace path must appear in bwrap argv");
+    }
+
+    #[test]
+    fn wrap_command_bwrap_includes_authorized_dirs() {
+        let workspace = std::env::current_dir().unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let sb = Sandbox {
+            root: workspace,
+            authorized: Arc::new(Mutex::new(HashSet::from([
+                PathBuf::from("/tmp/authorized"),
+            ]))),
+            enabled: true,
+            backend: SandboxBackend::Bwrap,
+        };
+        let argv = sb.wrap_command().expect("bwrap should produce argv");
+        assert!(argv.contains(&"/tmp/authorized".to_string()));
+    }
+
+    #[test]
+    fn seatbelt_policy_includes_workspace() {
+        let sb = Sandbox {
+            root: PathBuf::from("/home/user/project"),
+            authorized: Arc::new(Mutex::new(HashSet::new())),
+            enabled: true,
+            backend: SandboxBackend::Seatbelt,
+        };
+        let policy = sb.seatbelt_policy();
+        assert!(policy.contains("deny file-write*"));
+        assert!(policy.contains("/home/user/project"));
     }
 }

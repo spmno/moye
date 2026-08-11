@@ -966,7 +966,7 @@ fn build_runner_agent(
         .agent(&model)
         .preamble(&preamble)
         .temperature(crate::providers::Provider::clamp_temperature(0.7));
-    let agent = crate::tools::add_builtin_tools(builder, registry.context_config())
+    let agent = crate::tools::add_builtin_tools(builder, registry.context_config(), registry.sandbox())
         .additional_params(params)
         .default_max_turns(max_turns)
         .max_tokens(max_output)

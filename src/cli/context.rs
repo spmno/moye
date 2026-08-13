@@ -95,7 +95,7 @@ impl AppContext {
                 return format!("写入 agent.toml 失败: {e}");
             }
             return format!(
-                "套餐已切换为 {}（{}）。请重启 my-agent 生效。",
+                "套餐已切换为 {}（{}）。请重启 moye 生效。",
                 new_plan.slug(),
                 new_plan.label()
             );
@@ -181,7 +181,7 @@ impl AppContext {
     pub fn cmd_help(&self) -> String {
         let provider = format!("{:?}", crate::providers::current_provider());
         format!(
-            "my-agent ({provider}) | model: {}\n\
+            "moye ({provider}) | model: {}\n\
              \u{2500}\u{2500}\u{2500} \u{547d}\u{4ee4} \u{2500}\u{2500}\u{2500}\n\
              /model [slug]       \u{67e5}\u{770b}\u{6216}\u{5207}\u{6362}\u{5f53}\u{524d}\u{4f1a}\u{8bdd}\u{6a21}\u{578b}\n\
              /models             \u{6253}\u{5f00}\u{4ea4}\u{4e92}\u{5f0f}\u{6a21}\u{578b}\u{9009}\u{62e9}\u{5668}\n\
@@ -367,12 +367,12 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
-/// 解析默认模型：优先 `MY_AGENT_MODEL` 环境变量，其次统一配置中
+/// 解析默认模型：优先 `AGENT_MODEL` 环境变量，其次统一配置中
 /// `[agent].default_model`；均缺失时返回 `None`。
-/// Resolve the default model: prefer the `MY_AGENT_MODEL` env var, then the
+/// Resolve the default model: prefer the `AGENT_MODEL` env var, then the
 /// `[agent].default_model` from the unified config; returns `None` when both are absent.
 fn resolve_default_model() -> Option<String> {
-    std::env::var("MY_AGENT_MODEL").ok().or_else(|| {
+    std::env::var("AGENT_MODEL").ok().or_else(|| {
         let dm = &crate::config::config()?.agent.default_model;
         if dm.is_empty() {
             None

@@ -1,23 +1,23 @@
 # Agent 运行时配置。
-# 通过环境变量 MY_AGENT_PROVIDER 选择供应商（deepseek / bailian / moonshot / volcengine）。
+# 通过环境变量 AGENT_PROVIDER 选择供应商（deepseek / bailian / moonshot / volcengine）。
 # API Key 从供应商对应的环境变量读取（DEEPSEEK / DASHSCOPE / MOONSHOT / ARK）。
 
 [provider]
 # 默认供应商（deepseek / bailian / moonshot / volcengine / custom）。
-# 优先级：MY_AGENT_PROVIDER 环境变量（或 .env）> 此处配置 > deepseek。
+# 优先级：AGENT_PROVIDER 环境变量（或 .env）> 此处配置 > deepseek。
 # 推荐：把配置写进项目根的 .env 文件（参考 .env.example），启动时自动加载。
-# Priority: MY_AGENT_PROVIDER env (or .env) > this config > deepseek.
+# Priority: AGENT_PROVIDER env (or .env) > this config > deepseek.
 provider = "custom"
 
 # 可选：全局覆盖 OpenAI 兼容 base URL。
-# 优先级：MY_AGENT_BASE_URL 环境变量 > 此处配置 > 供应商默认。
+# 优先级：AGENT_BASE_URL 环境变量 > 此处配置 > 供应商默认。
 # Optional: global OpenAI-compatible base URL override.
-# Priority: MY_AGENT_BASE_URL env > this config > provider default.
+# Priority: AGENT_BASE_URL env > this config > provider default.
 base_url = "https://ai-gateway.mxcdp.com"
 
 # 可选：自定义 API key 环境变量名（默认按供应商自动选择）。
 # Optional: custom API key env var name (defaults to the provider's standard name).
-api_key_env = "MY_AGENT_API_KEY"
+api_key_env = "AGENT_API_KEY"
 
 # 可选：API 套餐（standard / coding / agent）。仅部分供应商支持套餐端点：
 #   volcengine: standard(按量 /api/v3) | coding(/api/coding/v3) | agent(/api/plan/v3)
@@ -25,10 +25,10 @@ api_key_env = "MY_AGENT_API_KEY"
 #   moonshot:   standard(api.moonshot.cn/v1) | coding(api.kimi.com/coding/v1)
 #   zhipu:      standard(api/paas/v4) | coding(api/coding/paas/v4)
 # 注意：套餐 API Key 与按量付费 Key 不互通，需在对应套餐控制台单独创建。
-# 优先级：MY_AGENT_PLAN 环境变量 > 此处配置 > standard。
+# 优先级：AGENT_PLAN 环境变量 > 此处配置 > standard。
 # Optional: API plan (standard / coding / agent). Only some providers support plan endpoints.
 # Plan API keys are NOT interchangeable with pay-as-you-go keys.
-# Priority: MY_AGENT_PLAN env > this config > standard.
+# Priority: AGENT_PLAN env > this config > standard.
 # plan = "agent"
 
 [agent]
@@ -137,16 +137,16 @@ rule_escalation_threshold = 3
 # 如果需要访问其它目录（如 /etc、/tmp、~/.config），会暂停并请求用户授权。
 # 用户确认后，该目录被加入授权列表，后续访问不再询问。
 #
-# 通过环境变量 MY_AGENT_SANDBOX=off 可禁用沙箱（不推荐）。
-# 通过环境变量 MY_AGENT_TRUST_SANDBOX=on 可在启动时开启信任模式（所有沙箱外访问自动授权）。
+# 通过环境变量 AGENT_SANDBOX=off 可禁用沙箱（不推荐）。
+# 通过环境变量 AGENT_TRUST_SANDBOX=on 可在启动时开启信任模式（所有沙箱外访问自动授权）。
 #
 # The Agent can only access the project root (current working directory) and its
 # subdirectories by default. Access to other directories (e.g. /etc, /tmp,
 # ~/.config) will pause and prompt the user for authorization. Once authorized,
 # the directory is added to the allow-list and subsequent accesses won't prompt.
 #
-# Disable via MY_AGENT_SANDBOX=off (not recommended).
-# Enable trust mode via MY_AGENT_TRUST_SANDBOX=on (auto-authorize all out-of-sandbox access).
+# Disable via AGENT_SANDBOX=off (not recommended).
+# Enable trust mode via AGENT_TRUST_SANDBOX=on (auto-authorize all out-of-sandbox access).
 
 [sandbox]
 # 预授权目录列表：这些目录及其子目录可直接访问，无需弹窗确认。
@@ -155,5 +155,5 @@ rule_escalation_threshold = 3
 # accessible without prompting. Supports ~ expansion (e.g. ~/.config).
 #
 # 示例 / Example:
-# authorized_dirs = ["~/.config", "/tmp/my-agent", "../shared-libs"]
+# authorized_dirs = ["~/.config", "/tmp/moye", "../shared-libs"]
 authorized_dirs = []

@@ -526,7 +526,7 @@ pub async fn run_tui(ctx: Arc<AppContext>) -> anyhow::Result<()> {
 
     let mut state = TuiState::new(provider, model, max_turns, tool_names, mcp_servers, skill_names);
     state.push_event(AgentEvent::System(format!(
-        "my-agent ({}) | model: {}",
+        "moye ({}) | model: {}",
         state.provider, state.model
     )));
     state.push_event(AgentEvent::Info(

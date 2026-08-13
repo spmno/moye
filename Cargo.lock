@@ -1392,8 +1392,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "my-agent"
-version = "0.1.0"
+name = "moye"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "chrono",

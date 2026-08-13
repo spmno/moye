@@ -70,8 +70,8 @@ pub struct McpServerConfig {
     /// stdio transport: environment variables for the child process.
     #[serde(default)]
     pub env: HashMap<String, String>,
-    /// npm 包名：设置后，首次使用时自动安装到 `~/.my-agent/`，后续直接使用本地二进制。
-    /// npm package name: when set, auto-installs to `~/.my-agent/` on first use, then runs the local binary.
+    /// npm 包名：设置后，首次使用时自动安装到 `~/.moye/`，后续直接使用本地二进制。
+    /// npm package name: when set, auto-installs to `~/.moye/` on first use, then runs the local binary.
     pub package: Option<String>,
     /// 初始化参数：设置后，若 `init_if_missing` 指定的目录不存在，则在启动 MCP server 之前
     /// 用这些参数运行一次初始化命令（如 `["init"]` → `codegraph init`）。
@@ -150,15 +150,15 @@ impl Config {
 #[derive(Debug, Deserialize, Default)]
 pub struct ProviderSection {
     /// 默认供应商 slug（deepseek / bailian / moonshot / custom）。
-    /// `MY_AGENT_PROVIDER` 环境变量优先于此值。
+    /// `AGENT_PROVIDER` 环境变量优先于此值。
     pub provider: Option<String>,
-    /// 全局 OpenAI 兼容 base URL 覆盖。`MY_AGENT_BASE_URL` 环境变量优先。
+    /// 全局 OpenAI 兼容 base URL 覆盖。`AGENT_BASE_URL` 环境变量优先。
     pub base_url: Option<String>,
     /// 自定义 API key 环境变量名；为空时按供应商自动选择。
     pub api_key_env: Option<String>,
     /// API 套餐：standard（按量付费，默认）/ coding / agent。
     /// 仅部分供应商支持套餐端点（volcengine / bailian / moonshot / zhipu）。
-    /// `MY_AGENT_PLAN` 环境变量优先于此值。
+    /// `AGENT_PLAN` 环境变量优先于此值。
     #[serde(default)]
     pub plan: Option<String>,
 }
@@ -182,11 +182,11 @@ pub struct EvolutionSection {
 
 static CONFIG: OnceLock<Arc<Config>> = OnceLock::new();
 
-/// 启动时调用一次：加载项目 `agent.toml`，再用全局 `~/.config/my-agent/config.toml`
+/// 启动时调用一次：加载项目 `agent.toml`，再用全局 `~/.config/moye/config.toml`
 /// 作为 fallback 填充项目中缺失的 `[provider]` 字段，最后缓存并返回共享 Arc。
 /// 合并优先级：环境变量 > 项目 agent.toml > 全局 config.toml > 供应商默认。
 /// Call once at startup: loads the project `agent.toml`, then fills in any missing
-/// `[provider]` fields from the global `~/.config/my-agent/config.toml` as a fallback,
+/// `[provider]` fields from the global `~/.config/moye/config.toml` as a fallback,
 /// before caching and returning the shared Arc.
 /// Precedence: env vars > project agent.toml > global config.toml > provider default.
 ///
@@ -214,9 +214,9 @@ pub fn init(path: &str) -> anyhow::Result<Arc<Config>> {
     Ok(CONFIG.get_or_init(|| cfg).clone())
 }
 
-/// 检查本地 `agent.toml` 或全局 `~/.config/my-agent/config.toml` 是否存在。
+/// 检查本地 `agent.toml` 或全局 `~/.config/moye/config.toml` 是否存在。
 /// 任一存在即跳过 setup 向导。
-/// Checks if a local `agent.toml` or global `~/.config/my-agent/config.toml` exists.
+/// Checks if a local `agent.toml` or global `~/.config/moye/config.toml` exists.
 /// Either being present skips the setup wizard.
 pub fn has_config_file() -> bool {
     std::path::Path::new("agent.toml").exists()
@@ -225,14 +225,14 @@ pub fn has_config_file() -> bool {
             .unwrap_or(false)
 }
 
-/// 返回全局配置路径 `~/.config/my-agent/config.toml`；`HOME` 未设置时返回 `None`。
-/// Return the global config path `~/.config/my-agent/config.toml`; `None` when `HOME` is unset.
+/// 返回全局配置路径 `~/.config/moye/config.toml`；`HOME` 未设置时返回 `None`。
+/// Return the global config path `~/.config/moye/config.toml`; `None` when `HOME` is unset.
 fn global_config_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(
         PathBuf::from(home)
             .join(".config")
-            .join("my-agent")
+            .join("moye")
             .join("config.toml"),
     )
 }
@@ -296,7 +296,7 @@ pub fn default_model_for_provider_plan(provider: &str, plan: &str) -> &'static s
     }
 }
 
-/// 当项目根目录没有 `agent.toml` 时，从全局配置 `~/.config/my-agent/config.toml`
+/// 当项目根目录没有 `agent.toml` 时，从全局配置 `~/.config/moye/config.toml`
 /// 的 `[provider]` 信息 + 合理默认值自动生成一个完整的 `agent.toml`。
 /// When the project root has no `agent.toml`, auto-generate a complete one from
 /// the global config's `[provider]` info + sensible defaults.
@@ -516,7 +516,7 @@ rules_file = "rules.json"
 rule_escalation_threshold = 5
 
 [sandbox]
-authorized_dirs = ["~/.config", "/tmp/my-agent"]
+authorized_dirs = ["~/.config", "/tmp/moye"]
 "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.provider.provider.as_deref(), Some("moonshot"));
@@ -534,7 +534,7 @@ authorized_dirs = ["~/.config", "/tmp/my-agent"]
         assert_eq!(cfg.evolution.rule_escalation_threshold, 5);
         assert_eq!(cfg.sandbox.authorized_dirs.len(), 2);
         assert_eq!(cfg.sandbox.authorized_dirs[0], "~/.config");
-        assert_eq!(cfg.sandbox.authorized_dirs[1], "/tmp/my-agent");
+        assert_eq!(cfg.sandbox.authorized_dirs[1], "/tmp/moye");
     }
 
     #[test]
@@ -652,7 +652,7 @@ MOONSHOT_API_KEY = "global-moon"
     fn generate_agent_toml_produces_valid_config() {
         // 生成的 agent.toml 应能被 Config::load 正确解析。
         // The generated agent.toml should be parseable by Config::load.
-        let tmp = std::env::temp_dir().join("my-agent-test-gen.toml");
+        let tmp = std::env::temp_dir().join("moye-test-gen.toml");
         generate_agent_toml(tmp.to_string_lossy().as_ref()).unwrap();
         let raw = std::fs::read_to_string(&tmp).unwrap();
         let cfg: Config = toml::from_str(&raw).unwrap();

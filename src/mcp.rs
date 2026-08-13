@@ -15,7 +15,7 @@ use crate::config::McpServerConfig;
 
 fn mcp_home() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".my-agent"))
+    Some(PathBuf::from(home).join(".moye"))
 }
 
 fn local_bin_path(command: &str) -> Option<PathBuf> {
@@ -24,14 +24,14 @@ fn local_bin_path(command: &str) -> Option<PathBuf> {
 
 async fn ensure_installed(command: &str, package: &str) -> Result<PathBuf> {
     let bin = local_bin_path(command)
-        .with_context(|| "HOME not set; cannot resolve ~/.my-agent path")?;
+        .with_context(|| "HOME not set; cannot resolve ~/.moye path")?;
 
     if bin.exists() {
         return Ok(bin);
     }
 
     let dir = mcp_home()
-        .with_context(|| "HOME not set; cannot resolve ~/.my-agent path")?;
+        .with_context(|| "HOME not set; cannot resolve ~/.moye path")?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create directory {:?}", dir))?;
 

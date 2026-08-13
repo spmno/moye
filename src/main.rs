@@ -64,8 +64,8 @@ async fn main() -> Result<()> {
     let memory = memory::MemoryStore::new(&config.memory)?;
     let rule_threshold = config.evolution.rule_escalation_threshold;
 
-    // 加载跨会话模型历史（~/.config/my-agent/models.json）；失败时回退空历史，不阻断启动。
-    // Load cross-session model history (~/.config/my-agent/models.json); fall back to empty
+    // 加载跨会话模型历史（~/.config/moye/models.json）；失败时回退空历史，不阻断启动。
+    // Load cross-session model history (~/.config/moye/models.json); fall back to empty
     // on failure without blocking startup.
     let model_history = Arc::new(Mutex::new(ModelHistory::load()));
 

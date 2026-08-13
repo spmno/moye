@@ -181,7 +181,7 @@ impl AgentRegistry {
         mcp: Arc<McpManager>,
         sandbox: crate::sandbox::Sandbox,
     ) -> Self {
-        let session_model = std::env::var("MY_AGENT_MODEL").ok();
+        let session_model = std::env::var("AGENT_MODEL").ok();
         Self {
             config,
             mcp,
@@ -585,9 +585,9 @@ pub struct Orchestrator {
 
 impl Orchestrator {
     pub fn new(registry: AgentRegistry) -> Self {
-        // 环境变量 MY_AGENT_TRUST_SANDBOX=on 可在启动时开启信任模式。
-        // The MY_AGENT_TRUST_SANDBOX=on env var enables trust mode at startup.
-        let trust = std::env::var("MY_AGENT_TRUST_SANDBOX")
+        // 环境变量 AGENT_TRUST_SANDBOX=on 可在启动时开启信任模式。
+        // The AGENT_TRUST_SANDBOX=on env var enables trust mode at startup.
+        let trust = std::env::var("AGENT_TRUST_SANDBOX")
             .map(|v| matches!(v.as_str(), "on" | "true" | "1"))
             .unwrap_or(false);
         // 从配置文件 [sandbox].authorized_dirs 预授权目录。

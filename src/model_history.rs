@@ -1,9 +1,9 @@
 //! 模型历史模块：把用户用过的模型（slug + 供应商 + base URL + 使用次数 + 最近时间）
-//! 持久化到 `~/.config/my-agent/models.json`，供 `/models` 选择器列出"最近使用"分区，
+//! 持久化到 `~/.config/moye/models.json`，供 `/models` 选择器列出"最近使用"分区，
 //! 让用户一键切回之前用过的模型，无需重新输入 slug。
 //!
 //! Model history module: persists used models (slug + provider + base URL + use count +
-//! last-used time) to `~/.config/my-agent/models.json`, so the `/models` selector can list
+//! last-used time) to `~/.config/moye/models.json`, so the `/models` selector can list
 //! a "recently used" section and let users switch back to a previously used model without
 //! retyping the slug.
 
@@ -134,11 +134,11 @@ impl ModelHistory {
     }
 }
 
-/// 返回历史文件路径 `~/.config/my-agent/models.json`；`HOME` 未设置时返回 `None`。
-/// Return the history file path `~/.config/my-agent/models.json`; `None` when `HOME` is unset.
+/// 返回历史文件路径 `~/.config/moye/models.json`；`HOME` 未设置时返回 `None`。
+/// Return the history file path `~/.config/moye/models.json`; `None` when `HOME` is unset.
 fn history_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".config").join("my-agent").join("models.json"))
+    Some(PathBuf::from(home).join(".config").join("moye").join("models.json"))
 }
 
 /// 当前 Unix 时间戳（秒）；系统时钟异常时退回 0。

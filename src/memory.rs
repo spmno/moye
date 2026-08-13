@@ -219,7 +219,7 @@ mod tests {
 
     fn tmp_store(tag: &str) -> MemoryStore {
         let dir = std::env::temp_dir().join(format!(
-            "my-agent-test-{tag}-{}",
+            "moye-test-{tag}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn load_rules_from_file_missing_returns_empty() {
-        let path = std::env::temp_dir().join("my-agent-nonexistent-rules.json");
+        let path = std::env::temp_dir().join("moye-nonexistent-rules.json");
         let _ = std::fs::remove_file(&path);
         assert!(load_rules_from_file(&path).is_empty());
     }
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn load_rules_from_file_parses_json() {
         let dir = std::env::temp_dir().join(format!(
-            "my-agent-test-rf-{}",
+            "moye-test-rf-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

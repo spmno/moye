@@ -408,14 +408,14 @@ impl PortableTool for RunFile {
 // ─── Web tools ───────────────────────────────────────────────────────────
 
 /// 构建带代理支持的 reqwest Client。
-/// 优先级：MY_AGENT_PROXY > HTTPS_PROXY > HTTP_PROXY。均未设置时不使用代理。
+/// 优先级：AGENT_PROXY > HTTPS_PROXY > HTTP_PROXY。均未设置时不使用代理。
 /// Builds a reqwest Client with proxy support.
-/// Priority: MY_AGENT_PROXY > HTTPS_PROXY > HTTP_PROXY. No proxy when none are set.
+/// Priority: AGENT_PROXY > HTTPS_PROXY > HTTP_PROXY. No proxy when none are set.
 fn build_web_client() -> std::result::Result<reqwest::Client, ToolError> {
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .user_agent("my-agent/0.1 (web tool)");
-    let proxy_url = std::env::var("MY_AGENT_PROXY")
+        .user_agent("moye/0.0.1 (web tool)");
+    let proxy_url = std::env::var("AGENT_PROXY")
         .or_else(|_| std::env::var("HTTPS_PROXY"))
         .or_else(|_| std::env::var("HTTP_PROXY"))
         .ok();
@@ -477,7 +477,7 @@ impl PortableTool for WebFetch {
             .get(&args.url)
             .send()
             .await
-            .map_err(|e| ToolError(format!("请求失败: {e}。提示: 可能需要设置代理，如 export MY_AGENT_PROXY=http://127.0.0.1:7890")))?;
+            .map_err(|e| ToolError(format!("请求失败: {e}。提示: 可能需要设置代理，如 export AGENT_PROXY=http://127.0.0.1:7890")))?;
         let status = resp.status();
         let content_type = resp
             .headers()
@@ -575,7 +575,7 @@ impl PortableTool for WebSearch {
             .send()
             .await
             .map_err(|e| ToolError(format!(
-                "搜索请求失败: {e}。提示: 在中国大陆可能需要设置代理，如 export MY_AGENT_PROXY=http://127.0.0.1:7890"
+                "搜索请求失败: {e}。提示: 在中国大陆可能需要设置代理，如 export AGENT_PROXY=http://127.0.0.1:7890"
             )))?;
         let status = resp.status();
         if !status.is_success() {

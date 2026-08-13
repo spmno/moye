@@ -1,5 +1,5 @@
-// 供应商客户端：通过 MY_AGENT_PROVIDER 环境变量选择供应商（deepseek / bailian / moonshot / volcengine）。
-// Provider client: selects a provider (deepseek / bailian / moonshot / volcengine) via the MY_AGENT_PROVIDER env var.
+// 供应商客户端：通过 AGENT_PROVIDER 环境变量选择供应商（deepseek / bailian / moonshot / volcengine）。
+// Provider client: selects a provider (deepseek / bailian / moonshot / volcengine) via the AGENT_PROVIDER env var.
 // 均使用 OpenAI 兼容接口，Bailian 百炼平台、Moonshot Kimi 平台和火山引擎 Ark 通过自定义 base URL 接入。
 // All providers use the OpenAI-compatible interface; Bailian, Moonshot Kimi, and Volcengine Ark connect via custom base URLs.
 use anyhow::Result;
@@ -32,8 +32,8 @@ pub enum Provider {
     /// 智谱 GLM（https://open.bigmodel.cn）。OpenAI 兼容接口。
     /// Zhipu GLM (https://open.bigmodel.cn). OpenAI-compatible API.
     Zhipu,
-    /// 自定义 OpenAI 兼容供应商。通过 MY_AGENT_BASE_URL + MY_AGENT_API_KEY 配置。
-    /// Custom OpenAI-compatible provider. Configured via MY_AGENT_BASE_URL + MY_AGENT_API_KEY.
+    /// 自定义 OpenAI 兼容供应商。通过 AGENT_BASE_URL + AGENT_API_KEY 配置。
+    /// Custom OpenAI-compatible provider. Configured via AGENT_BASE_URL + AGENT_API_KEY.
     Custom,
 }
 
@@ -96,12 +96,12 @@ impl Provider {
         self.supported_plans().len() > 1
     }
 
-    /// 解析当前套餐：MY_AGENT_PLAN 环境变量优先，其次 agent.toml 的
+    /// 解析当前套餐：AGENT_PLAN 环境变量优先，其次 agent.toml 的
     /// `[provider].plan`；均缺失时默认 Standard。
-    /// Resolves the active plan: MY_AGENT_PLAN env var wins, then
+    /// Resolves the active plan: AGENT_PLAN env var wins, then
     /// `[provider].plan` from agent.toml; defaults to Standard.
     pub fn plan_from_env() -> ApiPlan {
-        if let Ok(raw) = std::env::var("MY_AGENT_PLAN") {
+        if let Ok(raw) = std::env::var("AGENT_PLAN") {
             return ApiPlan::parse(&raw);
         }
         if let Some(raw) = crate::config::config().and_then(|c| c.provider.plan.clone()) {
@@ -127,13 +127,13 @@ impl Provider {
 }
 
 impl Provider {
-    /// 解析供应商：`MY_AGENT_PROVIDER` 环境变量优先，其次 agent.toml 的
+    /// 解析供应商：`AGENT_PROVIDER` 环境变量优先，其次 agent.toml 的
     /// `[provider].provider`；均缺失时默认 deepseek。
-    /// Resolves the provider: `MY_AGENT_PROVIDER` env var wins, then the
+    /// Resolves the provider: `AGENT_PROVIDER` env var wins, then the
     /// `[provider].provider` from agent.toml; defaults to deepseek when absent.
     pub fn from_env() -> Self {
         let configured = crate::config::config().and_then(|c| c.provider.provider.clone());
-        let raw = std::env::var("MY_AGENT_PROVIDER")
+        let raw = std::env::var("AGENT_PROVIDER")
             .ok()
             .or(configured)
             .unwrap_or_default();
@@ -171,17 +171,17 @@ impl Provider {
             Provider::MiMo => "MIMO_API_KEY",
             Provider::Gemini => "GEMINI_API_KEY",
             Provider::Zhipu => "ZAI_API_KEY",
-            Provider::Custom => "MY_AGENT_API_KEY",
+            Provider::Custom => "AGENT_API_KEY",
         }
         .to_string()
     }
 
-    /// OpenAI 兼容 base URL。优先级：`MY_AGENT_BASE_URL` env → `[provider].base_url`
+    /// OpenAI 兼容 base URL。优先级：`AGENT_BASE_URL` env → `[provider].base_url`
     /// → 当前套餐专属端点 → 供应商默认。
-    /// OpenAI-compatible base URL. Precedence: `MY_AGENT_BASE_URL` env →
+    /// OpenAI-compatible base URL. Precedence: `AGENT_BASE_URL` env →
     /// `[provider].base_url` → active plan endpoint → provider default.
     fn base_url(&self) -> String {
-        if let Ok(url) = std::env::var("MY_AGENT_BASE_URL") {
+        if let Ok(url) = std::env::var("AGENT_BASE_URL") {
             return url;
         }
         if let Some(url) = crate::config::config()
@@ -206,7 +206,7 @@ impl Provider {
             Provider::MiMo => "MIMO_API_KEY",
             Provider::Gemini => "GEMINI_API_KEY",
             Provider::Zhipu => "ZAI_API_KEY",
-            Provider::Custom => "MY_AGENT_API_KEY",
+            Provider::Custom => "AGENT_API_KEY",
         }
     }
 
@@ -271,7 +271,7 @@ pub fn create_client_with(
     let plan = Provider::plan_from_env();
     let base_url = base_url_override
         .map(str::to_string)
-        .or_else(|| std::env::var("MY_AGENT_BASE_URL").ok())
+        .or_else(|| std::env::var("AGENT_BASE_URL").ok())
         .or_else(|| {
             crate::config::config()
                 .and_then(|c| c.provider.base_url.clone())
@@ -693,11 +693,11 @@ mod tests {
     fn from_env_accepts_volcanoark_alias() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
-            std::env::set_var("MY_AGENT_PROVIDER", "volcanoark");
+            std::env::set_var("AGENT_PROVIDER", "volcanoark");
         }
         assert_eq!(Provider::from_env(), Provider::Volcengine);
         unsafe {
-            std::env::remove_var("MY_AGENT_PROVIDER");
+            std::env::remove_var("AGENT_PROVIDER");
         }
     }
 

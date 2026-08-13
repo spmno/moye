@@ -14,10 +14,10 @@
 // 2. OS 级沙箱（进程隔离）——run_bash 命令在 bwrap（Linux）或 sandbox-exec（macOS）中执行。
 //    OS-level sandbox (process isolation) — run_bash commands execute inside bwrap (Linux) or sandbox-exec (macOS).
 //
-// 可通过环境变量 MY_AGENT_SANDBOX=off 禁用沙箱（不推荐）。
-// The sandbox can be disabled via the MY_AGENT_SANDBOX=off environment variable (not recommended).
-// 可通过 MY_AGENT_SANDBOX_BACKEND=auto|bwrap|seatbelt|path|off 选择后端。
-// Select the backend via MY_AGENT_SANDBOX_BACKEND=auto|bwrap|seatbelt|path|off.
+// 可通过环境变量 AGENT_SANDBOX=off 禁用沙箱（不推荐）。
+// The sandbox can be disabled via the AGENT_SANDBOX=off environment variable (not recommended).
+// 可通过 AGENT_SANDBOX_BACKEND=auto|bwrap|seatbelt|path|off 选择后端。
+// Select the backend via AGENT_SANDBOX_BACKEND=auto|bwrap|seatbelt|path|off.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -140,13 +140,13 @@ pub struct Sandbox {
 impl Sandbox {
     /// 创建沙箱，以当前工作目录为根。
     /// Creates a sandbox with the current working directory as root.
-    /// 通过 `MY_AGENT_SANDBOX=off` 可禁用。
-    /// Can be disabled via `MY_AGENT_SANDBOX=off`.
+    /// 通过 `AGENT_SANDBOX=off` 可禁用。
+    /// Can be disabled via `AGENT_SANDBOX=off`.
     pub fn new() -> Self {
-        let enabled = std::env::var("MY_AGENT_SANDBOX")
+        let enabled = std::env::var("AGENT_SANDBOX")
             .map(|v| !matches!(v.as_str(), "off" | "false" | "0"))
             .unwrap_or(true);
-        let backend_env = std::env::var("MY_AGENT_SANDBOX_BACKEND")
+        let backend_env = std::env::var("AGENT_SANDBOX_BACKEND")
             .map(|v| SandboxBackend::parse(&v))
             .unwrap_or(SandboxBackend::Auto);
         let backend = if !enabled {

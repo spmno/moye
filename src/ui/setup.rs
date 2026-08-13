@@ -39,7 +39,7 @@ const PROVIDERS: &[ProviderEntry] = &[
     ProviderEntry { slug: "bailian", label: "Bailian (DashScope)", detail: "百炼 · Qwen3.8 Max / Qwen3.7 Plus", api_key_env: "DASHSCOPE_API_KEY" },
     ProviderEntry { slug: "moonshot", label: "Moonshot Kimi", detail: "Kimi K3 · 1M 上下文", api_key_env: "MOONSHOT_API_KEY" },
     ProviderEntry { slug: "volcengine", label: "Volcengine Ark", detail: "Doubao Seed Evolving · 周迭代", api_key_env: "ARK_API_KEY" },
-    ProviderEntry { slug: "custom", label: "Custom (OpenAI-compatible)", detail: "自定义 base URL + API key", api_key_env: "MY_AGENT_API_KEY" },
+    ProviderEntry { slug: "custom", label: "Custom (OpenAI-compatible)", detail: "自定义 base URL + API key", api_key_env: "AGENT_API_KEY" },
 ];
 
 enum Phase {
@@ -354,7 +354,7 @@ fn write_config(state: &SetupState) -> Result<()> {
         .unwrap_or_else(|| config::default_model_for_provider_plan(provider.slug, plan.slug()));
     let base_url = state.base_url.as_deref();
     let api_key_env = if provider.slug == "custom" {
-        Some("MY_AGENT_API_KEY")
+        Some("AGENT_API_KEY")
     } else {
         Some(provider.api_key_env)
     };
@@ -373,15 +373,15 @@ fn write_config(state: &SetupState) -> Result<()> {
     );
     std::fs::write("agent.toml", &content)?;
 
-    let mut env_lines = vec![format!("MY_AGENT_PROVIDER={}", provider.slug)];
+    let mut env_lines = vec![format!("AGENT_PROVIDER={}", provider.slug)];
     if plan != ApiPlan::Standard && provider.slug != "custom" {
-        env_lines.push(format!("MY_AGENT_PLAN={}", plan.slug()));
+        env_lines.push(format!("AGENT_PLAN={}", plan.slug()));
     }
     if provider.slug == "custom" {
         if let Some(ref url) = state.base_url {
-            env_lines.push(format!("MY_AGENT_BASE_URL={url}"));
+            env_lines.push(format!("AGENT_BASE_URL={url}"));
         }
-        env_lines.push(format!("MY_AGENT_API_KEY={}", state.api_key));
+        env_lines.push(format!("AGENT_API_KEY={}", state.api_key));
     } else {
         env_lines.push(format!("{}={}", provider.api_key_env, state.api_key));
     }
@@ -446,7 +446,7 @@ fn draw(f: &mut Frame, state: &mut SetupState) {
                 .provider
                 .map(|p| {
                     if p.slug == "custom" {
-                        "MY_AGENT_API_KEY"
+                        "AGENT_API_KEY"
                     } else {
                         p.api_key_env
                     }
@@ -476,7 +476,7 @@ fn draw(f: &mut Frame, state: &mut SetupState) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" my-agent Setup · {title} "))
+        .title(format!(" moye Setup · {title} "))
         .border_style(Style::default().fg(Color::Cyan));
     let para = Paragraph::new(lines).block(block);
     f.render_widget(para, area);
@@ -485,7 +485,7 @@ fn draw(f: &mut Frame, state: &mut SetupState) {
 fn draw_selector(f: &mut Frame, area: Rect, sel: &SelectorState) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" my-agent Setup · {} ", sel.title()))
+        .title(format!(" moye Setup · {} ", sel.title()))
         .border_style(Style::default().fg(Color::Cyan));
 
     let visible = sel.visible();

@@ -17,13 +17,24 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-/// 把文本复制到剪贴板。先尝试 OSC52 写 `/dev/tty`，失败则回退系统工具。
-/// 返回 `true` 表示至少一条路径成功。
+/// 把文本复制到剪贴板。同时尝试 OSC52 写 `/dev/tty` 和系统剪贴板工具，
+/// 任一成功即返回 `true`。
 ///
-/// Copy text to the clipboard. Tries OSC52 to `/dev/tty` first, then falls
-/// back to a system clipboard tool. Returns `true` if at least one path succeeded.
+/// OSC52 写 `/dev/tty` 即使成功，终端也可能不处理该序列（不支持 OSC52、
+/// 被嵌套会话吞掉等），因此系统工具也必须尝试。在 SSH 会话中系统工具
+/// 可能不存在，此时仅靠 OSC52。
+///
+/// Copy text to the clipboard. Tries both OSC52 (to `/dev/tty`) and a
+/// system clipboard tool; returns `true` if either succeeded.
+///
+/// Even if OSC52 writes to `/dev/tty` successfully, the terminal may not
+/// process the sequence (no OSC52 support, nested session swallowed it, etc.),
+/// so the system tool must also be tried. In SSH sessions the system tool
+/// may not exist, leaving OSC52 as the only path.
 pub fn copy_to_clipboard(text: &str) -> bool {
-    copy_via_osc52(text) || copy_via_system_tool(text)
+    let osc52_ok = copy_via_osc52(text);
+    let system_ok = copy_via_system_tool(text);
+    osc52_ok || system_ok
 }
 
 /// OSC52：`\x1b]52;c;<base64>\x07` 写 `/dev/tty`。

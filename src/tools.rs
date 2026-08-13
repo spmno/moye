@@ -65,7 +65,8 @@ impl PortableTool for ReadFile {
     /// 执行工具：读取文件内容，支持 offset/limit 分页。失败时返回 `ToolError`。
     /// Executes the tool: reads file content with optional offset/limit pagination. Returns `ToolError` on failure.
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let content = std::fs::read_to_string(&args.path).map_err(|e| ToolError(e.to_string()))?;
+        let path = crate::sandbox::expand_tilde(&args.path);
+        let content = std::fs::read_to_string(&path).map_err(|e| ToolError(e.to_string()))?;
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
         if total == 0 {
@@ -78,7 +79,10 @@ impl PortableTool for ReadFile {
         if offset == 0 && end == total {
             Ok(selected)
         } else {
-            Ok(format!("{selected}\n…(截断 / truncated, {total} lines total, showing lines {}-{end}, use offset to read more)", offset + 1))
+            let start = offset + 1;
+            Ok(format!(
+                "{selected}\n…(截断 / truncated, {total} lines total, showing lines {start}-{end}, use offset={end} to read the next batch)"
+            ))
         }
     }
 }
@@ -127,12 +131,13 @@ impl PortableTool for EditFile {
     /// 执行工具：读取、替换、写回。`old` 不存在时返回错误。
     /// Executes the tool: read, replace, write back. Returns an error if `old` is absent.
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let content = std::fs::read_to_string(&args.path).map_err(|e| ToolError(e.to_string()))?;
+        let path = crate::sandbox::expand_tilde(&args.path);
+        let content = std::fs::read_to_string(&path).map_err(|e| ToolError(e.to_string()))?;
         if !content.contains(&args.old) {
             return Err(ToolError("old text not found in file".into()));
         }
         let updated = content.replacen(&args.old, &args.new, 1);
-        std::fs::write(&args.path, updated).map_err(|e| ToolError(e.to_string()))?;
+        std::fs::write(&path, updated).map_err(|e| ToolError(e.to_string()))?;
         Ok(format!("edited {}", args.path))
     }
 }
@@ -181,7 +186,8 @@ impl PortableTool for WriteFile {
     /// 执行工具：写入文件并返回确认信息。
     /// Executes the tool: writes the file and returns a confirmation message.
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        std::fs::write(&args.path, &args.content).map_err(|e| ToolError(e.to_string()))?;
+        let path = crate::sandbox::expand_tilde(&args.path);
+        std::fs::write(&path, &args.content).map_err(|e| ToolError(e.to_string()))?;
         Ok(format!("wrote {}", args.path))
     }
 }
@@ -337,7 +343,8 @@ impl PortableTool for RunFile {
     /// 与 RunBash 相同：使用 tokio::process + kill_on_drop 确保 Esc 中断时子进程被清理。
     /// Same as RunBash: uses tokio::process + kill_on_drop so Esc-abort kills the child process.
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let path = std::path::Path::new(&args.path);
+        let expanded = crate::sandbox::expand_tilde(&args.path);
+        let path = std::path::Path::new(&expanded);
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let interpreter = match ext {
             "sh" => "bash",

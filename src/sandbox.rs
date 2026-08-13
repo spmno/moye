@@ -477,7 +477,7 @@ impl Default for Sandbox {
 
 /// 展开 `~` 为用户主目录。
 /// Expands `~` to the user's home directory.
-fn expand_tilde(path: &str) -> String {
+pub fn expand_tilde(path: &str) -> String {
     if path == "~" {
         return std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
     }

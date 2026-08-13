@@ -514,8 +514,88 @@ fn extract_paths_from_command(command: &str) -> Vec<String> {
     paths
 }
 
+/// 从命令中剥离 heredoc 内容，只保留 shell 命令部分。
+/// Heredoc 内容（`<< 'DELIM'` 到 `DELIM` 之间的行）是数据，不是命令，
+/// 不应被路径提取扫描。
+///
+/// Strips heredoc bodies from a multi-line command, keeping only the shell
+/// command parts. Heredoc content (lines between `<< 'DELIM'` and `DELIM`)
+/// is data, not command, and must not be scanned for path-like tokens.
+fn strip_heredocs(command: &str) -> String {
+    let mut result = String::with_capacity(command.len());
+    let mut heredoc_delim: Option<String> = None;
+
+    for line in command.lines() {
+        if let Some(ref delim) = heredoc_delim {
+            if line.trim() == delim.as_str() {
+                heredoc_delim = None;
+            }
+            continue;
+        }
+
+        match find_heredoc_start(line) {
+            Some((prefix, delim)) => {
+                result.push_str(&prefix);
+                result.push('\n');
+                heredoc_delim = Some(delim);
+            }
+            None => {
+                result.push_str(line);
+                result.push('\n');
+            }
+        }
+    }
+
+    if result.ends_with('\n') {
+        result.pop();
+    }
+    result
+}
+
+/// 在单行中查找 heredoc 起始（`<< DELIM`），返回 `(<< 之前的部分, 定界符)`。
+/// 排除 `<<<`（here-string）。处理 `<<-`、`<< 'DELIM'`、`<< "DELIM"`、`<< DELIM`。
+///
+/// Finds heredoc start (`<< DELIM`) in a single line. Returns `(prefix, delimiter)`
+/// or `None`. Excludes `<<<` (here-string). Handles `<<-`, quoted/unquoted delimiters.
+fn find_heredoc_start(line: &str) -> Option<(String, String)> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'<' && bytes[i + 1] == b'<' {
+            if i + 2 < bytes.len() && bytes[i + 2] == b'<' {
+                i += 3;
+                continue;
+            }
+
+            let prefix = line[..i].to_string();
+            let rest = &line[i + 2..];
+            let rest = rest.strip_prefix('-').unwrap_or(rest);
+            let rest = rest.trim_start();
+
+            if rest.is_empty() {
+                return None;
+            }
+
+            let delim = if let Some(r) = rest.strip_prefix('\'') {
+                r.split('\'').next().unwrap_or("").to_string()
+            } else if let Some(r) = rest.strip_prefix('"') {
+                r.split('"').next().unwrap_or("").to_string()
+            } else {
+                rest.split_whitespace().next().unwrap_or("").to_string()
+            };
+
+            if !delim.is_empty() {
+                return Some((prefix, delim));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 fn extract_paths_from_command_inner(command: &str, paths: &mut Vec<String>) {
-    let outer = strip_command_substitutions(command, paths);
+    let stripped = strip_heredocs(command);
+    let outer = strip_command_substitutions(&stripped, paths);
 
     for segment in outer.split(['|', ';', '&', '\n']) {
         let segment = segment.trim();
@@ -1048,5 +1128,78 @@ mod tests {
     fn real_abs_path_still_extracted() {
         let paths = extract_paths_from_command("echo GET /etc/passwd");
         assert!(paths.contains(&"/etc/passwd".to_string()));
+    }
+
+    /// Heredoc content should not be scanned for paths.
+    /// `//!` in a Rust heredoc should not be treated as a path.
+    /// Heredoc 内容不应被扫描路径。Rust 文档注释 `//!` 不应被当作路径。
+    #[test]
+    fn heredoc_content_not_scanned() {
+        let cmd = "cat > ~/project/src/main.rs << 'RUSTEOF'\n//! doc comment\n/// another comment\nRUSTEOF\necho done";
+        let paths = extract_paths_from_command(cmd);
+        assert!(!paths.iter().any(|p| p.contains("//!")));
+        assert!(!paths.iter().any(|p| p.contains("///")));
+    }
+
+    /// Paths before the heredoc should still be extracted.
+    /// Heredoc 之前的路径仍应被提取。
+    #[test]
+    fn heredoc_prefix_path_extracted() {
+        let cmd = "cat > ~/project/src/main.rs << 'EOF'\nsome content\nEOF";
+        let paths = extract_paths_from_command(cmd);
+        assert!(paths.iter().any(|p| p.contains("src/main.rs")));
+    }
+
+    /// Commands after the heredoc closing delimiter should be processed.
+    /// Heredoc 结束定界符之后的命令应被正常处理。
+    #[test]
+    fn heredoc_suffix_command_processed() {
+        let cmd = "cat << 'EOF'\ncontent\nEOF\ncat /etc/hostname";
+        let paths = extract_paths_from_command(cmd);
+        assert!(paths.contains(&"/etc/hostname".to_string()));
+    }
+
+    /// `<<<` (here-string) should not trigger heredoc stripping.
+    /// `<<<`（here-string）不应触发 heredoc 剥离。
+    #[test]
+    fn here_string_not_stripped() {
+        let result = strip_heredocs("cat <<< /etc/passwd");
+        assert!(result.contains("/etc/passwd"));
+    }
+
+    /// Unquoted heredoc delimiter should work.
+    /// 无引号的 heredoc 定界符应正确工作。
+    #[test]
+    fn heredoc_unquoted_delim() {
+        let cmd = "cat << EOF\n//! not a path\nEOF\necho done";
+        let paths = extract_paths_from_command(cmd);
+        assert!(!paths.iter().any(|p| p.contains("//!")));
+    }
+
+    /// `<<-` variant should work.
+    /// `<<-` 变体应正确工作。
+    #[test]
+    fn heredoc_dash_variant() {
+        let cmd = "cat <<- 'EOF'\n//! not a path\nEOF\necho done";
+        let paths = extract_paths_from_command(cmd);
+        assert!(!paths.iter().any(|p| p.contains("//!")));
+    }
+
+    /// No heredoc — normal command should be unaffected.
+    /// 无 heredoc 时，普通命令不受影响。
+    #[test]
+    fn strip_heredocs_no_heredoc() {
+        let result = strip_heredocs("ls /etc/passwd");
+        assert_eq!(result, "ls /etc/passwd");
+    }
+
+    /// Basic heredoc stripping test.
+    #[test]
+    fn strip_heredocs_basic() {
+        let cmd = "cat > file.rs << 'EOF'\n//! content\nEOF\necho done";
+        let result = strip_heredocs(cmd);
+        assert!(result.contains("cat > file.rs"));
+        assert!(!result.contains("//! content"));
+        assert!(result.contains("echo done"));
     }
 }

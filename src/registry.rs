@@ -620,32 +620,28 @@ impl Orchestrator {
         match intent {
             Intent::Implement => self.run_sdd_pipeline(message, tx).await,
             Intent::Investigate => {
-                let (out, new_hist) = crate::agent_loop::run_autonomous(
+                crate::agent_loop::run_autonomous(
                     &self.registry,
                     &self.sandbox,
                     self.trust_sandbox.clone(),
                     Role::Investigator,
                     message,
                     tx,
-                    history,
+                    self.history.clone(),
                 )
-                .await?;
-                *self.history.lock().unwrap() = new_hist;
-                Ok(out)
+                .await
             }
             Intent::Chat => {
-                let (out, new_hist) = crate::agent_loop::run_autonomous(
+                crate::agent_loop::run_autonomous(
                     &self.registry,
                     &self.sandbox,
                     self.trust_sandbox.clone(),
                     Role::Builder,
                     message,
                     tx,
-                    history,
+                    self.history.clone(),
                 )
-                .await?;
-                *self.history.lock().unwrap() = new_hist;
-                Ok(out)
+                .await
             }
         }
     }
@@ -653,8 +649,7 @@ impl Orchestrator {
     async fn run_sdd_pipeline(&self, message: &str, tx: &EventSender) -> anyhow::Result<String> {
         // 调查步骤：先让调查者判断是否需要调查并探索代码库。
         // Investigation step: let the Investigator decide whether to investigate and explore the codebase.
-        let prior = self.history.lock().unwrap().clone();
-        let (investigation, inv_hist) = crate::agent_loop::run_autonomous(
+        let investigation = crate::agent_loop::run_autonomous(
             &self.registry,
             &self.sandbox,
             self.trust_sandbox.clone(),
@@ -666,13 +661,12 @@ impl Orchestrator {
                  否则，探索相关代码，理解架构与依赖，产出结构化调查报告。"
             ),
             tx,
-            prior,
+            self.history.clone(),
         )
         .await?;
 
         // 问答逃生口：如果调查者判断用户消息是问答/咨询，直接返回答案，跳过规划/构建/审计。
         if investigation.contains("无需实现") {
-            *self.history.lock().unwrap() = inv_hist;
             return Ok(investigation);
         }
 
@@ -690,23 +684,20 @@ impl Orchestrator {
         let planner = self.registry.build(Role::Planner)?;
         let plan = planner.run(&plan_prompt, tx).await?;
 
-        let (built, builder_hist) = crate::agent_loop::run_autonomous(
+        let built = crate::agent_loop::run_autonomous(
             &self.registry,
             &self.sandbox,
             self.trust_sandbox.clone(),
             Role::Builder,
             &format!("{message}\n\n\u{53c2}\u{8003}\u{8ba1}\u{5212}\u{ff1a}\n{plan}"),
             tx,
-            inv_hist,
+            self.history.clone(),
         )
         .await?;
 
         let gate = crate::reviewer::ReviewGate::new(self.registry.clone());
         match gate.review(message, &built, tx).await? {
-            crate::reviewer::Verdict::Approve => {
-                *self.history.lock().unwrap() = builder_hist;
-                Ok(built)
-            }
+            crate::reviewer::Verdict::Approve => Ok(built),
             crate::reviewer::Verdict::Reject(reason) => {
                 let _ = tx.send(AgentEvent::Info(format!(
                     "[SDD] 审计驳回，带反馈重试一次 / Audit rejected, retrying with feedback:\n  · 驳回原因: {reason}"
@@ -724,21 +715,18 @@ impl Orchestrator {
                      [System] Fix the issues identified in the rejection reason above. \
                      Address each point, keep correct parts, only change what's rejected."
                 );
-                let (retry_out, retry_hist) = crate::agent_loop::run_autonomous(
+                crate::agent_loop::run_autonomous(
                     &self.registry,
                     &self.sandbox,
                     self.trust_sandbox.clone(),
                     Role::Builder,
                     &retry,
                     tx,
-                    builder_hist,
+                    self.history.clone(),
                 )
-                .await?;
-                *self.history.lock().unwrap() = retry_hist;
-                Ok(retry_out)
+                .await
             }
             crate::reviewer::Verdict::Clarify(q) => {
-                *self.history.lock().unwrap() = builder_hist;
                 Ok(format!("\u{9700}\u{9700}\u{8981}\u{6f84}\u{6e05}\u{ff1a}{q}\n\n\u{5df2}\u{4ea7}\u{51fa}\u{7684}\u{5de5}\u{4f5c}\u{ff1a}\n{built}"))
             }
         }

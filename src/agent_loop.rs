@@ -664,6 +664,13 @@ fn decide_flow(perms: &ToolPerms, tool_name: &str, args: &str) -> ToolCallAction
 /// SSE 断连时自动重试最多 3 次，每次告知模型已完成的工作让其继续。
 /// On SSE disconnect, auto-retries up to 3 times, each time telling the model what's done so it can continue.
 ///
+/// `shared_history` 是由 Orchestrator 持有的共享对话历史 Arc。每轮 CompletionCall 时
+/// `ContextHook` 会将最新历史写入此 Arc，因此即使 task 被 abort（Esc 中断），
+/// partial history 仍保留在 Orchestrator 的状态中，下次对话能继承上下文。
+/// `shared_history` is the Orchestrator's shared conversation history Arc. `ContextHook`
+/// writes the latest history to it on every CompletionCall, so even if the task is
+/// aborted (Esc interrupt), the partial history persists for the next message.
+///
 /// 所有用户可见输出通过 `tx` channel 发送给 TUI。
 /// All user-visible output is sent to the TUI via the `tx` channel.
 pub async fn run_autonomous(
@@ -673,11 +680,11 @@ pub async fn run_autonomous(
     role: Role,
     goal: &str,
     tx: &EventSender,
-    prior_history: Vec<Message>,
-) -> anyhow::Result<(String, Vec<Message>)> {
+    shared_history: Arc<Mutex<Vec<Message>>>,
+) -> anyhow::Result<String> {
     const MAX_RETRIES: usize = 3;
 
-    let captured_history: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(prior_history));
+    let captured_history = shared_history;
     let captured_turn: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let mut turns_used: usize = 0;
     let total_max_turns = registry.max_turns_for_role(role);
@@ -746,7 +753,7 @@ pub async fn run_autonomous(
         let stream = runner.stream().await;
 
         match consume_stream(stream, Some(hitl_waiting), tx).await {
-            Ok(output) => return Ok((output, captured_history.lock().unwrap().clone())),
+            Ok(output) => return Ok(output),
             Err(e) if is_context_overflow_error(&e) && attempt < MAX_RETRIES => {
                 let mut hist = captured_history.lock().unwrap();
                 let old_len = hist.len();

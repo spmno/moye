@@ -214,6 +214,17 @@ pub fn init(path: &str) -> anyhow::Result<Arc<Config>> {
     Ok(CONFIG.get_or_init(|| cfg).clone())
 }
 
+/// 检查本地 `agent.toml` 或全局 `~/.config/my-agent/config.toml` 是否存在。
+/// 任一存在即跳过 setup 向导。
+/// Checks if a local `agent.toml` or global `~/.config/my-agent/config.toml` exists.
+/// Either being present skips the setup wizard.
+pub fn has_config_file() -> bool {
+    std::path::Path::new("agent.toml").exists()
+        || global_config_path()
+            .map(|p| p.exists())
+            .unwrap_or(false)
+}
+
 /// 返回全局配置路径 `~/.config/my-agent/config.toml`；`HOME` 未设置时返回 `None`。
 /// Return the global config path `~/.config/my-agent/config.toml`; `None` when `HOME` is unset.
 fn global_config_path() -> Option<PathBuf> {

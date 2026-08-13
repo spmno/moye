@@ -43,10 +43,10 @@ async fn main() -> Result<()> {
     }
 
     // 统一解析 agent.toml（仅此一处），各模块共享同一份配置。
-    // 若 agent.toml 不存在，启动首次配置向导（交互式选择供应商、模型、输入 API key）。
+    // 若本地 agent.toml 和全局 config.toml 均不存在，启动首次配置向导。
     // Parse agent.toml once here; all modules share this single config.
-    // If agent.toml is missing, launch the first-time setup wizard.
-    if !std::path::Path::new("agent.toml").exists() {
+    // If neither local agent.toml nor global config.toml exists, launch the setup wizard.
+    if !crate::config::has_config_file() {
         crate::ui::setup::run_setup().await?;
     }
     let config = crate::config::init("agent.toml")?;

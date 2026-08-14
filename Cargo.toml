@@ -1,6 +1,6 @@
 [package]
 name = "moye"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 description = "Self-evolving AI Agent built on rig (Rust LLM framework)"
 license = "MIT"

@@ -153,6 +153,14 @@ impl SetupState {
         self.cursor += c.len_utf8();
     }
 
+    fn input_paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.input.insert_str(self.cursor, text);
+        self.cursor += text.len();
+    }
+
     fn backspace(&mut self) {
         if self.cursor > 0 {
             let mut idx = self.cursor - 1;
@@ -228,8 +236,14 @@ pub async fn run_setup() -> Result<()> {
     loop {
         terminal.draw(|f| draw(f, &mut state))?;
 
-        if let Event::Key(key) = event::read()? {
-            handle_key(key, &mut state);
+        match event::read()? {
+            Event::Key(key) => handle_key(key, &mut state),
+            Event::Paste(text) => {
+                if state.selector.is_none() {
+                    state.input_paste(&text);
+                }
+            }
+            _ => {}
         }
 
         if state.is_done() {

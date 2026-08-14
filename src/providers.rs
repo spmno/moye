@@ -150,6 +150,7 @@ impl Provider {
             "mimo" | "xiaomi" => Provider::MiMo,
             "gemini" | "google" => Provider::Gemini,
             "zhipu" | "glm" | "bigmodel" => Provider::Zhipu,
+            "custom" => Provider::Custom,
             _ => Provider::DeepSeek,
         }
     }

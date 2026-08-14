@@ -59,16 +59,30 @@ impl TerminalGuard {
     }
 }
 
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info);
+    }));
+}
+
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            std::io::stdout(),
-            DisableMouseCapture,
-            DisableBracketedPaste,
-            LeaveAlternateScreen,
-            crossterm::cursor::Show
-        );
+        restore_terminal();
     }
 }
 
@@ -518,6 +532,7 @@ pub async fn run_tui(ctx: Arc<AppContext>) -> anyhow::Result<()> {
         .map(|m| m.list())
         .unwrap_or_default();
 
+    install_panic_hook();
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -536,7 +551,7 @@ pub async fn run_tui(ctx: Arc<AppContext>) -> anyhow::Result<()> {
     let mut events = EventStream::new();
     let mut tick = interval(Duration::from_millis(TICK_MS));
 
-    run_loop(
+    let result = run_loop(
         &mut terminal,
         &mut state,
         &ctx,
@@ -545,7 +560,14 @@ pub async fn run_tui(ctx: Arc<AppContext>) -> anyhow::Result<()> {
         &mut events,
         &mut tick,
     )
-    .await
+    .await;
+
+    // Explicitly restore terminal BEFORE _guard drops.
+    // This ensures cleanup runs at a known point, regardless of
+    // Drop order or EventStream background thread interference.
+    restore_terminal();
+
+    result
 }
 
 async fn run_loop(
@@ -557,6 +579,9 @@ async fn run_loop(
     events: &mut EventStream,
     tick: &mut tokio::time::Interval,
 ) -> anyhow::Result<()> {
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+
     loop {
         if state.needs_full_redraw {
             if let Ok(size) = terminal.size() {
@@ -589,6 +614,9 @@ async fn run_loop(
             }
             _ = tick.tick() => {
                 state.tick();
+            }
+            _ = &mut ctrl_c => {
+                state.should_quit = true;
             }
         }
 

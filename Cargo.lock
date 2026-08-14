@@ -1400,6 +1400,7 @@ dependencies = [
  "crossterm",
  "dotenvy",
  "futures",
+ "libc",
  "pulldown-cmark",
  "ratatui",
  "reqwest",

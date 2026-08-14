@@ -44,10 +44,28 @@ const TICK_MS: u64 = 120;
 // ===== Terminal guard (panic-safe cleanup) =====
 // ===== 终端守卫（panic 安全清理） =====
 
-struct TerminalGuard;
+use std::sync::OnceLock;
+
+static SAVED_TERMIOS: OnceLock<Option<libc::termios>> = OnceLock::new();
+
+struct TerminalGuard {
+    original_termios: Option<libc::termios>,
+}
 
 impl TerminalGuard {
     fn enter() -> anyhow::Result<Self> {
+        let original_termios = {
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            let fd = tty_fd();
+            let ok = unsafe { libc::tcgetattr(fd, &mut t) } == 0;
+            if ok {
+                let _ = SAVED_TERMIOS.set(Some(t));
+                Some(t)
+            } else {
+                None
+            }
+        };
+
         enable_raw_mode()?;
         execute!(
             std::io::stdout(),
@@ -55,12 +73,39 @@ impl TerminalGuard {
             EnableMouseCapture,
             EnableBracketedPaste
         )?;
-        Ok(Self)
+        Ok(Self { original_termios })
     }
 }
 
-fn restore_terminal() {
-    let _ = disable_raw_mode();
+fn tty_fd() -> i32 {
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+        libc::STDIN_FILENO
+    } else if let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    {
+        use std::os::unix::io::IntoRawFd;
+        file.into_raw_fd()
+    } else {
+        libc::STDIN_FILENO
+    }
+}
+
+fn restore_terminal(original: Option<&libc::termios>) {
+    use std::io::Write;
+
+    // Write escape sequences to /dev/tty directly, not stdout.
+    // This ensures they reach the terminal even if stdout is redirected.
+    if let Ok(mut tty) = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+    {
+        let _ = tty.write_all(b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?1049l\x1b[?25h");
+        let _ = tty.flush();
+    }
+
+    // Also write to stdout as fallback.
     let _ = execute!(
         std::io::stdout(),
         DisableMouseCapture,
@@ -68,21 +113,34 @@ fn restore_terminal() {
         LeaveAlternateScreen,
         crossterm::cursor::Show
     );
-    use std::io::Write;
     let _ = std::io::stdout().flush();
+
+    if let Some(t) = original {
+        let fd = tty_fd();
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, t) };
+    }
+
+    let _ = disable_raw_mode();
+
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("stty sane < /dev/tty 2>/dev/null")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
+    restore_terminal(SAVED_TERMIOS.get().and_then(|opt| opt.as_ref()));
         default_hook(info);
     }));
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        restore_terminal();
+        restore_terminal(self.original_termios.as_ref());
     }
 }
 
@@ -562,10 +620,10 @@ pub async fn run_tui(ctx: Arc<AppContext>) -> anyhow::Result<()> {
     )
     .await;
 
-    // Explicitly restore terminal BEFORE _guard drops.
-    // This ensures cleanup runs at a known point, regardless of
-    // Drop order or EventStream background thread interference.
-    restore_terminal();
+    drop(events);
+    drop(tick);
+
+    restore_terminal(SAVED_TERMIOS.get().and_then(|opt| opt.as_ref()));
 
     result
 }

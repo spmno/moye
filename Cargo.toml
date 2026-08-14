@@ -25,6 +25,7 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 pulldown-cmark = "0.13"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query"] }
 dotenvy = "0.15.7"
+libc = "0.2"
 rig-agent = { version = "0.41", features = ["rmcp"] }
 rmcp = { version = "2", features = ["transport-io", "transport-child-process", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 

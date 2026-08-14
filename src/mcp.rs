@@ -206,7 +206,9 @@ async fn connect_one(name: &str, cfg: &McpServerConfig) -> Result<McpConnection>
         for (k, v) in &cfg.env {
             command.env(k, v);
         }
-        let transport = TokioChildProcess::new(command)
+        let (transport, _stderr) = TokioChildProcess::builder(command)
+            .stderr(std::process::Stdio::null())
+            .spawn()
             .with_context(|| format!("spawn MCP server '{name}': {:?}", resolved))?;
         let service = ClientInfo::default()
             .serve(transport)

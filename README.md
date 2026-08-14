@@ -6,6 +6,14 @@ A self-evolving autonomous-loop AI Agent built on [rig](https://github.com/0xPla
 
 ---
 
+## The Name: Moye (莫邪)
+
+> In the Spring and Autumn period, the swordsmith Gan Jiang was ordered by the King of Wu to forge a pair of legendary swords. The iron in the furnace would not melt — the fire was not hot enough. His wife, Mo Ye, climbed onto the furnace wall and cast herself into the flames. The sacrifice broke the spell. The iron melted, and two swords were born: *Gan Jiang* and *Mo Ye* — the sharpest blades of their age.
+
+A sword must pass through fire to be born. An AI agent is no different — it must iterate, evolve, and remake itself to become truly useful. Moye is built on this belief: **transformation is the only path to sharpness**. The agent reads its own code, learns from every task, and rewrites its own prompts — not because it is broken, but because standing still is not enough. What does not transform, does not survive.
+
+---
+
 ## Architecture Overview
 
 ```

@@ -499,7 +499,7 @@ pub fn default_model_for_provider_plan(provider: &str, plan: &str) -> &'static s
 /// file (they stay in the global config.toml's [keys], backfilled at runtime via
 /// merge_provider_fallback).
 fn generate_agent_toml(path: &str) -> anyhow::Result<()> {
-    let (provider, base_url, api_key_env, global_model) =
+    let (provider, base_url, api_key_env, plan, global_model) =
         if let Some(global_path) = global_config_path() {
             if global_path.exists() {
                 match Config::load(global_path.to_string_lossy().as_ref()) {
@@ -510,21 +510,26 @@ fn generate_agent_toml(path: &str) -> anyhow::Result<()> {
                             .unwrap_or_else(|| "deepseek".to_string()),
                         global.provider.base_url,
                         global.provider.api_key_env,
+                        global.provider.plan,
                         global.agent.default_model,
                     ),
-                    Err(_) => ("deepseek".to_string(), None, None, String::new()),
+                    Err(_) => ("deepseek".to_string(), None, None, None, String::new()),
                 }
             } else {
-                ("deepseek".to_string(), None, None, String::new())
+                ("deepseek".to_string(), None, None, None, String::new())
             }
         } else {
-            ("deepseek".to_string(), None, None, String::new())
+            ("deepseek".to_string(), None, None, None, String::new())
         };
 
     let model = if !global_model.is_empty() {
         global_model
     } else {
-        default_model_for_provider(&provider).to_string()
+        default_model_for_provider_plan(
+            &provider,
+            plan.as_deref().unwrap_or("standard"),
+        )
+        .to_string()
     };
 
     let content = render_agent_toml(
@@ -532,7 +537,7 @@ fn generate_agent_toml(path: &str) -> anyhow::Result<()> {
         &model,
         base_url.as_deref(),
         api_key_env.as_deref(),
-        None,
+        plan.as_deref(),
     );
     std::fs::write(path, &content)?;
     eprintln!(
@@ -917,6 +922,53 @@ MOONSHOT_API_KEY = "global-moon"
             Permission::Deny
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn generate_agent_toml_propagates_global_plan() {
+        // Regression: when global config sets [provider].plan (e.g. "agent"),
+        // the auto-generated project agent.toml must include `plan = "..."` so
+        // direct file reads (e.g. --dump-config) and runtime plan resolution
+        // both pick up the non-standard endpoint without re-merging.
+        let tmp = std::env::temp_dir().join("moye-test-gen-plan.toml");
+        let content = render_agent_toml(
+            "volcengine",
+            "doubao-seed-evolving",
+            None,
+            Some("ARK_API_KEY"),
+            Some("agent"),
+        );
+        std::fs::write(&tmp, &content).unwrap();
+        let raw = std::fs::read_to_string(&tmp).unwrap();
+        let cfg: Config = toml::from_str(&raw).unwrap();
+        assert_eq!(cfg.provider.provider.as_deref(), Some("volcengine"));
+        assert_eq!(cfg.provider.plan.as_deref(), Some("agent"));
+        assert_eq!(cfg.provider.api_key_env.as_deref(), Some("ARK_API_KEY"));
+        assert_eq!(cfg.agent.default_model, "doubao-seed-evolving");
+        assert!(
+            raw.contains("plan = \"agent\""),
+            "generated toml must contain plan line, got:\n{raw}"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn generate_agent_toml_omits_plan_when_not_set() {
+        // Backward compat: when no plan is configured (standard), the generated
+        // file must not include a plan line.
+        let content = render_agent_toml(
+            "deepseek",
+            "deepseek-v4-pro",
+            None,
+            Some("DEEPSEEK_API_KEY"),
+            None,
+        );
+        assert!(
+            !content.contains("plan ="),
+            "standard plan must not emit a plan line:\n{content}"
+        );
+        let cfg: Config = toml::from_str(&content).unwrap();
+        assert_eq!(cfg.provider.plan, None);
     }
 
     #[test]

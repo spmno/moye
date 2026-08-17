@@ -155,6 +155,34 @@ pub struct SimpleSandbox {
 /// should use `SimpleSandbox` directly.
 pub type Sandbox = SimpleSandbox;
 
+/// macOS Seatbelt 沙箱下放行写入的字符设备/伪终端字面路径。
+/// Literal device/PTY paths allowed for write under the macOS Seatbelt sandbox.
+const SEATBELT_WRITE_LITERALS: &[&str] = &[
+    "/dev/null",
+    "/dev/stdin",
+    "/dev/stdout",
+    "/dev/stderr",
+    "/dev/tty",
+    "/dev/zero",
+    "/dev/random",
+    "/dev/urandom",
+];
+
+/// macOS Seatbelt 沙箱下放行写入的子路径（临时目录等）。
+/// Subpaths allowed for write under the macOS Seatbelt sandbox (temp dirs, etc.).
+/// `/tmp` 与 `/var` 在 macOS 上是指向 `/private/*` 的符号链接，Seatbelt
+/// 基于已解析路径做判定，因此必须同时列出规范路径。
+/// `/tmp` and `/var` are symlinks to `/private/*` on macOS; Seatbelt evaluates
+/// against resolved paths, so both the symlink and canonical forms are listed.
+const SEATBELT_WRITE_SUBPATHS: &[&str] = &[
+    "/tmp",
+    "/private/tmp",
+    "/var/tmp",
+    "/private/var/tmp",
+    "/var/folders",
+    "/private/var/folders",
+];
+
 impl SimpleSandbox {
     /// 创建沙箱，以当前工作目录为根。
     /// Creates a sandbox with the current working directory as root.
@@ -287,6 +315,19 @@ impl SimpleSandbox {
             "(allow file-write* (subpath \"{}\"))",
             self.root.to_string_lossy()
         ));
+        // 系统设备与临时目录：shell 重定向（2>/dev/null）、临时文件写入、终端恢复
+        // （stty sane </dev/tty）均需要。bwrap 后端通过 `--dev /dev` 与
+        // `--tmpfs /tmp` 处理同等需求；Seatbelt 没有等价开关，必须显式放行。
+        // System devices and temp dirs required by shell redirects (2>/dev/null),
+        // temp-file writes, and TTY recovery (stty sane </dev/tty). The bwrap
+        // backend covers these via `--dev /dev` + `--tmpfs /tmp`; Seatbelt has
+        // no equivalent switch, so the paths are listed explicitly.
+        for literal in SEATBELT_WRITE_LITERALS {
+            policy.push_str(&format!("(allow file-write* (literal \"{literal}\"))"));
+        }
+        for subpath in SEATBELT_WRITE_SUBPATHS {
+            policy.push_str(&format!("(allow file-write* (subpath \"{subpath}\"))"));
+        }
         let authorized = self.authorized.lock().unwrap();
         for dir in authorized.iter() {
             policy.push_str(&format!(
@@ -1142,6 +1183,29 @@ mod tests {
         let policy = sb.seatbelt_policy();
         assert!(policy.contains("deny file-write*"));
         assert!(policy.contains("/home/user/project"));
+    }
+
+    #[test]
+    fn seatbelt_policy_allows_dev_null_and_tmp() {
+        let sb = Sandbox {
+            root: PathBuf::from("/home/user/project"),
+            authorized: Arc::new(Mutex::new(HashSet::new())),
+            enabled: true,
+            backend: SandboxBackend::Seatbelt,
+        };
+        let policy = sb.seatbelt_policy();
+        for dev in ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"] {
+            assert!(
+                policy.contains(&format!("literal \"{dev}\"")),
+                "policy must allow literal write to {dev}: {policy}"
+            );
+        }
+        for tmp in ["/tmp", "/var/folders"] {
+            assert!(
+                policy.contains(&format!("subpath \"{tmp}\"")),
+                "policy must allow subpath write to {tmp}: {policy}"
+            );
+        }
     }
 
     /// Comment lines starting with '#' should not produce paths.

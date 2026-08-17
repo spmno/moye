@@ -393,6 +393,12 @@ pub fn is_reasoning_model(model: &str) -> bool {
         || lower.contains("gpt-5")
         // Claude 3.7+ / 4+ 支持扩展思考 / supports extended thinking
         || lower.contains("claude-3.7") || lower.contains("claude-4")
+        // 火山引擎豆包 Seed 系列（doubao-seed-evolving / doubao-seed-2-0-pro /
+        // doubao-seed-2.0-code / doubao-seed-2-1-* 等）均在响应中返回
+        // `reasoning_content` 字段，属于推理模型，需要跳过 max_tokens 以避免
+        // 推理阶段耗尽预算导致可见输出被截断成一两个字。
+        // Volcengine Doubao Seed series (all variants) emit `reasoning_content`.
+        || lower.starts_with("doubao-seed")
 }
 
 /// 对话型 Agent 别名：基于 OpenAI CompletionModel 的 rig Agent（兼容所有供应商）。
@@ -909,6 +915,13 @@ mod tests {
         assert!(is_reasoning_model("gpt-5"));
         assert!(is_reasoning_model("claude-3.7-sonnet"));
         assert!(is_reasoning_model("claude-4-opus"));
+        // Volcengine Doubao Seed series emits reasoning_content on every turn;
+        // must be detected so max_tokens is skipped (otherwise visible output
+        // can be truncated to one or two characters).
+        assert!(is_reasoning_model("doubao-seed-evolving"));
+        assert!(is_reasoning_model("doubao-seed-2-1-pro-260628"));
+        assert!(is_reasoning_model("doubao-seed-2.0-code"));
+        assert!(is_reasoning_model("DOUBAO-SEED-EVOLVING"));
     }
 
     #[test]

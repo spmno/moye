@@ -1,40 +1,82 @@
-//! 剪贴板复制：OSC52 转义序列写 `/dev/tty`，穿透 alternate screen + SSH + tmux。
+//! 剪贴板复制：分层尝试，任一成功即返回 `true`。
 //!
-//! OSC52 在 alacritty / kitty / ghostty / wezterm 默认支持；tmux 需
-//! `set -g set-clipboard on`；GNOME Terminal / Konsole / xterm 默认关。
-//! 兜底：OSC52 写 `/dev/tty` 失败时，回退到系统剪贴板工具
-//! （macOS `pbcopy`、Linux X11 `xclip`/`xsel`、Wayland `wl-copy`、Windows `clip.exe`）。
+//! 1. Wayland：内置 Wayland 剪贴板（`wl-clipboard-rs`，纯 Rust 编译进二进制，
+//!    不依赖 `wl-copy`/`xclip`/`xsel` 等外部工具，也不依赖终端支持 OSC52）。
+//! 2. 系统剪贴板工具：macOS `pbcopy`、Windows `clip.exe`、Linux `wl-copy`/`xclip`/`xsel`。
+//! 3. OSC52：转义序列写 `/dev/tty`，穿透 alternate screen + SSH + tmux
+//!    （alacritty / kitty / ghostty / wezterm 默认支持；tmux 需
+//!    `set -g set-clipboard on`；GNOME Terminal / Konsole / xterm 默认关）。
 //!
-//! Clipboard copy: OSC52 escape sequence written to `/dev/tty`, passing through
-//! alternate screen + SSH + tmux.
+//! Clipboard copy: layered attempts, the first success wins.
 //!
-//! OSC52 is supported by alacritty / kitty / ghostty / wezterm by default;
-//! tmux needs `set -g set-clipboard on`; GNOME Terminal / Konsole / xterm are
-//! off by default. Fallback: when OSC52 to `/dev/tty` fails, fall back to a
-//! system clipboard tool (macOS `pbcopy`, Linux X11 `xclip`/`xsel`, Wayland
-//! `wl-copy`, Windows `clip.exe`).
+//! 1. Wayland: built-in Wayland clipboard (`wl-clipboard-rs`, pure Rust compiled
+//!    into the binary; no dependency on external tools like `wl-copy`/`xclip`/
+//!    `xsel`, nor on terminal OSC52 support).
+//! 2. System clipboard tool: macOS `pbcopy`, Windows `clip.exe`, Linux
+//!    `wl-copy`/`xclip`/`xsel`.
+//! 3. OSC52: escape sequence written to `/dev/tty`, passing through alternate
+//!    screen + SSH + tmux (alacritty / kitty / ghostty / wezterm by default;
+//!    tmux needs `set -g set-clipboard on`; GNOME Terminal / Konsole / xterm off).
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-/// 把文本复制到剪贴板。同时尝试 OSC52 写 `/dev/tty` 和系统剪贴板工具，
+/// 把文本复制到剪贴板。分层尝试：Wayland 内置后端 → 系统剪贴板工具 → OSC52，
 /// 任一成功即返回 `true`。
 ///
 /// OSC52 写 `/dev/tty` 即使成功，终端也可能不处理该序列（不支持 OSC52、
 /// 被嵌套会话吞掉等），因此系统工具也必须尝试。在 SSH 会话中系统工具
 /// 可能不存在，此时仅靠 OSC52。
 ///
-/// Copy text to the clipboard. Tries both OSC52 (to `/dev/tty`) and a
-/// system clipboard tool; returns `true` if either succeeded.
+/// Copy text to the clipboard. Tries Wayland built-in backend, then a system
+/// clipboard tool, then OSC52; returns `true` if any succeeded.
 ///
 /// Even if OSC52 writes to `/dev/tty` successfully, the terminal may not
 /// process the sequence (no OSC52 support, nested session swallowed it, etc.),
 /// so the system tool must also be tried. In SSH sessions the system tool
 /// may not exist, leaving OSC52 as the only path.
 pub fn copy_to_clipboard(text: &str) -> bool {
-    let osc52_ok = copy_via_osc52(text);
+    if copy_via_wayland(text) {
+        return true;
+    }
     let system_ok = copy_via_system_tool(text);
-    osc52_ok || system_ok
+    let osc52_ok = copy_via_osc52(text);
+    system_ok || osc52_ok
+}
+
+/// Wayland 内置剪贴板后端：仅当 `WAYLAND_DISPLAY` 已设置时启用。
+/// 通过 `wl-clipboard-rs`（纯 Rust Wayland client）直接与 compositor 的
+/// `ext-data-control`/`wlr-data-control` 协议通信，把数据 offer 为
+/// `text/plain`（并附带 `UTF8_STRING` 等别名以便 XWayland 客户端粘贴）。
+///
+/// `Options::copy` 默认在后台线程持续服务粘贴请求（`serve_requests` 默认
+/// Unlimited），调用即刻返回；data source 在其他应用接管剪贴板时自动销毁。
+///
+/// Built-in Wayland clipboard backend: active only when `WAYLAND_DISPLAY` is
+/// set. Talks directly to the compositor's `ext-data-control`/`wlr-data-control`
+/// protocol via `wl-clipboard-rs` (a pure-Rust Wayland client), offering the
+/// data as `text/plain` (plus `UTF8_STRING` etc. aliases for XWayland clients).
+///
+/// `Options::copy` serves paste requests on a background thread by default
+/// (`serve_requests` defaults to Unlimited) and returns immediately; the data
+/// source is destroyed automatically when another app takes over the clipboard.
+#[cfg(target_os = "linux")]
+fn copy_via_wayland(text: &str) -> bool {
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return false;
+    }
+    let opts = wl_clipboard_rs::copy::Options::new();
+    let bytes: Box<[u8]> = text.as_bytes().to_vec().into_boxed_slice();
+    opts.copy(
+        wl_clipboard_rs::copy::Source::Bytes(bytes),
+        wl_clipboard_rs::copy::MimeType::Text,
+    )
+    .is_ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn copy_via_wayland(_text: &str) -> bool {
+    false
 }
 
 /// OSC52：`\x1b]52;c;<base64>\x07` 写 `/dev/tty`。

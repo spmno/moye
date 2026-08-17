@@ -29,5 +29,8 @@ libc = "0.2"
 rig-agent = { version = "0.41", features = ["rmcp"] }
 rmcp = { version = "2", features = ["transport-io", "transport-child-process", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+wl-clipboard-rs = "0.9"
+
 [profile.release]
 opt-level = 3

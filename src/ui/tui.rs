@@ -866,10 +866,16 @@ fn handle_key_event(
 fn copy_selection(state: &mut TuiState) {
     if let Some(sel) = state.selection.take() {
         let text = sel.extract(&state.all_message_lines());
-        if !text.is_empty() {
-            clipboard::copy_to_clipboard(&text);
+        if text.is_empty() {
+            return;
+        }
+        if clipboard::copy_to_clipboard(&text) {
             state.push_event(AgentEvent::Info(
                 "\u{2713} \u{5df2}\u{590d}\u{5236}\u{9009}\u{533a}".into(),
+            ));
+        } else {
+            state.push_event(AgentEvent::Info(
+                "\u{2717} \u{590d}\u{5236}\u{5931}\u{8d25}\u{ff1a}\u{672a}\u{68c0}\u{6d4b}\u{5230}\u{53ef}\u{7528}\u{7684}\u{526a}\u{8d34}\u{677f}\u{3002}\u{8bf7}\u{5b89}\u{88c5} wl-clipboard / xclip / xsel \u{540e}\u{91cd}\u{8bd5}\u{ff08}\u{6216}\u{786e}\u{8ba4}\u{7ec8}\u{7aef}\u{652f}\u{6301} OSC52\u{ff09}\u{3002}".into(),
             ));
         }
     }

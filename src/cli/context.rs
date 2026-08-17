@@ -8,8 +8,88 @@ use crate::evolution::prompt_evolve::PromptEvolver;
 use crate::memory::{Lesson, MemoryStore, Turn};
 use crate::model_history::ModelHistory;
 use crate::registry::{AgentRegistry, Orchestrator};
+use crate::seam::SandboxProvider;
 use crate::{evolution, skills};
 use std::sync::{Arc, Mutex};
+
+/// 启动时 OS 级沙箱 provider 的选择结果，由 `[sandbox].mode` 决定。
+/// Selection of the OS-level sandbox provider at startup, driven by `[sandbox].mode`.
+///
+/// 测试友好：纯枚举，可在不构造 trait 对象的情况下断言选择逻辑。
+/// Test-friendly: a plain enum, assertable without constructing trait objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxKind {
+    /// `SimpleSandbox`（bwrap / seatbelt / path 后端）——mode 为 `auto` / `bwrap` / 未知时。
+    /// `SimpleSandbox` (bwrap / seatbelt / path backend) — mode is `auto` / `bwrap` / unknown.
+    Simple,
+    /// `LandlockSandbox`（Landlock LSM，bwrap 不可用时的 fallback）——mode 为 `landlock` 时。
+    /// `LandlockSandbox` (Landlock LSM, fallback when bwrap is unavailable) — mode is `landlock`.
+    Landlock,
+    /// 禁用 OS 级沙箱——mode 为 `off` 时。
+    /// OS-level sandbox disabled — mode is `off`.
+    Off,
+}
+
+/// 根据 `[sandbox].mode` 选择启动时应使用的 OS 级沙箱 provider 类型。
+/// Selects which OS-level sandbox provider type to use at startup, based on `[sandbox].mode`.
+///
+/// - `"landlock"` → [`SandboxKind::Landlock`]
+/// - `"off"` / `"false"` / `"0"` → [`SandboxKind::Off`]
+/// - 其他（`"auto"` / `"bwrap"` / 未知）→ [`SandboxKind::Simple`]
+pub fn select_sandbox_kind(cfg: &crate::config::Config) -> SandboxKind {
+    match cfg.sandbox.mode.as_str() {
+        "landlock" => SandboxKind::Landlock,
+        "off" | "false" | "0" => SandboxKind::Off,
+        _ => SandboxKind::Simple,
+    }
+}
+
+/// 根据组合配置构造 OS 级沙箱 trait 对象（todo 8 启动时选择）。
+/// Builds the OS-level sandbox trait object based on the combined config (todo 8).
+///
+/// 由 `select_sandbox_kind` 决定具体 provider：
+/// - [`SandboxKind::Landlock`] → `LandlockSandbox::with_authorized_dirs`
+/// - [`SandboxKind::Off`] → `SimpleSandbox`（backend = `Off`）
+/// - [`SandboxKind::Simple`] → `SimpleSandbox`（backend 来自 `[sandbox].backend`）
+pub fn build_sandbox_provider(cfg: &crate::config::Config) -> Arc<dyn SandboxProvider> {
+    match select_sandbox_kind(cfg) {
+        SandboxKind::Landlock => Arc::new(crate::provider::LandlockSandbox::with_authorized_dirs(
+            &cfg.sandbox.authorized_dirs,
+        )),
+        SandboxKind::Off => Arc::new(crate::sandbox::SimpleSandbox::with_backend(
+            &cfg.sandbox.authorized_dirs,
+            crate::sandbox::SandboxBackend::Off,
+        )),
+        SandboxKind::Simple => {
+            let backend = crate::sandbox::SandboxBackend::parse(&cfg.sandbox.backend);
+            Arc::new(crate::sandbox::SimpleSandbox::with_backend(
+                &cfg.sandbox.authorized_dirs,
+                backend,
+            ))
+        }
+    }
+}
+
+/// 把 `agent.toml` 原始内容解析 + 应用 profile 叠加后，序列化为人类可读的
+/// TOML 字符串。开头以注释形式标注选中的 profile 名（如有）。
+///
+/// Parses the raw `agent.toml`, applies profile overlay, then serializes the
+/// combined tree to a human-readable TOML string. The selected profile name
+/// (if any) is noted in a leading comment.
+pub fn dump_config_to_string(raw: &str) -> anyhow::Result<String> {
+    let (cfg, value, _active_from_parse) = crate::config::Config::parse_combined(raw, None)?;
+    // 用 Config::active_profile_name() 而非 parse_combined 返回的 active，既验证
+    // 两者一致，也让 active_profile_name() 在生产路径中被实际调用（避免 dead_code）。
+    // Use Config::active_profile_name() rather than the active returned by parse_combined,
+    // both to cross-check they agree and to exercise the method on the production path.
+    let active = cfg.active_profile_name();
+    let mut body = toml::to_string_pretty(&value)?;
+    if let Some(name) = active {
+        let header = format!("# Active profile: {name}\n");
+        body = format!("{header}{body}");
+    }
+    Ok(body)
+}
 
 /// 应用上下文：运行期共享的状态集合，承载所有 `/` 命令分发与任务执行所需依赖。
 /// Application context: the shared runtime state holding all dependencies needed for
@@ -111,11 +191,15 @@ impl AppContext {
         out.push_str("\n支持的套餐:");
         for sp in supported {
             let marker = if *sp == current { " ← 当前" } else { "" };
-            out.push_str(&format!("\n  /plan {}  →  {}{}", sp.slug(), sp.label(), marker));
+            out.push_str(&format!(
+                "\n  /plan {}  →  {}{}",
+                sp.slug(),
+                sp.label(),
+                marker
+            ));
         }
         out
     }
-
 
     /// `/evolve`: trigger prompt evolution (inject lessons → evaluate → adopt best), returning user-facing text.
     pub async fn cmd_evolve(&self, tx: &EventSender) -> String {
@@ -213,7 +297,10 @@ impl AppContext {
                 "\u{ff08}\u{6682}\u{65e0}\u{5bf9}\u{8bdd}\u{8bb0}\u{5f55}\u{ff09}".to_string()
             }
             Ok(turns) => {
-                let mut out = format!("\u{2500}\u{2500}\u{2500} \u{6700}\u{8fd1} {} \u{8f6e}\u{5bf9}\u{8bdd} \u{2500}\u{2500}\u{2500}", turns.len());
+                let mut out = format!(
+                    "\u{2500}\u{2500}\u{2500} \u{6700}\u{8fd1} {} \u{8f6e}\u{5bf9}\u{8bdd} \u{2500}\u{2500}\u{2500}",
+                    turns.len()
+                );
                 for t in &turns {
                     let role = match t.role.as_str() {
                         "user" => "\u{7528}\u{6237}",
@@ -237,7 +324,10 @@ impl AppContext {
                 "\u{ff08}\u{6682}\u{65e0}\u{7ecf}\u{9a8c}\u{8bb0}\u{5f55}\u{ff09}".to_string()
             }
             Ok(lessons) => {
-                let mut out = format!("\u{2500}\u{2500}\u{2500} \u{7ecf}\u{9a8c}\u{6559}\u{8bad}\u{ff08}\u{5171} {} \u{6761}\u{ff09}\u{2500}\u{2500}\u{2500}", lessons.len());
+                let mut out = format!(
+                    "\u{2500}\u{2500}\u{2500} \u{7ecf}\u{9a8c}\u{6559}\u{8bad}\u{ff08}\u{5171} {} \u{6761}\u{ff09}\u{2500}\u{2500}\u{2500}",
+                    lessons.len()
+                );
                 for (i, l) in lessons.iter().enumerate() {
                     out.push_str(&format!("\n  {}. {}", i + 1, l.summary));
                 }
@@ -268,10 +358,16 @@ impl AppContext {
                     ts,
                 });
 
-                let summary = format!("\u{4efb}\u{52a1}: {goal} \u{2192} \u{4ea7}\u{51fa}: {}", truncate(&out, 200));
+                let summary = format!(
+                    "\u{4efb}\u{52a1}: {goal} \u{2192} \u{4ea7}\u{51fa}: {}",
+                    truncate(&out, 200)
+                );
                 let lesson = Lesson { summary, ts };
                 let _ = self.memory.record_lesson(&lesson);
-                if let Ok(Some(rule)) = self.memory.check_and_escalate_rule(&lesson, self.rule_threshold) {
+                if let Ok(Some(rule)) = self
+                    .memory
+                    .check_and_escalate_rule(&lesson, self.rule_threshold)
+                {
                     let _ = tx.send(AgentEvent::Info(format!(
                         "📋 规则提升：教训反复出现 {} 次，已提升为规则：{}",
                         rule.count, rule.text
@@ -330,6 +426,41 @@ fn write_plan_to_config(plan: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Test helper: saves the current value of an env var, sets a new one (or
+    /// unsets it), and restores the original on Drop. Wraps the edition-2024
+    /// `unsafe` env mutators so tests stay clean.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn new(key: &'static str, value: Option<&str>) -> Self {
+            let prev = std::env::var(key).ok();
+            match value {
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn env_guard(key: &'static str, value: Option<&str>) -> EnvGuard {
+        EnvGuard::new(key, value)
+    }
 
     #[test]
     fn truncate_short_text_unchanged() {
@@ -355,6 +486,178 @@ mod tests {
         let s = "\u{4f60}\u{597d}\u{4e16}\u{754c}";
         let result = truncate(s, 6);
         assert_eq!(result, "\u{4f60}\u{597d}\u{2026}");
+    }
+
+    // ── SandboxKind / build_sandbox_provider / dump_config tests (todo 8) ──
+
+    fn sandbox_cfg(mode: &str) -> crate::config::Config {
+        let toml_str = format!(
+            r#"
+[sandbox]
+backend = "auto"
+mode = "{mode}"
+authorized_dirs = []
+"#
+        );
+        toml::from_str(&toml_str).expect("sandbox cfg should parse")
+    }
+
+    #[test]
+    fn select_sandbox_kind_landlock_mode() {
+        // Given: [sandbox] mode = "landlock".
+        // When: select_sandbox_kind.
+        // Then: returns Landlock.
+        let cfg = sandbox_cfg("landlock");
+        assert_eq!(select_sandbox_kind(&cfg), SandboxKind::Landlock);
+    }
+
+    #[test]
+    fn select_sandbox_kind_off_mode() {
+        // Given: [sandbox] mode = "off".
+        // When: select_sandbox_kind.
+        // Then: returns Off.
+        let cfg = sandbox_cfg("off");
+        assert_eq!(select_sandbox_kind(&cfg), SandboxKind::Off);
+    }
+
+    #[test]
+    fn select_sandbox_kind_auto_falls_back_to_simple() {
+        // Given: [sandbox] mode = "auto" (and "bwrap" / unknown).
+        // When: select_sandbox_kind.
+        // Then: returns Simple for all non-landlock / non-off modes.
+        assert_eq!(
+            select_sandbox_kind(&sandbox_cfg("auto")),
+            SandboxKind::Simple
+        );
+        assert_eq!(
+            select_sandbox_kind(&sandbox_cfg("bwrap")),
+            SandboxKind::Simple
+        );
+        assert_eq!(
+            select_sandbox_kind(&sandbox_cfg("unknown")),
+            SandboxKind::Simple
+        );
+    }
+
+    #[test]
+    fn build_sandbox_provider_landlock_probes_without_panic() {
+        // Given: config with mode = "landlock".
+        // When: build_sandbox_provider.
+        // Then: returns an Arc<dyn SandboxProvider> whose probe() returns a valid
+        // ProbeLevel without panicking (LandlockSandbox instantiated at startup).
+        let cfg = sandbox_cfg("landlock");
+        let provider = build_sandbox_provider(&cfg);
+        let level = provider.probe();
+        use crate::seam::ProbeLevel;
+        assert!(
+            matches!(
+                level,
+                ProbeLevel::Full | ProbeLevel::Partial | ProbeLevel::Unusable
+            ),
+            "probe() must return a valid ProbeLevel, got {level:?}"
+        );
+    }
+
+    #[test]
+    fn build_sandbox_provider_off_mode_yields_disabled_sandbox() {
+        // Given: config with mode = "off".
+        // When: build_sandbox_provider.
+        // Then: probe() returns Unusable (OS-level sandbox disabled).
+        // (Path-checking is a separate HITL concern handled by Orchestrator's
+        // SimpleSandbox, which gets mode="off" propagated via Orchestrator::new.)
+        let cfg = sandbox_cfg("off");
+        let provider = build_sandbox_provider(&cfg);
+        use crate::seam::ProbeLevel;
+        assert_eq!(
+            provider.probe(),
+            ProbeLevel::Unusable,
+            "off mode → probe() must be Unusable"
+        );
+    }
+
+    #[test]
+    fn dump_config_outputs_valid_toml_with_profile_applied() {
+        // Given: agent.toml content with a profile patching sandbox.mode to "landlock".
+        // When: dump_config_to_string with explicit profile via AGENT_PROFILE env.
+        // Then: output is valid TOML (re-parseable) and contains mode = "landlock";
+        //       the active profile name appears in the leading comment.
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _guard = env_guard("AGENT_PROFILE", Some("dev"));
+        let raw = r#"
+[sandbox]
+backend = "auto"
+mode = "auto"
+authorized_dirs = []
+
+[profile.dev]
+name = "dev"
+patches = [
+    { id = "sandbox", config = { backend = "auto", mode = "landlock", authorized_dirs = [] } },
+]
+"#;
+        let dump = dump_config_to_string(raw).expect("dump should succeed");
+        assert!(
+            dump.contains("# Active profile: dev"),
+            "dump must include the active profile name in a comment, got:\n{dump}"
+        );
+        assert!(
+            dump.contains("mode = \"landlock\""),
+            "dump must contain the patched mode value, got:\n{dump}"
+        );
+        let body = dump
+            .strip_prefix("# Active profile: dev\n")
+            .unwrap_or(&dump);
+        let reparsed: toml::Value = toml::from_str(body).expect("dump body must be valid TOML");
+        let mode = reparsed
+            .get("sandbox")
+            .and_then(|s| s.get("mode"))
+            .and_then(|m| m.as_str())
+            .expect("sandbox.mode present in reparsed dump");
+        assert_eq!(mode, "landlock");
+    }
+
+    #[test]
+    fn dump_config_no_profile_has_no_active_header() {
+        // Given: agent.toml with no [profile] section, no AGENT_PROFILE env.
+        // When: dump_config_to_string.
+        // Then: output is valid TOML and has no "Active profile" header.
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _guard = env_guard("AGENT_PROFILE", None);
+        let raw = r#"
+[sandbox]
+backend = "bwrap"
+mode = "auto"
+"#;
+        let dump = dump_config_to_string(raw).expect("dump should succeed");
+        assert!(
+            !dump.contains("Active profile"),
+            "no profile selected → no active-profile header, got:\n{dump}"
+        );
+        let _reparsed: toml::Value = toml::from_str(&dump).expect("dump must be valid TOML");
+    }
+
+    #[test]
+    fn dump_config_propagates_profile_format_error() {
+        // Given: profile whose patch references a non-existent id.
+        // When: dump_config_to_string with that profile active.
+        // Then: returns Err (non-zero exit at the call site), not a silent dump.
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _guard = env_guard("AGENT_PROFILE", Some("bad"));
+        let raw = r#"
+[sandbox]
+backend = "auto"
+
+[profile.bad]
+name = "bad"
+patches = [
+    { id = "nonexistent.path", config = {} },
+]
+"#;
+        let result = dump_config_to_string(raw);
+        assert!(
+            result.is_err(),
+            "profile format error must propagate as Err, got: {result:?}"
+        );
     }
 }
 

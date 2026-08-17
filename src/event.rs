@@ -31,7 +31,6 @@ use tokio::sync::{mpsc, oneshot};
 pub enum AgentEvent {
     // ===== 瞬态：流式 / 生命周期 =====
     // ===== Transient: streaming / lifecycle =====
-
     /// LLM 文本增量。
     /// LLM text delta.
     TextDelta(String),
@@ -61,7 +60,6 @@ pub enum AgentEvent {
 
     // ===== 持久：存入消息历史 =====
     // ===== Persistent: stored in message history =====
-
     /// 用户输入。
     /// User input.
     User(String),
@@ -76,7 +74,11 @@ pub enum AgentEvent {
     ToolCall { name: String, desc: String },
     /// 工具结果通知。
     /// Tool result notification.
-    ToolResult { name: String, result: String, ok: bool },
+    ToolResult {
+        name: String,
+        result: String,
+        ok: bool,
+    },
     /// 回合完成，附 token 用量。
     /// Turn finished, with token usage stats.
     TurnFinished { turn: usize, usage: String },

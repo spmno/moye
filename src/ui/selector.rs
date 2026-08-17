@@ -67,8 +67,7 @@ impl SelectorState {
         self.items
             .iter()
             .filter(|it| {
-                it.label.to_lowercase().contains(&f)
-                    || it.detail.to_lowercase().contains(&f)
+                it.label.to_lowercase().contains(&f) || it.detail.to_lowercase().contains(&f)
             })
             .collect()
     }
@@ -138,9 +137,21 @@ mod tests {
 
     fn models() -> Vec<SelectorItem> {
         vec![
-            SelectorItem { label: "deepseek-v4-pro".into(), detail: "旗舰".into(), ..Default::default() },
-            SelectorItem { label: "deepseek-v4-flash".into(), detail: "快速".into(), ..Default::default() },
-            SelectorItem { label: "kimi-k3".into(), detail: "长上下文".into(), ..Default::default() },
+            SelectorItem {
+                label: "deepseek-v4-pro".into(),
+                detail: "旗舰".into(),
+                ..Default::default()
+            },
+            SelectorItem {
+                label: "deepseek-v4-flash".into(),
+                detail: "快速".into(),
+                ..Default::default()
+            },
+            SelectorItem {
+                label: "kimi-k3".into(),
+                detail: "长上下文".into(),
+                ..Default::default()
+            },
         ]
     }
 

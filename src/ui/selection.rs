@@ -80,7 +80,12 @@ impl Selection {
             return String::new();
         }
         let mut out = String::new();
-        for (i, line) in lines.iter().enumerate().skip(lo_line).take(hi_line - lo_line + 1) {
+        for (i, line) in lines
+            .iter()
+            .enumerate()
+            .skip(lo_line)
+            .take(hi_line - lo_line + 1)
+        {
             if i > lo_line {
                 out.push('\n');
             }

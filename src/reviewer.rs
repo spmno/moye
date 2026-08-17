@@ -10,7 +10,7 @@ use crate::registry::{AgentRegistry, Role};
 
 /// 评审结论：通过 / 驳回（附反馈）/ 需要澄清（附问题）。
 /// Review verdict: Approve / Reject (with feedback) / Clarify (with question).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Approve,
     Reject(String), // 返回给构建者的反馈
@@ -24,8 +24,8 @@ pub enum Verdict {
 ///   1. Spec compliance — does it implement what was required?
 ///   2. 代码质量   —— 安全性、正确性、可维护性。
 ///   2. Code quality   — security, correctness, maintainability.
-/// 两者都必须 Approve，否则带着反馈退回。
-/// Both must Approve; otherwise returned with feedback.
+///      两者都必须 Approve，否则带着反馈退回。
+///      Both must Approve; otherwise returned with feedback.
 pub struct ReviewGate {
     registry: AgentRegistry,
 }
@@ -39,7 +39,12 @@ impl ReviewGate {
 
     /// 对产物执行两阶段评审，返回最终结论。
     /// Executes two-stage review on the produced work, returns the final verdict.
-    pub async fn review(&self, task: &str, produced: &str, tx: &EventSender) -> anyhow::Result<Verdict> {
+    pub async fn review(
+        &self,
+        task: &str,
+        produced: &str,
+        tx: &EventSender,
+    ) -> anyhow::Result<Verdict> {
         let auditor = self.registry.build(Role::Auditor)?;
 
         let spec_prompt = format!(
@@ -71,11 +76,19 @@ impl ReviewGate {
             Ok(Verdict::Approve)
         } else if up.contains("CLARIFY") {
             Ok(Verdict::Clarify(
-                qual_out.lines().find(|l| l.to_uppercase().contains("CLARIFY")).unwrap_or("").to_string(),
+                qual_out
+                    .lines()
+                    .find(|l| l.to_uppercase().contains("CLARIFY"))
+                    .unwrap_or("")
+                    .to_string(),
             ))
         } else {
             Ok(Verdict::Reject(
-                qual_out.lines().find(|l| l.to_uppercase().contains("REJECT")).unwrap_or("quality failed").to_string(),
+                qual_out
+                    .lines()
+                    .find(|l| l.to_uppercase().contains("REJECT"))
+                    .unwrap_or("quality failed")
+                    .to_string(),
             ))
         }
     }

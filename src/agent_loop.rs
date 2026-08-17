@@ -14,9 +14,9 @@ use std::time::Duration;
 use futures::StreamExt;
 use rig_agent::agent::hook::CompletionCall;
 use rig_agent::agent::{
-    Agent, AgentHook, HookContext, InvalidToolCallAction, InvalidToolCallContext, ModelTurnAction,
-    ModelTurnFinished, MultiTurnStreamItem, RequestPatch, StepEventKind, StreamingResult,
-    ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent, CompletionCallAction,
+    Agent, AgentHook, CompletionCallAction, HookContext, InvalidToolCallAction,
+    InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, MultiTurnStreamItem, RequestPatch,
+    StepEventKind, StreamingResult, ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent,
 };
 use rig_agent::client::AgentClientExt;
 use rig_core::completion::{Message, Usage};
@@ -25,9 +25,12 @@ use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::event::{AgentEvent, EventSender};
-use crate::registry::{AgentRegistry, Permission, Role, ToolPerms};
+use crate::events::{PreStepState, WaterfallAction, WaterfallEvent, WaterfallRegistry};
+use crate::registry::{AgentRegistry, ApprovalChain, DefaultApproval, Permission, Role, ToolPerms};
 use crate::sandbox::Sandbox;
+use crate::seam::{ApprovalRequest, ApprovalVerdict, ToolApproval};
 use crate::tools::is_readonly_bash;
+use crate::tools::pipeline::{PipelineCall, PipelineResult, PostAction, PreAction};
 
 /// HITL（人在环）门控。实现为 rig 的 `AgentHook`，拦截每一次 `ToolCall` 并按角色的
 /// HITL (Human-in-the-Loop) gate. Implemented as rig's `AgentHook`, intercepts every `ToolCall` by role,
@@ -46,29 +49,54 @@ use crate::tools::is_readonly_bash;
 /// Permission tiers are captured at loop startup.
 #[derive(Clone)]
 pub struct HitlHook {
-    perms: Arc<Mutex<ToolPerms>>,
+    approval: Arc<ApprovalChain>,
+    role: String,
     waiting: Arc<AtomicBool>,
     tx: EventSender,
     sandbox: Sandbox,
     /// 信任模式：为 true 时沙箱外访问自动授权，不弹窗确认。
     /// Trust mode: when true, out-of-sandbox access is auto-authorized without prompting.
     trust_sandbox: Arc<AtomicBool>,
+    /// todo 9: 简化 pre/post 监听器（pre/post 层，独立于 around-execute 层）。
+    /// `Arc` 使 `HitlHook` 保持 `Clone`（`PipelineHooks` 本身不可 Clone——内部是
+    /// `Vec<Box<dyn Fn>>`）。pre 监听器在 `on_tool_call` 现有沙箱/权限检查之前运行；
+    /// post 监听器在 `on_tool_result` 现有通知之后运行。原 y/n HITL 逻辑不变。
+    /// todo 9: simplified pre/post listeners (pre/post layer, independent of the
+    /// around-execute layer). `Arc` keeps `HitlHook` `Clone` (`PipelineHooks` itself is
+    /// not Clone — it holds `Vec<Box<dyn Fn>>`). pre listeners run in `on_tool_call`
+    /// BEFORE the existing sandbox/permission check; post listeners run in
+    /// `on_tool_result` AFTER the existing notification. The original y/n HITL logic is unchanged.
+    pipeline_hooks: Arc<crate::tools::pipeline::PipelineHooks>,
+    /// todo 11: 全功能 waterfall 监听器注册表（emit/waterfall/serial）。
+    /// 在 `on_tool_call` / `on_tool_result` 中派发 ToolsPreExecute /
+    /// ToolsPostExecute 事件。空注册表为 no-op（默认行为不变）。
+    /// todo 11: full waterfall listener registry (emit/waterfall/serial).
+    /// Dispatches ToolsPreExecute / ToolsPostExecute from `on_tool_call` /
+    /// `on_tool_result`. Empty registry is a no-op (default behavior unchanged).
+    waterfall: Arc<WaterfallRegistry>,
 }
 
 impl HitlHook {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        perms: ToolPerms,
+        approval: Arc<ApprovalChain>,
+        role: String,
         waiting: Arc<AtomicBool>,
         tx: EventSender,
         sandbox: Sandbox,
         trust_sandbox: Arc<AtomicBool>,
+        pipeline_hooks: Arc<crate::tools::pipeline::PipelineHooks>,
+        waterfall: Arc<WaterfallRegistry>,
     ) -> Self {
         Self {
-            perms: Arc::new(Mutex::new(perms)),
+            approval,
+            role,
             waiting,
             tx,
             sandbox,
             trust_sandbox,
+            pipeline_hooks,
+            waterfall,
         }
     }
 
@@ -138,6 +166,54 @@ impl AgentHook for HitlHook {
     async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
         let tool_name = event.tool_name;
         let args = event.args;
+        // ── pre-execute 监听器（todo 9 pre/post 层）──
+        // 在沙箱/权限检查之前运行。Skip→拒绝；Rewrite→替换 args 重新派发（rig 重入
+        // on_tool_call）；Run→继续下方现有逻辑。
+        // pre-execute listeners (todo 9 pre/post layer), run BEFORE sandbox/permission
+        // check. Skip -> deny; Rewrite -> replace args and re-dispatch (rig re-enters
+        // on_tool_call); Run -> continue into existing logic below.
+        let parsed_args =
+            serde_json::from_str::<serde_json::Value>(args).unwrap_or(serde_json::Value::Null);
+        // ── todo 11 waterfall 派发（emit + waterfall）──
+        // emit 是 fire-and-forget；waterfall 顺序派发，ShortCircuit → 拒绝执行。
+        // 空注册表为 no-op（waterfall 返回 Continue），不影响现有行为。
+        // todo 11 waterfall dispatch (emit + waterfall). emit is fire-and-forget;
+        // waterfall runs sequentially; ShortCircuit -> deny the call. Empty
+        // registry is a no-op (waterfall returns Continue), preserving behavior.
+        let pre_wf_event = WaterfallEvent::ToolsPreExecute {
+            tool_name: tool_name.to_string(),
+            args: parsed_args.clone(),
+        };
+        self.waterfall.emit(&pre_wf_event);
+        if matches!(
+            self.waterfall.waterfall(&pre_wf_event),
+            WaterfallAction::ShortCircuit
+        ) {
+            let _ = self.tx.send(AgentEvent::Info(
+                "  [waterfall] pre-execute short-circuited".into(),
+            ));
+            return ToolCallAction::Skip("short-circuited by waterfall listener".into());
+        }
+        let pre_call = PipelineCall {
+            tool_name: tool_name.to_string(),
+            args: parsed_args,
+            role: None,
+        };
+        match self.pipeline_hooks.pre_execute(&pre_call) {
+            PreAction::Run => {}
+            PreAction::Skip(reason) => {
+                let _ = self
+                    .tx
+                    .send(AgentEvent::Info(format!("  [pre] denied: {reason}")));
+                return ToolCallAction::Skip(reason);
+            }
+            PreAction::Rewrite(new_args) => {
+                let _ = self
+                    .tx
+                    .send(AgentEvent::Info("  [pre] rewrite args".into()));
+                return ToolCallAction::Rewrite(new_args);
+            }
+        }
         // ── 沙箱检查 ──
         // 在权限分级检查之前，先检查工具调用是否访问沙箱外的路径。
         // If the path is outside the sandbox and not yet authorized, prompt the user.
@@ -178,19 +254,22 @@ impl AgentHook for HitlHook {
                     let _ = self.tx.send(AgentEvent::Info(
                         "  [\u{6c99}\u{7bb1}] \u{8bbf}\u{95ee}\u{88ab}\u{62d2}\u{7edd}".into(),
                     ));
-                    return ToolCallAction::Skip(
-                        format!("\u{6c99}\u{7bb1}\u{62d2}\u{7edd}\u{8bbf}\u{95ee}: {sandbox_err}"),
-                    );
+                    return ToolCallAction::Skip(format!(
+                        "\u{6c99}\u{7bb1}\u{62d2}\u{7edd}\u{8bbf}\u{95ee}: {sandbox_err}"
+                    ));
                 }
             }
         }
 
-        // ── 权限分级检查（原有逻辑）──
-        // Permission tier check (original logic)
-        let perms = self.perms.lock().unwrap().clone();
-        let tier = decide_tier(&perms, tool_name, args);
-        match tier {
-            Permission::Allow => {
+        // ── 审批链检查（todo 10：从 decide_tier 升级为 ApprovalChain）──
+        // Approval chain check (todo 10: upgraded from decide_tier to ApprovalChain)
+        let req = ApprovalRequest {
+            tool_name: tool_name.to_string(),
+            args: pre_call.args.clone(),
+            role: self.role.clone(),
+        };
+        match self.approval.request(&req) {
+            ApprovalVerdict::Allow => {
                 let _ = self.tx.send(AgentEvent::Info(
                     "  [HITL] \u{81ea}\u{52a8}\u{5141}\u{8bb8}".into(),
                 ));
@@ -199,17 +278,15 @@ impl AgentHook for HitlHook {
                 }
                 ToolCallAction::Run
             }
-            Permission::Deny => {
+            ApprovalVerdict::Deny => {
                 let _ = self.tx.send(AgentEvent::Info(
                     "  [HITL] \u{5df2}\u{62d2}\u{7edd}\u{ff08}\u{5b89}\u{5168}\u{7b56}\u{7565}\u{ff09}".into(),
                 ));
-                ToolCallAction::Skip(
-                    format!(
-                        "\u{5de5}\u{5177} `{tool_name}` \u{88ab}\u{5f53}\u{524d}\u{89d2}\u{8272}\u{7684}\u{5b89}\u{5168}\u{7b56}\u{7565}\u{7981}\u{6b62}"
-                    ),
-                )
+                ToolCallAction::Skip(format!(
+                    "\u{5de5}\u{5177} `{tool_name}` \u{88ab}\u{5f53}\u{524d}\u{89d2}\u{8272}\u{7684}\u{5b89}\u{5168}\u{7b56}\u{7565}\u{7981}\u{6b62}"
+                ))
             }
-            Permission::Ask => {
+            ApprovalVerdict::Ask => {
                 let desc = format_tool_call_desc(tool_name, args);
                 if self.confirm(tool_name, &desc).await {
                     if let Some(action) = self.maybe_run_interactive(tool_name, args).await {
@@ -217,11 +294,9 @@ impl AgentHook for HitlHook {
                     }
                     ToolCallAction::Run
                 } else {
-                    ToolCallAction::Skip(
-                        format!(
-                            "\u{7528}\u{6237}\u{62d2}\u{7edd}\u{4e86} `{tool_name}` \u{7684}\u{6267}\u{884c}"
-                        ),
-                    )
+                    ToolCallAction::Skip(format!(
+                        "\u{7528}\u{6237}\u{62d2}\u{7edd}\u{4e86} `{tool_name}` \u{7684}\u{6267}\u{884c}"
+                    ))
                 }
             }
         }
@@ -232,16 +307,50 @@ impl AgentHook for HitlHook {
         _ctx: &HookContext,
         event: ToolResultEvent<'_>,
     ) -> ToolResultAction {
+        let content = event.presentation.as_text().unwrap_or("").to_string();
+        // ── todo 11 waterfall 派发（emit + waterfall）──
+        // ShortCircuit → 停止循环。空注册表为 no-op，不影响现有行为。
+        // todo 11 waterfall dispatch (emit + waterfall). ShortCircuit -> halt
+        // the loop. Empty registry is a no-op, preserving existing behavior.
+        let post_wf_event = WaterfallEvent::ToolsPostExecute {
+            tool_name: event.tool_name.to_string(),
+            result: content.clone(),
+            ok: event.raw_result.is_success(),
+        };
+        self.waterfall.emit(&post_wf_event);
+        if matches!(
+            self.waterfall.waterfall(&post_wf_event),
+            WaterfallAction::ShortCircuit
+        ) {
+            return ToolResultAction::Stop("short-circuited by waterfall listener".into());
+        }
         let _ = self.tx.send(AgentEvent::ToolResult {
             name: event.tool_name.to_string(),
-            result: event
-                .presentation
-                .as_text()
-                .unwrap_or("")
-                .to_string(),
+            result: content.clone(),
             ok: true,
         });
-        ToolResultAction::Keep
+        // ── post-execute 监听器（todo 9 pre/post 层）──
+        // 在现有通知之后运行。Keep→透传；Rewrite→替换模型可见结果；Stop→停止循环。
+        // post-execute listeners (todo 9 pre/post layer), run AFTER the existing
+        // notification. Keep -> passthrough; Rewrite -> replace model-visible result; Stop -> halt.
+        let post_result = PipelineResult {
+            tool_name: event.tool_name.to_string(),
+            content,
+            ok: event.raw_result.is_success(),
+        };
+        match self.pipeline_hooks.post_execute(&post_result) {
+            PostAction::Keep => ToolResultAction::Keep,
+            PostAction::Rewrite(new_content) => {
+                let _ = self
+                    .tx
+                    .send(AgentEvent::Info("  [post] rewrite result".into()));
+                ToolResultAction::rewrite(new_content)
+            }
+            PostAction::Stop => {
+                let _ = self.tx.send(AgentEvent::Info("  [post] stop".into()));
+                ToolResultAction::Stop("stopped by post-execute hook".into())
+            }
+        }
     }
 
     async fn on_invalid_tool_call(
@@ -270,12 +379,10 @@ impl AgentHook for HitlHook {
         event: ModelTurnFinished<'_>,
     ) -> ModelTurnAction {
         let usage_str = format_usage(&event.usage);
-        let _ = self
-            .tx
-            .send(AgentEvent::TurnFinished {
-                turn: event.turn,
-                usage: usage_str,
-            });
+        let _ = self.tx.send(AgentEvent::TurnFinished {
+            turn: event.turn,
+            usage: usage_str,
+        });
         ModelTurnAction::Continue
     }
 }
@@ -294,6 +401,10 @@ impl AgentHook for HitlHook {
 /// Also records actual token usage from the API on `ModelTurnFinished`,
 /// 用于校准溢出检测。
 /// calibrating overflow detection.
+/// 缓存：(压缩时的历史长度, 压缩后的历史)。历史未变时复用。
+/// Cache: (history length at compaction, compacted history). Reused when history unchanged.
+type CompactionCache = Arc<Mutex<Option<(usize, Vec<Message>)>>>;
+
 pub struct ContextHook {
     budget: Arc<Mutex<crate::context::TokenBudget>>,
     config: crate::context::ContextConfig,
@@ -302,7 +413,7 @@ pub struct ContextHook {
     tx: EventSender,
     /// 缓存：(压缩时的历史长度, 压缩后的历史)。历史未变时复用。
     /// Cache: (history length at compaction, compacted history). Reused when history unchanged.
-    compaction_cache: Arc<Mutex<Option<(usize, Vec<Message>)>>>,
+    compaction_cache: CompactionCache,
     /// SSE 重试时用于捕获对话历史的共享 Arc（None = 不捕获）。
     /// Shared Arc for capturing conversation history on SSE retry (None = no capture).
     history_capture: Option<Arc<Mutex<Vec<Message>>>>,
@@ -312,6 +423,9 @@ pub struct ContextHook {
     /// 自主循环轮数上限，用于轮次预算提醒。
     /// Max turns for the autonomous loop, used for turn-budget awareness.
     max_turns: usize,
+    /// todo 11: waterfall 注册表，派发 AgentRequest 事件（fire-and-forget）。
+    /// todo 11: waterfall registry, dispatches AgentRequest events (fire-and-forget).
+    waterfall: Arc<WaterfallRegistry>,
 }
 
 impl ContextHook {
@@ -324,6 +438,7 @@ impl ContextHook {
         model: String,
         tx: EventSender,
         max_turns: usize,
+        waterfall: Arc<WaterfallRegistry>,
     ) -> Self {
         let budget = crate::context::TokenBudget::new(context_limit);
         Self {
@@ -336,6 +451,7 @@ impl ContextHook {
             history_capture: None,
             turn_capture: None,
             max_turns,
+            waterfall,
         }
     }
 
@@ -361,14 +477,22 @@ impl ContextHook {
         Some(format!(
             "[\u{7cfb}\u{7edf}\u{63d0}\u{793a}] \u{4f60}\u{5df2}\u{4f7f}\u{7528} {}/{} \u{8f6e}\u{ff0c}\u{5269}\u{4f59} {} \u{8f6e}\u{3002}\u{8bf7}\u{4f18}\u{5148}\u{6536}\u{655b}\u{5230}\u{7ed3}\u{8bba}\u{ff0c}\u{907f}\u{514d}\u{8fc7}\u{5ea6}\u{63a2}\u{7d22}\u{3002}\n\
              [System] {}/{} turns used, {} remaining. Prioritize converging to a conclusion, avoid excessive exploration.",
-            turn, self.max_turns, remaining,
-            turn, self.max_turns, remaining,
+            turn, self.max_turns, remaining, turn, self.max_turns, remaining,
         ))
     }
 
     /// 检测溢出并在必要时压缩历史，返回 `CompletionCallAction::Patch` 或 `CompletionCallAction::Continue`。
     /// Detect overflow and compact if needed, returning `CompletionCallAction::Patch` or `CompletionCallAction::Continue`.
-    async fn handle_completion_call(&self, history: &[Message], _turn: usize) -> CompletionCallAction {
+    async fn handle_completion_call(
+        &self,
+        history: &[Message],
+        _turn: usize,
+    ) -> CompletionCallAction {
+        // todo 11: fire-and-forget AgentRequest 事件（空注册表为 no-op）。
+        // todo 11: fire-and-forget AgentRequest event (empty registry is a no-op).
+        self.waterfall.emit(&WaterfallEvent::AgentRequest {
+            message: format!("turn={_turn}"),
+        });
         if let Some(hc) = &self.history_capture {
             *hc.lock().unwrap() = history.to_vec();
         }
@@ -412,8 +536,11 @@ impl ContextHook {
             let eff = budget.effective_budget();
             eff / 4
         };
-        let (old, recent) =
-            crate::context::select_head_tail(&base_history, self.config.keep_recent_turns, tail_budget);
+        let (old, recent) = crate::context::select_head_tail(
+            &base_history,
+            self.config.keep_recent_turns,
+            tail_budget,
+        );
         if old.is_empty() {
             return CompletionCallAction::Continue;
         }
@@ -428,12 +555,11 @@ impl ContextHook {
             }
         };
 
-        let summary_msg = Message::system(format!(
-            "[对话历史摘要 / Conversation Summary]\n{summary}"
-        ));
+        let summary_msg =
+            Message::system(format!("[对话历史摘要 / Conversation Summary]\n{summary}"));
         let continue_msg = Message::system(
             "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.\n\
-             \u{5982}\u{679c}\u{6709}\u{540e}\u{7eed}\u{6b65}\u{9aa4}\u{8bf7}\u{7ee7}\u{7eed}\u{ff0c}\u{5426}\u{5219}\u{8bf7}\u{6c42}\u{6f84}\u{6e05}\u{3002}"
+             \u{5982}\u{679c}\u{6709}\u{540e}\u{7eed}\u{6b65}\u{9aa4}\u{8bf7}\u{7ee7}\u{7eed}\u{ff0c}\u{5426}\u{5219}\u{8bf7}\u{6c42}\u{6f84}\u{6e05}\u{3002}",
         );
         let compacted: Vec<Message> = std::iter::once(summary_msg)
             .chain(recent.iter().cloned())
@@ -444,8 +570,7 @@ impl ContextHook {
 
         // 缓存结果。
         // Cache the result.
-        *self.compaction_cache.lock().unwrap() =
-            Some((history.len(), compacted.clone()));
+        *self.compaction_cache.lock().unwrap() = Some((history.len(), compacted.clone()));
 
         let _ = self.tx.send(AgentEvent::ContextCompacted {
             old_tokens: estimated,
@@ -567,7 +692,9 @@ fn format_tool_call_desc(tool_name: &str, args: &str) -> String {
                 .and_then(|v| v.as_str())
                 .map(|s| s.len())
                 .unwrap_or(0);
-            format!("write_file \u{2192} \u{5199}\u{5165}\u{6587}\u{4ef6}: {path} ({content_len} \u{5b57}\u{8282})")
+            format!(
+                "write_file \u{2192} \u{5199}\u{5165}\u{6587}\u{4ef6}: {path} ({content_len} \u{5b57}\u{8282})"
+            )
         }
         "run_bash" => {
             let command = get_str("command").unwrap_or_default();
@@ -614,6 +741,7 @@ fn format_usage(usage: &Usage) -> String {
 /// Pure-function permission tier resolution, can be tested independently without hook wrapping. `args` is the JSON-form
 /// 工具调用参数（用于从 `run_bash` 中提取 `command`）。
 /// tool call arguments (used to extract `command` from `run_bash`).
+#[allow(dead_code)] // used in tests
 pub fn decide_tier(perms: &ToolPerms, tool_name: &str, args: &str) -> Permission {
     match tool_name {
         "read_file" => perms.read_file,
@@ -625,7 +753,11 @@ pub fn decide_tier(perms: &ToolPerms, tool_name: &str, args: &str) -> Permission
         "run_bash" => {
             let command = serde_json::from_str::<serde_json::Value>(args)
                 .ok()
-                .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_string))
+                .and_then(|v| {
+                    v.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(str::to_string)
+                })
                 .unwrap_or_default();
             if is_readonly_bash(&command) {
                 perms.run_bash_readonly
@@ -647,12 +779,10 @@ pub fn decide_tier(perms: &ToolPerms, tool_name: &str, args: &str) -> Permission
 fn decide_flow(perms: &ToolPerms, tool_name: &str, args: &str) -> ToolCallAction {
     match decide_tier(perms, tool_name, args) {
         Permission::Allow => ToolCallAction::Run,
-        Permission::Deny => ToolCallAction::Skip(
-            format!("tool `{tool_name}` is denied by policy for this role"),
-        ),
-        Permission::Ask => ToolCallAction::Skip(
-            format!("user declined to run `{tool_name}`"),
-        ),
+        Permission::Deny => ToolCallAction::Skip(format!(
+            "tool `{tool_name}` is denied by policy for this role"
+        )),
+        Permission::Ask => ToolCallAction::Skip(format!("user declined to run `{tool_name}`")),
     }
 }
 
@@ -673,6 +803,7 @@ fn decide_flow(perms: &ToolPerms, tool_name: &str, args: &str) -> ToolCallAction
 ///
 /// 所有用户可见输出通过 `tx` channel 发送给 TUI。
 /// All user-visible output is sent to the TUI via the `tx` channel.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_autonomous(
     registry: &AgentRegistry,
     sandbox: &Sandbox,
@@ -681,13 +812,56 @@ pub async fn run_autonomous(
     goal: &str,
     tx: &EventSender,
     shared_history: Arc<Mutex<Vec<Message>>>,
+    shared_waterfall: Option<Arc<WaterfallRegistry>>,
+    pre_step: Option<Arc<PreStepState>>,
 ) -> anyhow::Result<String> {
     const MAX_RETRIES: usize = 3;
+
+    // todo 12: dispatch AgentPreStep via shared waterfall (if provided).
+    // Serial listeners (InvestigatorListener, PlannerListener) fire here,
+    // before the retry loop starts. They may set escape hatch or goal_override.
+    let goal_owned: Option<String> = if let (Some(wf), Some(ps)) = (&shared_waterfall, &pre_step) {
+        let event = WaterfallEvent::AgentPreStep {
+            role: format!("{role:?}").to_lowercase(),
+            goal: goal.to_string(),
+        };
+        wf.emit(&event);
+        wf.serial(&event).await;
+        if ps.escape.load(Ordering::Relaxed) {
+            return Ok(ps.investigation.lock().unwrap().clone().unwrap_or_default());
+        }
+        if let Some(err) = ps.error.lock().unwrap().take() {
+            return Err(anyhow::anyhow!(err));
+        }
+        ps.goal_override.lock().unwrap().clone()
+    } else {
+        None
+    };
+    let goal: &str = goal_owned.as_deref().unwrap_or(goal);
 
     let captured_history = shared_history;
     let captured_turn: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let mut turns_used: usize = 0;
     let total_max_turns = registry.max_turns_for_role(role);
+
+    // SessionLog: append-only 旁路日志，与 ContextHook history capture 并存。
+    // 追加失败不影响 model-visible 行为（仅 warn），SessionLog 是侧信道。
+    let session_dir = crate::config::config()
+        .map(|c| c.memory.dir.clone())
+        .unwrap_or_else(|| std::path::PathBuf::from("memory"));
+    let session_id = {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{role:?}-{nanos}")
+    };
+    let mut session_log = crate::session_log::SessionLog::new(session_id, session_dir);
+    if let Err(e) = session_log.append(crate::session_log::SessionEvent::UserMessage {
+        content: goal.to_string(),
+    }) {
+        warn!(error = %e, "session_log append user_message failed");
+    }
 
     for attempt in 0..=MAX_RETRIES {
         let max_turns_remaining = total_max_turns.saturating_sub(turns_used);
@@ -718,8 +892,22 @@ pub async fn run_autonomous(
         };
 
         let perms = registry.tool_perms(role);
+        let mut approval = ApprovalChain::new();
+        approval.add(Box::new(DefaultApproval::new(perms)));
         let hitl_waiting = Arc::new(AtomicBool::new(false));
-        let hook = HitlHook::new(perms, hitl_waiting.clone(), tx.clone(), sandbox.clone(), trust_sandbox.clone());
+        // todo 11: 每个自主循环创建独立的 WaterfallRegistry（按任务隔离监听器）。
+        // todo 11: each autonomous loop gets its own WaterfallRegistry (per-task isolation).
+        let waterfall = Arc::new(WaterfallRegistry::new());
+        let hook = HitlHook::new(
+            Arc::new(approval),
+            format!("{role:?}").to_lowercase(),
+            hitl_waiting.clone(),
+            tx.clone(),
+            sandbox.clone(),
+            trust_sandbox.clone(),
+            std::sync::Arc::new(crate::tools::pipeline::PipelineHooks::new()),
+            waterfall.clone(),
+        );
 
         let model = registry
             .session_model()
@@ -736,6 +924,7 @@ pub async fn run_autonomous(
             model,
             tx.clone(),
             max_turns_remaining,
+            waterfall.clone(),
         )
         .with_history_capture(captured_history.clone(), captured_turn.clone());
 
@@ -753,7 +942,16 @@ pub async fn run_autonomous(
         let stream = runner.stream().await;
 
         match consume_stream(stream, Some(hitl_waiting), tx).await {
-            Ok(output) => return Ok(output),
+            Ok(output) => {
+                if let Err(e) =
+                    session_log.append(crate::session_log::SessionEvent::AssistantMessage {
+                        content: output.clone(),
+                    })
+                {
+                    warn!(error = %e, "session_log append assistant_message failed");
+                }
+                return Ok(output);
+            }
             Err(e) if is_context_overflow_error(&e) && attempt < MAX_RETRIES => {
                 let mut hist = captured_history.lock().unwrap();
                 let old_len = hist.len();
@@ -893,15 +1091,15 @@ pub async fn consume_stream<R>(
                 Err(_) => {
                     // Check whether HITL started during the timed wait.
                     // 检查 HITL 是否在超时等待期间开始。
-                    if let Some(flag) = &hitl_waiting {
-                        if flag.load(Ordering::Relaxed) {
-                            // HITL became active mid-timeout — retry without
-                            // a deadline so the user has unlimited time to
-                            // respond.
-                            // HITL 在超时期间变为活动——无截止时间重试，
-                            // 让用户有无限时间响应。
-                            continue;
-                        }
+                    if let Some(flag) = &hitl_waiting
+                        && flag.load(Ordering::Relaxed)
+                    {
+                        // HITL became active mid-timeout — retry without
+                        // a deadline so the user has unlimited time to
+                        // respond.
+                        // HITL 在超时期间变为活动——无截止时间重试，
+                        // 让用户有无限时间响应。
+                        continue;
                     }
                     warn!(
                         timeout_secs = CHUNK_TIMEOUT.as_secs(),
@@ -993,10 +1191,7 @@ pub async fn consume_stream<R>(
 /// Builds a "runnable" rig `Agent` (with tools) for a role, respecting session-level model override.
 /// 与 `AgentRegistry::build` 类似，但返回原始 `Agent`，以便附加 runner 与 hook。
 /// Similar to `AgentRegistry::build`, but returns the raw `Agent` so runner and hooks can be attached.
-fn build_runner_agent(
-    registry: &AgentRegistry,
-    role: Role,
-) -> anyhow::Result<Agent<OpenAiModel>> {
+fn build_runner_agent(registry: &AgentRegistry, role: Role) -> anyhow::Result<Agent<OpenAiModel>> {
     let rc = registry
         .role_config(role)
         .ok_or_else(|| anyhow::anyhow!("no config for role {role:?}"))?;
@@ -1017,9 +1212,13 @@ fn build_runner_agent(
         .agent(&model)
         .preamble(&preamble)
         .temperature(crate::providers::Provider::clamp_temperature(0.7));
-    let builder = crate::tools::add_builtin_tools(builder, registry.context_config(), registry.sandbox())
-        .additional_params(params)
-        .default_max_turns(max_turns);
+    // 沙箱以 trait 对象注入（todo 4 迁移，与 AgentRegistry::build 一致）。
+    // registry.sandbox() 已返回 Arc<dyn SandboxProvider>，无需再包一层 Arc。
+    let sandbox_provider: Arc<dyn crate::seam::SandboxProvider> = registry.sandbox();
+    let builder =
+        crate::tools::add_builtin_tools(builder, registry.context_config(), sandbox_provider)
+            .additional_params(params)
+            .default_max_turns(max_turns);
     let agent = if reasoning {
         builder.build()
     } else {
@@ -1031,6 +1230,8 @@ fn build_runner_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::ContextConfig;
+    use crate::providers::CompletionsClient;
 
     fn perms() -> ToolPerms {
         ToolPerms {
@@ -1104,17 +1305,129 @@ mod tests {
 
     #[test]
     fn overflow_error_detected() {
-        assert!(is_context_overflow_error(&anyhow::anyhow!("context_length_exceeded")));
-        assert!(is_context_overflow_error(&anyhow::anyhow!("prompt_too_long")));
-        assert!(is_context_overflow_error(&anyhow::anyhow!("maximum context window exceeded")));
-        assert!(is_context_overflow_error(&anyhow::anyhow!("token limit reached")));
-        assert!(is_context_overflow_error(&anyhow::anyhow!("上下文超出限制")));
+        assert!(is_context_overflow_error(&anyhow::anyhow!(
+            "context_length_exceeded"
+        )));
+        assert!(is_context_overflow_error(&anyhow::anyhow!(
+            "prompt_too_long"
+        )));
+        assert!(is_context_overflow_error(&anyhow::anyhow!(
+            "maximum context window exceeded"
+        )));
+        assert!(is_context_overflow_error(&anyhow::anyhow!(
+            "token limit reached"
+        )));
+        assert!(is_context_overflow_error(&anyhow::anyhow!(
+            "上下文超出限制"
+        )));
     }
 
     #[test]
     fn non_overflow_error_not_detected() {
-        assert!(!is_context_overflow_error(&anyhow::anyhow!("network timeout")));
-        assert!(!is_context_overflow_error(&anyhow::anyhow!("permission denied")));
-        assert!(!is_context_overflow_error(&anyhow::anyhow!("file not found")));
+        assert!(!is_context_overflow_error(&anyhow::anyhow!(
+            "network timeout"
+        )));
+        assert!(!is_context_overflow_error(&anyhow::anyhow!(
+            "permission denied"
+        )));
+        assert!(!is_context_overflow_error(&anyhow::anyhow!(
+            "file not found"
+        )));
+    }
+
+    // ── ContextHook history-capture characterization ──
+    // Characterization test: locks existing history/turn capture behavior that
+    // run_autonomous relies on. MUST stay green before AND after the SessionLog
+    // append wiring (append is additive, must not change model-visible behavior).
+
+    /// Build a dummy client. `handle_completion_call` only touches the client in
+    /// the compaction path, which is unreachable with a tiny history, so a
+    /// placeholder key/URL is safe here.
+    fn dummy_client() -> CompletionsClient {
+        let http = reqwest::Client::builder()
+            .build()
+            .expect("reqwest client build");
+        CompletionsClient::builder()
+            .api_key("dummy-key".to_string())
+            .base_url("http://localhost:1")
+            .http_client(http)
+            .build()
+            .expect("completions client build")
+    }
+
+    #[tokio::test]
+    async fn context_hook_captures_history_and_turn_baseline() {
+        // Given: a ContextHook with history capture enabled and a tiny history
+        // (well below any overflow threshold → no LLM compaction path).
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let history_arc: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
+        let turn_arc: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let hook = ContextHook::new(
+            128_000,
+            ContextConfig::default(),
+            dummy_client(),
+            "test-model".to_string(),
+            tx,
+            30,
+            Arc::new(crate::events::WaterfallRegistry::new()),
+        )
+        .with_history_capture(history_arc.clone(), turn_arc.clone());
+
+        let history = vec![Message::user("hello"), Message::assistant("hi there")];
+
+        // When: handle_completion_call runs at turn 2 with this history.
+        let action = hook.handle_completion_call(&history, 2).await;
+
+        // Then: the shared Arcs capture the history and turn verbatim, and a
+        // small history yields Continue (no compaction, no turn reminder).
+        let captured = history_arc.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2);
+        assert!(matches!(captured[0], Message::User { .. }));
+        assert!(matches!(captured[1], Message::Assistant { .. }));
+        assert_eq!(*turn_arc.lock().unwrap(), 2);
+        assert!(
+            matches!(action, CompletionCallAction::Continue),
+            "small history must not trigger compaction or a turn reminder"
+        );
+    }
+
+    // ── todo 11: ContextHook dispatches AgentRequest via WaterfallRegistry ──
+    // Characterization: a registered emit listener fires on handle_completion_call.
+    // Empty registry behavior unchanged (baseline test above). This proves the
+    // wiring is live without changing model-visible behavior.
+
+    #[tokio::test]
+    async fn context_hook_dispatches_agent_request_via_waterfall() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let history_arc: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
+        let turn_arc: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let waterfall = Arc::new(crate::events::WaterfallRegistry::new());
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = calls.clone();
+        waterfall.register_emit(move |e| {
+            if matches!(e, crate::events::WaterfallEvent::AgentRequest { .. }) {
+                c.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let hook = ContextHook::new(
+            128_000,
+            ContextConfig::default(),
+            dummy_client(),
+            "test-model".to_string(),
+            tx,
+            30,
+            waterfall,
+        )
+        .with_history_capture(history_arc.clone(), turn_arc.clone());
+
+        let history = vec![Message::user("hello")];
+        let _ = hook.handle_completion_call(&history, 1).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "AgentRequest emit listener must fire on completion_call"
+        );
     }
 }

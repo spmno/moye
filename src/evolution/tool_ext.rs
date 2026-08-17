@@ -81,7 +81,10 @@ impl ToolManifest {
         out.push_str("    let mut tools = ToolSet::default();\n");
         for t in &self.tools {
             let mod_name = t.name.replace('-', "_");
-            out.push_str(&format!("    tools.add_tool({mod_name}::{});\n", capitalized(&t.name)));
+            out.push_str(&format!(
+                "    tools.add_tool({mod_name}::{});\n",
+                capitalized(&t.name)
+            ));
         }
         out.push_str("    tools\n}\n");
         std::fs::write(MOD_RS, out)?;
@@ -108,7 +111,7 @@ pub fn add_tool(name: &str, description: &str) -> Result<String> {
     let mod_name = name.replace('-', "_");
     let file = format!("src/tools_ext/{mod_name}.rs");
     let src = format!(
-         "// AUTO-GENERATED tool scaffold. 请编辑 call 函数体补全实现。\n\
+        "// AUTO-GENERATED tool scaffold. 请编辑 call 函数体补全实现。\n\
           use rig_core::tool::PortableTool;\n\
           use serde::Deserialize;\n\
           use serde_json::json;\n\n\
@@ -137,5 +140,7 @@ pub fn add_tool(name: &str, description: &str) -> Result<String> {
         source_file: file.clone(),
         description: clean_desc,
     })?;
-    Ok(format!("scaffolded tool '{name}' at {file}; registered in manifest"))
+    Ok(format!(
+        "scaffolded tool '{name}' at {file}; registered in manifest"
+    ))
 }

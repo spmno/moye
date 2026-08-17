@@ -23,17 +23,15 @@ fn local_bin_path(command: &str) -> Option<PathBuf> {
 }
 
 async fn ensure_installed(command: &str, package: &str) -> Result<PathBuf> {
-    let bin = local_bin_path(command)
-        .with_context(|| "HOME not set; cannot resolve ~/.moye path")?;
+    let bin =
+        local_bin_path(command).with_context(|| "HOME not set; cannot resolve ~/.moye path")?;
 
     if bin.exists() {
         return Ok(bin);
     }
 
-    let dir = mcp_home()
-        .with_context(|| "HOME not set; cannot resolve ~/.moye path")?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create directory {:?}", dir))?;
+    let dir = mcp_home().with_context(|| "HOME not set; cannot resolve ~/.moye path")?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("create directory {:?}", dir))?;
 
     eprintln!("[mcp] First-time setup: installing '{package}' to {dir:?} ...");
     let output = tokio::process::Command::new("npm")
@@ -146,7 +144,10 @@ impl McpManager {
                 }
             }
         }
-        Self { connections, failed }
+        Self {
+            connections,
+            failed,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -231,10 +232,7 @@ async fn connect_one(name: &str, cfg: &McpServerConfig) -> Result<McpConnection>
         .await
         .with_context(|| format!("list tools from MCP server '{name}'"))?;
 
-    info!(
-        "[mcp] '{name}' ({transport_desc}): {} tools",
-        tools.len()
-    );
+    info!("[mcp] '{name}' ({transport_desc}): {} tools", tools.len());
 
     tokio::spawn(async move {
         let _ = service.waiting().await;

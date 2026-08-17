@@ -138,7 +138,12 @@ impl ModelHistory {
 /// Return the history file path `~/.config/moye/models.json`; `None` when `HOME` is unset.
 fn history_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".config").join("moye").join("models.json"))
+    Some(
+        PathBuf::from(home)
+            .join(".config")
+            .join("moye")
+            .join("models.json"),
+    )
 }
 
 /// 当前 Unix 时间戳（秒）；系统时钟异常时退回 0。
@@ -193,8 +198,11 @@ mod tests {
         }
         assert_eq!(h.records.len(), MAX_RECORDS);
         // 最先加入的 m0..m4 应已被截断 / the earliest m0..m4 should have been truncated.
-        assert!(h.records.iter().all(|r| !r.slug.starts_with("m0")
-            || r.slug == format!("m{}", 0)));
+        assert!(
+            h.records
+                .iter()
+                .all(|r| !r.slug.starts_with("m0") || r.slug == format!("m{}", 0))
+        );
     }
 
     #[test]

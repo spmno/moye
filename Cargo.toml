@@ -32,6 +32,12 @@ rmcp = { version = "2", features = ["transport-io", "transport-child-process", "
 
 [target.'cfg(target_os = "linux")'.dependencies]
 wl-clipboard-rs = "0.9"
+landlock = "0.4"
+
+[dev-dependencies]
+# cargo-nextest + cargo-llvm-cov are cargo subcommands (binaries), not
+# libraries — install via `cargo install cargo-nextest cargo-llvm-cov`.
+insta = "1"
 
 [profile.release]
 opt-level = 3

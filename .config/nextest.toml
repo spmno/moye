@@ -1,0 +1,41 @@
+# cargo-nextest configuration for moye.
+# Docs: https://nexte.st/docs/configuration/
+#
+# The per-file 100% coverage gate lives in `scripts/coverage.sh` (it parses
+# the lcov output of `cargo llvm-cov`), NOT here — nextest is a test *runner*,
+# coverage thresholds are a coverage-tool concern. This file configures how
+# tests run; `scripts/coverage.sh` configures the coverage gate (per-file 100%
+# on new/modified files only, per GAP-5 fix — existing files are not
+# retroactively gated).
+
+[profile.default]
+# Do not abort on the first failure when running locally — surface every
+# failing test in one pass. CI (profile.ci) fails fast.
+fail-fast = false
+
+# No retries by default. Flaky tests must be fixed at the root cause, not
+# masked by retries. CI may set retries = 1 as a transient safety net only
+# during the stabilization window for new test infrastructure.
+retries = 0
+
+# A test is "slow" if it exceeds this wall-clock period; nextest then waits
+# a grace period before killing it. 60s is generous for unit/integration
+# tests in this crate (the existing 202 tests are fast); raise if a legit
+# long-running integration test is added.
+slow-timeout = { period = "60s", grace-period = "10s" }
+
+# Default test-threads: nextest runs each test in its own process, so this
+# controls parallelism. Leave unset to let nextest pick based on CPU count.
+
+[profile.ci]
+# CI: fail fast to surface the first breakage quickly, and allow one retry
+# to absorb transient flakiness (e.g. network-dependent web_fetch tests).
+fail-fast = true
+retries = 1
+
+# The `coverage` profile is what `scripts/coverage.sh` invokes via
+# `cargo nextest run --profile coverage` — it runs the full suite with
+# retries disabled so coverage reflects true (un-retried) behavior.
+[profile.coverage]
+fail-fast = false
+retries = 0

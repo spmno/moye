@@ -1,7 +1,7 @@
-/// REPL 命令解析模块：把用户在 TUI 中输入的 `/` 命令或自然语言目标
-/// 解析为 [`ReplCommand`] 枚举，供 `AppContext` 分发执行。
-/// REPL command parsing module: parses the `/` commands or natural-language goals
-/// entered by the user in the TUI into the [`ReplCommand`] enum for `AppContext` to dispatch.
+//! REPL 命令解析模块：把用户在 TUI 中输入的 `/` 命令或自然语言目标
+//! 解析为 [`ReplCommand`] 枚举，供 `AppContext` 分发执行。
+//! REPL command parsing module: parses the `/` commands or natural-language goals
+//! entered by the user in the TUI into the [`ReplCommand`] enum for `AppContext` to dispatch.
 
 /// REPL 命令枚举。TUI 输入处理复用此 parse 逻辑。
 /// REPL command enum. The TUI input handler reuses this parse logic.
@@ -20,7 +20,11 @@ pub enum ReplCommand {
     Evolve,
     /// `/evolve-code <file> <old> <new>`：代码自修改（编译验证 + 回退）。
     /// `/evolve-code <file> <old> <new>`: code self-modification (compile-verified + rollback).
-    EvolveCode { file: String, old: String, new: String },
+    EvolveCode {
+        file: String,
+        old: String,
+        new: String,
+    },
     /// `/add-tool <name> <desc>`：生成新工具脚手架（需重新编译生效）。
     /// `/add-tool <name> <desc>`: scaffold a new tool (requires recompile to take effect).
     AddTool { name: String, description: String },
@@ -137,10 +141,7 @@ mod tests {
 
     #[test]
     fn models_command_parses() {
-        assert!(matches!(
-            ReplCommand::parse("/models"),
-            ReplCommand::Models
-        ));
+        assert!(matches!(ReplCommand::parse("/models"), ReplCommand::Models));
     }
 
     #[test]

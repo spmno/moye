@@ -91,7 +91,9 @@ pub fn add_skill(name: &str, description: &str, body: &str) -> Result<String> {
         description: clean_desc,
         keywords: vec![],
     })?;
-    Ok(format!("scaffolded skill '{name}' at {file_path}; registered in manifest"))
+    Ok(format!(
+        "scaffolded skill '{name}' at {file_path}; registered in manifest"
+    ))
 }
 
 /// 按任务文本筛选相关技能，并把它们的正文拼接到一个字符串，供注入提示词使用。

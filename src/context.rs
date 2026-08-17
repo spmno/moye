@@ -15,9 +15,9 @@
 // 5. truncate_lines / truncate_at_char_boundary — 工具输出截断。
 //    truncate_lines / truncate_at_char_boundary — tool output truncation.
 
+use rig_core::OneOrMany;
 use rig_core::completion::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
 use rig_core::completion::{Message, Usage};
-use rig_core::OneOrMany;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -218,7 +218,7 @@ pub fn estimate_tokens(text: &str) -> usize {
         }
     }
     let cjk_tokens = cjk_count;
-    let latin_tokens = (other_count + 2) / 3;
+    let latin_tokens = other_count.div_ceil(3);
     cjk_tokens + latin_tokens
 }
 
@@ -254,8 +254,7 @@ pub fn extract_text(msg: &Message) -> String {
                     AssistantContent::ToolCall(tc) => {
                         parts.push(format!(
                             "[tool_call: {}({})]",
-                            tc.function.name,
-                            tc.function.arguments
+                            tc.function.name, tc.function.arguments
                         ));
                     }
                     _ => {}
@@ -294,7 +293,10 @@ pub fn estimate_history_tokens(history: &[Message]) -> usize {
 /// A turn = one User message (non-ToolResult) + subsequent Assistant and ToolResult
 /// messages until the next User message.
 #[allow(dead_code)]
-pub fn split_history(history: &[Message], keep_recent_turns: usize) -> (Vec<Message>, Vec<Message>) {
+pub fn split_history(
+    history: &[Message],
+    keep_recent_turns: usize,
+) -> (Vec<Message>, Vec<Message>) {
     if history.is_empty() {
         return (Vec::new(), Vec::new());
     }
@@ -331,7 +333,9 @@ fn is_user_text_message(msg: &Message) -> bool {
         Message::User { content } => {
             // 如果所有内容都是 ToolResult，则不是用户文本消息。
             // If all content items are ToolResult, this is not a user text message.
-            !content.iter().all(|c| matches!(c, UserContent::ToolResult(_)))
+            !content
+                .iter()
+                .all(|c| matches!(c, UserContent::ToolResult(_)))
         }
         _ => false,
     }
@@ -394,10 +398,21 @@ fn summarize_tool_result(tool_name: &str, tool_args: &str, content: &str) -> Str
     // 提取代码签名行：fn / struct / enum / impl / trait / class / def 等。
     // Extract code signature lines.
     let sig_prefixes = [
-        "fn ", "pub fn ", "pub(crate) fn ", "async fn ", "pub async fn ",
-        "struct ", "pub struct ", "enum ", "pub enum ",
-        "impl ", "trait ", "pub trait ",
-        "class ", "def ", "async def ",
+        "fn ",
+        "pub fn ",
+        "pub(crate) fn ",
+        "async fn ",
+        "pub async fn ",
+        "struct ",
+        "pub struct ",
+        "enum ",
+        "pub enum ",
+        "impl ",
+        "trait ",
+        "pub trait ",
+        "class ",
+        "def ",
+        "async def ",
     ];
     let signatures: Vec<&str> = content
         .lines()
@@ -479,8 +494,10 @@ pub fn microcompact(history: &[Message], protected_results: usize) -> Vec<Messag
     // 待清除的位置：除了最后 `protected_results` 个。
     // Positions to clear: all except the last `protected_results`.
     let clear_count = tool_result_positions.len() - protected_results;
-    let to_clear: std::collections::HashSet<(usize, usize)> =
-        tool_result_positions[..clear_count].iter().cloned().collect();
+    let to_clear: std::collections::HashSet<(usize, usize)> = tool_result_positions[..clear_count]
+        .iter()
+        .cloned()
+        .collect();
 
     let mut result: Vec<Message> = Vec::with_capacity(history.len());
     for (msg_idx, msg) in history.iter().enumerate() {
@@ -529,7 +546,8 @@ pub fn microcompact(history: &[Message], protected_results: usize) -> Vec<Messag
                                 .collect::<Vec<_>>()
                                 .join("\n");
 
-                            let summary = summarize_tool_result(&tool_name, &tool_args, &text_content);
+                            let summary =
+                                summarize_tool_result(&tool_name, &tool_args, &text_content);
                             new_items.push(UserContent::ToolResult(ToolResult {
                                 id: tr.id.clone(),
                                 call_id: tr.call_id.clone(),
@@ -578,10 +596,10 @@ pub const COMPACTION_PREAMBLE: &str = "\
 /// Find the previous compaction summary text in history (anchored summary).
 pub fn find_previous_summary(history: &[Message]) -> Option<String> {
     for msg in history.iter().rev() {
-        if let Message::System { content } = msg {
-            if content.starts_with("[对话历史摘要") {
-                return Some(content.clone());
-            }
+        if let Message::System { content } = msg
+            && content.starts_with("[对话历史摘要")
+        {
+            return Some(content.clone());
         }
     }
     None
@@ -734,10 +752,7 @@ mod tests {
 
     #[test]
     fn estimate_history_tokens_with_messages() {
-        let msgs = vec![
-            Message::user("hello"),
-            Message::assistant("hi there"),
-        ];
+        let msgs = vec![Message::user("hello"), Message::assistant("hi there")];
         // "hello" = ceil(5/3) = 2 + 4 overhead = 6
         // "hi there" = ceil(8/3) = 3 + 4 overhead = 7
         let est = estimate_history_tokens(&msgs);
@@ -818,10 +833,7 @@ mod tests {
 
     #[test]
     fn split_history_fewer_than_keep() {
-        let msgs = vec![
-            Message::user("hello"),
-            Message::assistant("hi"),
-        ];
+        let msgs = vec![Message::user("hello"), Message::assistant("hi")];
         let (old, recent) = split_history(&msgs, 6);
         assert!(old.is_empty());
         assert_eq!(recent.len(), 2);
@@ -858,10 +870,7 @@ mod tests {
 
     #[test]
     fn format_messages_for_summary_basic() {
-        let msgs = vec![
-            Message::user("hello"),
-            Message::assistant("hi there"),
-        ];
+        let msgs = vec![Message::user("hello"), Message::assistant("hi there")];
         let formatted = format_messages_for_summary(&msgs);
         assert!(formatted.contains("[User]: hello"));
         assert!(formatted.contains("[Assistant]: hi there"));
@@ -872,7 +881,8 @@ mod tests {
     #[test]
     fn microcompact_clears_old_tool_results() {
         // 5 tool results, protect last 2 → first 3 should be summarized.
-        let long_content = "fn hello() {}\nfn world() {}\npub fn foo() {}\nstruct Bar {}\n".repeat(20);
+        let long_content =
+            "fn hello() {}\nfn world() {}\npub fn foo() {}\nstruct Bar {}\n".repeat(20);
         let msgs = vec![
             Message::user("do task 1"),
             Message::assistant_with_id("m1".into(), "calling tool 1"),
@@ -982,7 +992,10 @@ mod tests {
 
     #[test]
     fn truncate_lines_basic() {
-        let s: String = (0..1000).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let s: String = (0..1000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let truncated = truncate_lines(&s, 10);
         assert!(truncated.contains("截断"));
         // Should contain first 10 lines

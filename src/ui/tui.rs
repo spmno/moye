@@ -3,24 +3,23 @@ use std::time::Duration;
 
 use crossterm::{
     event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
-        EnableMouseCapture, EventStream, KeyCode, KeyEvent, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::Modifier,
     text::{Line, Span, Text},
     widgets::{
-        Block, BorderType, Borders, Clear, Padding, Paragraph, Scrollbar,
-        ScrollbarOrientation, ScrollbarState, Wrap,
+        Block, BorderType, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Wrap,
     },
-    Frame, Terminal,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -30,14 +29,14 @@ use crate::cli::context::AppContext;
 use crate::cli::repl::ReplCommand;
 use crate::event::{AgentEvent, EventReceiver, EventSender};
 use crate::ui::clipboard;
-use crate::ui::selector::{SelectorItem, SelectorState};
 use crate::ui::selection::Selection;
+use crate::ui::selector::{SelectorItem, SelectorState};
 use crate::ui::{markdown, theme};
 use tracing::{info, warn};
 
 const SPINNER_FRAMES: [&str; 10] = [
-    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}",
-    "\u{2827}", "\u{2807}", "\u{280f}",
+    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
+    "\u{2807}", "\u{280f}",
 ];
 const TICK_MS: u64 = 120;
 
@@ -97,10 +96,7 @@ fn restore_terminal(original: Option<&libc::termios>) {
 
     // Write escape sequences to /dev/tty directly, not stdout.
     // This ensures they reach the terminal even if stdout is redirected.
-    if let Ok(mut tty) = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/tty")
-    {
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
         let _ = tty.write_all(b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?1049l\x1b[?25h");
         let _ = tty.flush();
     }
@@ -133,7 +129,7 @@ fn restore_terminal(original: Option<&libc::termios>) {
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-    restore_terminal(SAVED_TERMIOS.get().and_then(|opt| opt.as_ref()));
+        restore_terminal(SAVED_TERMIOS.get().and_then(|opt| opt.as_ref()));
         default_hook(info);
     }));
 }
@@ -313,7 +309,14 @@ struct TuiState {
 }
 
 impl TuiState {
-    fn new(provider: String, model: String, max_turns: usize, tool_names: Vec<String>, mcp_servers: Vec<crate::mcp::McpServerDisplay>, skill_names: Vec<String>) -> Self {
+    fn new(
+        provider: String,
+        model: String,
+        max_turns: usize,
+        tool_names: Vec<String>,
+        mcp_servers: Vec<crate::mcp::McpServerDisplay>,
+        skill_names: Vec<String>,
+    ) -> Self {
         Self {
             messages: Vec::new(),
             input: InputState::new(),
@@ -335,13 +338,13 @@ impl TuiState {
             mcp_servers,
             skill_names,
             task_handle: None,
-        needs_full_redraw: false,
-        selector: None,
-        selection: None,
-        msg_area: Rect::new(0, 0, 0, 0),
-        msg_scroll: 0,
+            needs_full_redraw: false,
+            selector: None,
+            selection: None,
+            msg_area: Rect::new(0, 0, 0, 0),
+            msg_scroll: 0,
+        }
     }
-}
 
     fn tick(&mut self) {
         if self.thinking {
@@ -416,10 +419,15 @@ fn log_event(event: &AgentEvent) {
             info!("[TUI] HITL 确认请求: {tool} | {desc}");
         }
         AgentEvent::SuspendTui { command, .. } => {
-            info!("[TUI] \u{6682}\u{505c} TUI \u{8fd0}\u{884c}\u{4ea4}\u{4e92}\u{5f0f}\u{547d}\u{4ee4}: {command}");
+            info!(
+                "[TUI] \u{6682}\u{505c} TUI \u{8fd0}\u{884c}\u{4ea4}\u{4e92}\u{5f0f}\u{547d}\u{4ee4}: {command}"
+            );
         }
         AgentEvent::TextDelta(_) | AgentEvent::ReasoningDelta(_) => {}
-        AgentEvent::ContextCompacted { old_tokens, new_tokens } => {
+        AgentEvent::ContextCompacted {
+            old_tokens,
+            new_tokens,
+        } => {
             info!("[TUI] 上下文压缩: {old_tokens} → {new_tokens} tokens");
         }
     }
@@ -460,17 +468,15 @@ fn render_event(event: &AgentEvent) -> Vec<Line<'static>> {
                 theme::tool_result_err()
             };
             let trunc = if result.len() > 500 {
-                format!(
-                    "{}\u{2026}",
-                    &result[..result.floor_char_boundary(500)]
-                )
+                format!("{}\u{2026}", &result[..result.floor_char_boundary(500)])
             } else {
                 result.clone()
             };
             let mut v = vec![];
-            v.push(Line::from(vec![
-                Span::styled(format!("{icon} {name}"), sty),
-            ]));
+            v.push(Line::from(vec![Span::styled(
+                format!("{icon} {name}"),
+                sty,
+            )]));
             for line in trunc.lines().take(15) {
                 v.push(Line::from(Span::raw(line.to_string())));
             }
@@ -550,7 +556,10 @@ fn format_event_for_context(event: &AgentEvent) -> String {
                 format!("[Info] {}", truncate_ctx(text, 120))
             }
         }
-        AgentEvent::ContextCompacted { old_tokens, new_tokens } => {
+        AgentEvent::ContextCompacted {
+            old_tokens,
+            new_tokens,
+        } => {
             format!("[ContextCompacted] {old_tokens} → {new_tokens} tokens")
         }
         AgentEvent::TextDelta(_) | AgentEvent::ReasoningDelta(_) => String::new(),
@@ -584,7 +593,10 @@ pub async fn run_tui(ctx: Arc<AppContext>) -> anyhow::Result<()> {
     let provider = format!("{:?}", crate::providers::current_provider());
     let model = ctx.current_model();
     let max_turns = ctx.registry.max_turns();
-    let tool_names: Vec<String> = crate::tools::tool_names().iter().map(|s| s.to_string()).collect();
+    let tool_names: Vec<String> = crate::tools::tool_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let mcp_servers = ctx.registry.mcp_server_displays();
     let skill_names: Vec<String> = crate::skills::SkillManifest::load()
         .map(|m| m.list())
@@ -597,7 +609,14 @@ pub async fn run_tui(ctx: Arc<AppContext>) -> anyhow::Result<()> {
 
     let (action_tx, mut action_rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    let mut state = TuiState::new(provider, model, max_turns, tool_names, mcp_servers, skill_names);
+    let mut state = TuiState::new(
+        provider,
+        model,
+        max_turns,
+        tool_names,
+        mcp_servers,
+        skill_names,
+    );
     state.push_event(AgentEvent::System(format!(
         "moye ({}) | model: {}",
         state.provider, state.model
@@ -658,11 +677,11 @@ async fn run_loop(
                     crossterm::event::Event::Mouse(mouse) => {
                         handle_mouse_event(mouse, state);
                     }
-                    crossterm::event::Event::Paste(text) => {
-                        if !state.thinking && state.hitl.is_none() {
-                            let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                            state.input.insert_str(&text);
-                        }
+                    crossterm::event::Event::Paste(text)
+                        if !state.thinking && state.hitl.is_none() =>
+                    {
+                        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                        state.input.insert_str(&text);
                     }
                     _ => {}
                 }
@@ -700,7 +719,8 @@ fn handle_key_event(
                 if let Some(h) = state.hitl.take() {
                     let _ = h.responder.send(true);
                     state.push_event(AgentEvent::Info(format!(
-                        "\u{26a0} \u{5141}\u{8bb8}\u{6267}\u{884c} {}", h.tool
+                        "\u{26a0} \u{5141}\u{8bb8}\u{6267}\u{884c} {}",
+                        h.tool
                     )));
                 }
             }
@@ -708,7 +728,8 @@ fn handle_key_event(
                 if let Some(h) = state.hitl.take() {
                     let _ = h.responder.send(false);
                     state.push_event(AgentEvent::Info(format!(
-                        "\u{26a0} \u{62d2}\u{7edd}\u{6267}\u{884c} {}", h.tool
+                        "\u{26a0} \u{62d2}\u{7edd}\u{6267}\u{884c} {}",
+                        h.tool
                     )));
                 }
             }
@@ -816,10 +837,10 @@ fn handle_key_event(
 
     match key.code {
         KeyCode::Enter => {
-            if !state.thinking {
-                if let Some(input) = state.input.take_submitted() {
-                    handle_command(input, state, ctx, action_tx);
-                }
+            if !state.thinking
+                && let Some(input) = state.input.take_submitted()
+            {
+                handle_command(input, state, ctx, action_tx);
             }
         }
         KeyCode::Char(c) => {
@@ -987,14 +1008,15 @@ fn handle_command(
         ReplCommand::Models => {
             let provider = crate::providers::current_provider();
             let plan = crate::providers::current_plan();
-            let mut items: Vec<SelectorItem> = crate::providers::provider_models_for_plan(provider, plan)
-                .into_iter()
-                .map(|m| SelectorItem {
-                    label: m.slug,
-                    detail: m.desc.to_string(),
-                    ..Default::default()
-                })
-                .collect();
+            let mut items: Vec<SelectorItem> =
+                crate::providers::provider_models_for_plan(provider, plan)
+                    .into_iter()
+                    .map(|m| SelectorItem {
+                        label: m.slug,
+                        detail: m.desc.to_string(),
+                        ..Default::default()
+                    })
+                    .collect();
             // 追加最近使用模型（去重内置清单已列出的 slug），标注使用次数；
             // Custom 供应商无内置清单时，历史是主要来源。
             let hist = ctx.model_history.lock().unwrap();
@@ -1004,7 +1026,6 @@ fn handle_command(
                         label: r.slug.clone(),
                         detail: format!("\u{6700}\u{8fd1}\u{4f7f}\u{7528} {} \u{6b21}", r.uses),
                         data: Some(format!("{}\n{}", r.provider, r.base_url)),
-                        ..Default::default()
                     });
                 }
             }
@@ -1035,7 +1056,11 @@ fn handle_command(
                 state.current_turn,
                 state.max_turns,
                 state.total_tokens,
-                if state.last_usage.is_empty() { "N/A" } else { &state.last_usage },
+                if state.last_usage.is_empty() {
+                    "N/A"
+                } else {
+                    &state.last_usage
+                },
                 state.tool_names.len(),
                 state.skill_names.len(),
                 state.messages.len(),
@@ -1117,7 +1142,7 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
         }
         AgentEvent::Agent(text) => {
             // Streaming was a preview of this final output — discard it.
-        // 流式文本是最终输出的预览——丢弃。
+            // 流式文本是最终输出的预览——丢弃。
             state.streaming.clear();
             if !text.is_empty() {
                 state.push_event(AgentEvent::Agent(text));
@@ -1171,8 +1196,12 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
                 Ok(out) => {
                     let stdout = String::from_utf8_lossy(&out.stdout);
                     let stderr = String::from_utf8_lossy(&out.stderr);
-                    let msg = format!("exit={}\nstdout:\n{}\nstderr:\n{}",
-                        out.status.code().unwrap_or(-1), stdout, stderr);
+                    let msg = format!(
+                        "exit={}\nstdout:\n{}\nstderr:\n{}",
+                        out.status.code().unwrap_or(-1),
+                        stdout,
+                        stderr
+                    );
                     println!("\n{}", msg);
                     msg
                 }
@@ -1183,7 +1212,9 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
                 }
             };
 
-            println!("\n--- \u{6309} Enter \u{8fd4}\u{56de} TUI / Press Enter to return to TUI ---");
+            println!(
+                "\n--- \u{6309} Enter \u{8fd4}\u{56de} TUI / Press Enter to return to TUI ---"
+            );
             let mut input = String::new();
             let _ = std::io::stdin().read_line(&mut input);
 
@@ -1201,7 +1232,7 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
         AgentEvent::AgentFinished => {
             state.task_handle = None;
             // Safety net: flush any unflushed streaming.
-        // 安全兜底：刷新未刷新的流式文本。
+            // 安全兜底：刷新未刷新的流式文本。
             if !state.streaming.is_empty() {
                 let flushed = std::mem::take(&mut state.streaming);
                 state.push_event(AgentEvent::Agent(flushed));
@@ -1215,8 +1246,14 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
         // User 和 System 事件由 handle_command 直接 push——
         // 它们不经过 channel 传递。
         AgentEvent::User(_) | AgentEvent::System(_) => {}
-        AgentEvent::ContextCompacted { old_tokens, new_tokens } => {
-            state.push_event(AgentEvent::ContextCompacted { old_tokens, new_tokens });
+        AgentEvent::ContextCompacted {
+            old_tokens,
+            new_tokens,
+        } => {
+            state.push_event(AgentEvent::ContextCompacted {
+                old_tokens,
+                new_tokens,
+            });
             state.reset_scroll();
         }
     }
@@ -1232,13 +1269,17 @@ fn estimate_input_lines(buffer: &str, area_width: u16) -> u16 {
     }
     let mut total: usize = 0;
     for (i, line) in buffer.lines().enumerate() {
-        let avail = if i == 0 { inner_width.saturating_sub(2) } else { inner_width };
+        let avail = if i == 0 {
+            inner_width.saturating_sub(2)
+        } else {
+            inner_width
+        };
         let avail = avail.max(1);
         let mut width: usize = 0;
         for c in line.chars() {
             width += if c.is_ascii() { 1 } else { 2 };
         }
-        total += ((width + avail - 1) / avail).max(1);
+        total += width.div_ceil(avail).max(1);
     }
     total as u16
 }
@@ -1362,7 +1403,11 @@ fn draw_selector(f: &mut Frame, state: &mut TuiState) {
     f.render_widget(dialog, dialog_area);
 
     // filter 输入光标（input 行 = y + 边框1 + 内边距1 + 列表 + 空行1）
-    let prefix = if is_custom_mode { "\u{81ea}\u{5b9a}\u{4e49} custom: " } else { "\u{8fc7}\u{6ee4} filter: " };
+    let prefix = if is_custom_mode {
+        "\u{81ea}\u{5b9a}\u{4e49} custom: "
+    } else {
+        "\u{8fc7}\u{6ee4} filter: "
+    };
     let prefix_w: usize = prefix
         .chars()
         .map(|c| if c.is_ascii() { 1 } else { 2 })
@@ -1388,18 +1433,12 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
     state.msg_area = inner;
     let total = all_lines.len() as u16;
 
-    let base = if total > inner.height {
-        total - inner.height
-    } else {
-        0
-    };
+    let base = total.saturating_sub(inner.height);
     let scroll = base.saturating_sub(state.scroll_offset);
     state.msg_scroll = scroll;
 
     let text = Text::from(all_lines);
-    let messages = Paragraph::new(text)
-        .scroll((scroll, 0))
-        .block(block);
+    let messages = Paragraph::new(text).scroll((scroll, 0)).block(block);
 
     f.render_widget(messages, area);
 
@@ -1551,7 +1590,10 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
     let mut lines: Vec<Line> = Vec::new();
 
     lines.push(Line::styled("Provider", theme::status_dim()));
-    lines.push(Line::styled(format!(" {}", state.provider), theme::status_model()));
+    lines.push(Line::styled(
+        format!(" {}", state.provider),
+        theme::status_model(),
+    ));
     let plan = crate::providers::current_plan();
     if plan != crate::providers::ApiPlan::Standard {
         lines.push(Line::styled(
@@ -1562,7 +1604,10 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
     lines.push(Line::default());
 
     lines.push(Line::styled("Model", theme::status_dim()));
-    lines.push(Line::styled(format!(" {}", state.model), theme::status_model()));
+    lines.push(Line::styled(
+        format!(" {}", state.model),
+        theme::status_model(),
+    ));
     lines.push(Line::default());
 
     lines.push(Line::styled("Context", theme::status_dim()));
@@ -1618,13 +1663,20 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
         let connected = state.mcp_servers.iter().filter(|s| s.connected).count();
         let total_tools: usize = state.mcp_servers.iter().map(|s| s.tool_names.len()).sum();
         lines.push(Line::styled(
-            format!("MCP ({connected}/{} servers, {total_tools} tools)", state.mcp_servers.len()),
+            format!(
+                "MCP ({connected}/{} servers, {total_tools} tools)",
+                state.mcp_servers.len()
+            ),
             theme::status_dim(),
         ));
         for server in &state.mcp_servers {
             if server.connected {
                 lines.push(Line::styled(
-                    format!(" \u{2713} {} ({} tools)", server.name, server.tool_names.len()),
+                    format!(
+                        " \u{2713} {} ({} tools)",
+                        server.name,
+                        server.tool_names.len()
+                    ),
                     theme::mcp_connected(),
                 ));
                 for tn in &server.tool_names {
@@ -1696,7 +1748,7 @@ fn draw_hitl_overlay(f: &mut Frame, state: &mut TuiState) {
             if display_width == 0 {
                 1u16
             } else {
-                (((display_width + inner_width - 1) / inner_width) as u16).max(1)
+                (display_width.div_ceil(inner_width) as u16).max(1)
             }
         })
         .sum();

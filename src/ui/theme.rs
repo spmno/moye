@@ -19,7 +19,9 @@ pub fn tool_result_err() -> Style {
 }
 
 pub fn error() -> Style {
-    Style::new().fg(Color::LightRed).add_modifier(Modifier::BOLD)
+    Style::new()
+        .fg(Color::LightRed)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn info() -> Style {
@@ -35,7 +37,9 @@ pub fn border() -> Style {
 }
 
 pub fn input_prompt() -> Style {
-    Style::new().fg(Color::LightCyan).add_modifier(Modifier::BOLD)
+    Style::new()
+        .fg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn streaming() -> Style {
@@ -116,7 +120,9 @@ pub fn status_ready() -> Style {
 }
 
 pub fn status_hitl() -> Style {
-    Style::new().fg(Color::LightRed).add_modifier(Modifier::BOLD)
+    Style::new()
+        .fg(Color::LightRed)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn mcp_connected() -> Style {
@@ -139,7 +145,9 @@ pub fn mcp_error_detail() -> Style {
 // ===== Selector styles =====
 
 pub fn selector_title() -> Style {
-    Style::new().fg(Color::LightCyan).add_modifier(Modifier::BOLD)
+    Style::new()
+        .fg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn selector_highlight() -> Style {
@@ -158,5 +166,7 @@ pub fn selector_dim() -> Style {
 }
 
 pub fn selector_input() -> Style {
-    Style::new().fg(Color::LightYellow).add_modifier(Modifier::BOLD)
+    Style::new()
+        .fg(Color::LightYellow)
+        .add_modifier(Modifier::BOLD)
 }

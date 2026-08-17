@@ -28,11 +28,26 @@ use std::process::Command;
 /// 这些标准直接衡量 AGENTS.md 应当包含的内容，而非无关的编程题。
 /// These criteria directly measure what AGENTS.md should contain, not irrelevant coding trivia.
 const EVAL_CRITERIA: &[(&str, &str)] = &[
-    ("roles", "Does the prompt clearly define the roles (Orchestrator, Planner, Builder, Auditor) and their responsibilities in the SDD pipeline?"),
-    ("safety", "Does the prompt include safety rules: only Builder can edit files/run bash, audit required before accepting changes, build+test must pass or git rollback?"),
-    ("memory", "Does the prompt mention lesson accumulation after each task and escalating repeated corrections to rules?"),
-    ("conciseness", "Is the prompt concise — free of redundancy, unnecessary verbosity, or irrelevant content?"),
-    ("clarity", "Are the instructions unambiguous and actionable? Could a new agent follow them without confusion?"),
+    (
+        "roles",
+        "Does the prompt clearly define the roles (Orchestrator, Planner, Builder, Auditor) and their responsibilities in the SDD pipeline?",
+    ),
+    (
+        "safety",
+        "Does the prompt include safety rules: only Builder can edit files/run bash, audit required before accepting changes, build+test must pass or git rollback?",
+    ),
+    (
+        "memory",
+        "Does the prompt mention lesson accumulation after each task and escalating repeated corrections to rules?",
+    ),
+    (
+        "conciseness",
+        "Is the prompt concise — free of redundancy, unnecessary verbosity, or irrelevant content?",
+    ),
+    (
+        "clarity",
+        "Are the instructions unambiguous and actionable? Could a new agent follow them without confusion?",
+    ),
 ];
 
 /// 提示词进化器：持有注册表与被进化的 AGENTS.md 路径。
@@ -182,20 +197,20 @@ fn parse_eval_score(response: &str) -> usize {
     // Look for "TOTAL: <number>" in the response (case-insensitive, last match wins).
     for line in response.lines().rev() {
         let line = line.trim();
-        if let Some(rest) = line.to_lowercase().strip_prefix("total:") {
-            if let Ok(n) = rest.trim().parse::<usize>() {
-                return n.min(max_score);
-            }
+        if let Some(rest) = line.to_lowercase().strip_prefix("total:")
+            && let Ok(n) = rest.trim().parse::<usize>()
+        {
+            return n.min(max_score);
         }
     }
 
     // Fallback: sum up individual criterion scores (each line like "name: N").
     let mut total = 0;
     for line in response.lines() {
-        if let Some(colon_pos) = line.rfind(':') {
-            if let Ok(n) = line[colon_pos + 1..].trim().parse::<usize>() {
-                total += n.min(2);
-            }
+        if let Some(colon_pos) = line.rfind(':')
+            && let Ok(n) = line[colon_pos + 1..].trim().parse::<usize>()
+        {
+            total += n.min(2);
         }
     }
     total.min(max_score)
@@ -222,8 +237,14 @@ fn generate_changelog(old: &str, new: &str) -> String {
     let old_lines: Vec<&str> = old.lines().map(|l| l.trim()).collect();
     let new_lines: Vec<&str> = new.lines().map(|l| l.trim()).collect();
 
-    let added: Vec<&&str> = new_lines.iter().filter(|l| !old_lines.contains(l)).collect();
-    let removed: Vec<&&str> = old_lines.iter().filter(|l| !new_lines.contains(l)).collect();
+    let added: Vec<&&str> = new_lines
+        .iter()
+        .filter(|l| !old_lines.contains(l))
+        .collect();
+    let removed: Vec<&&str> = old_lines
+        .iter()
+        .filter(|l| !new_lines.contains(l))
+        .collect();
 
     let mut summary = format!(
         "{} line(s) added, {} line(s) changed/removed",

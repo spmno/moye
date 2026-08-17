@@ -3,16 +3,20 @@
 mod agent_loop;
 mod cli;
 mod config;
-mod mcp;
 mod context;
 mod event;
+mod events;
 mod evolution;
+mod mcp;
 mod memory;
 mod model_history;
+mod provider;
 mod providers;
 mod registry;
 mod reviewer;
 mod sandbox;
+mod seam;
+mod session_log;
 mod skills;
 mod tools;
 mod tools_ext;
@@ -52,19 +56,38 @@ async fn main() -> Result<()> {
     let env_file = dotenvy::dotenv().ok();
 
     if let Some(path) = env_file {
-        info!("[env] \u{8f7d}\u{5165}\u{4e86}\u{914d}\u{7f6e}\u{6587}\u{4ef6}: {}", path.display());
+        info!(
+            "[env] \u{8f7d}\u{5165}\u{4e86}\u{914d}\u{7f6e}\u{6587}\u{4ef6}: {}",
+            path.display()
+        );
     }
 
     let config = crate::config::init("agent.toml")?;
+
+    // `--dump-config`：打印 profile 叠加后的组合配置树到 stdout，然后退出。
+    // 用于诊断"实际生效的配置是什么"（含 profile patch 的结果）。
+    // `--dump-config`: print the combined config tree (after profile overlay) to
+    // stdout, then exit. A debug/introspection feature.
+    let cli_args: Vec<String> = std::env::args().collect();
+    if cli_args.iter().any(|a| a == "--dump-config") {
+        let raw = std::fs::read_to_string("agent.toml")?;
+        let dump = crate::cli::context::dump_config_to_string(&raw)?;
+        println!("{dump}");
+        return Ok(());
+    }
+
     let mcp_manager = crate::mcp::McpManager::connect_all(&config.mcp).await;
-    let sandbox_backend =
-        crate::sandbox::SandboxBackend::parse(&config.sandbox.backend);
-    let sandbox = crate::sandbox::Sandbox::with_backend(
-        &config.sandbox.authorized_dirs,
-        sandbox_backend,
+    // 根据 [sandbox].mode 选择 OS 级沙箱 provider（todo 8）：
+    // - "landlock": 用 LandlockSandbox（bwrap 不可用时的 fallback）
+    // - "off": 禁用 OS 级沙箱
+    // - 其他（"auto"/"bwrap"/未知）: 用 SimpleSandbox（bwrap/seatbelt/path 后端）
+    // Select the OS-level sandbox provider based on [sandbox].mode (todo 8).
+    let sandbox_provider = crate::cli::context::build_sandbox_provider(&config);
+    info!(
+        "[sandbox] mode={} backend={}",
+        config.sandbox.mode, config.sandbox.backend
     );
-    info!("[sandbox] backend={:?} root={}", sandbox.backend(), sandbox.root().display());
-    let registry = AgentRegistry::new(config.clone(), Arc::new(mcp_manager), sandbox);
+    let registry = AgentRegistry::new(config.clone(), Arc::new(mcp_manager), sandbox_provider);
     let orchestrator = Orchestrator::new(registry.clone());
     let evolver = PromptEvolver::new(registry.clone(), "AGENTS.md".to_string());
     let memory = memory::MemoryStore::new(&config.memory)?;

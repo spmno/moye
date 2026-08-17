@@ -30,12 +30,15 @@ pub fn evolve_code(file: &str, old: &str, new: &str) -> Result<String> {
         Ok(out) if out.status.success() => {
             let _ = std::fs::remove_file(&backup);
             let _ = run_tests();
+            append_self_modify_note(file, old, new);
             Ok(format!("evolved {file} (build passed)"))
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
             revert(file, &backup);
-            Err(anyhow::anyhow!("build failed; reverted {file}. error:\n{stderr}"))
+            Err(anyhow::anyhow!(
+                "build failed; reverted {file}. error:\n{stderr}"
+            ))
         }
         Err(e) => {
             revert(file, &backup);
@@ -71,4 +74,52 @@ fn revert(file: &str, backup: &str) {
         let _ = std::fs::write(file, prev);
     }
     let _ = std::fs::remove_file(backup);
+}
+
+/// 判断变更是否为非 trivial：修改了 src/ 下的文件或 agent.toml。
+/// Whether a change is non-trivial: modified a file under src/ or agent.toml.
+fn is_nontrivial(file: &str) -> bool {
+    file.starts_with("src/") || file == "agent.toml"
+}
+
+/// 从文件路径推导 note slug（去扩展名，点替换为短横线）。
+/// Derive a note slug from the file path (strip extension, dots → dashes).
+fn derive_slug(file: &str) -> String {
+    let stem = file.rsplit('/').next().unwrap_or(file);
+    let stem = stem.rsplit_once('.').map(|(s, _)| s).unwrap_or(stem);
+    stem.replace('.', "-")
+}
+
+/// 截取字符串前 `max` 个字符（UTF-8 安全），超长则追加 "..."。
+/// Truncate to first `max` chars (UTF-8 safe), appending "..." if truncated.
+fn preview(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((idx, _)) => format!("{}...", &s[..idx]),
+        None => s.to_string(),
+    }
+}
+
+/// 在非 trivial 变更成功后，向 memory/notes/implemented/self-modify/ 追加一条
+/// Agent Note，记录修改的文件和 old→new 内容摘要。Note 写入失败不影响 evolve 结果。
+/// After a non-trivial change succeeds, append an Agent Note to
+/// memory/notes/implemented/self-modify/ recording the file and old→new preview.
+/// Note write failure does not affect the evolve result.
+fn append_self_modify_note(file: &str, old: &str, new: &str) {
+    if !is_nontrivial(file) {
+        return;
+    }
+    let base_dir = crate::config::config()
+        .map(|c| c.memory.dir.clone())
+        .unwrap_or_else(|| std::path::PathBuf::from("memory"));
+    let nm = match crate::memory::NotesManager::new(&base_dir) {
+        Ok(nm) => nm,
+        Err(_) => return,
+    };
+    let slug = derive_slug(file);
+    let content = format!(
+        "## evolve_code\n\nfile: `{file}`\n\nold:\n```\n{}\n```\n\nnew:\n```\n{}\n```\n",
+        preview(old, 200),
+        preview(new, 200),
+    );
+    let _ = nm.append("self-modify", &slug, &content);
 }

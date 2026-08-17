@@ -23,6 +23,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::seam::{ProbeLevel, SandboxProvider};
+
 /// 沙箱错误类型。
 /// Sandbox error type.
 #[derive(Debug, thiserror::Error)]
@@ -113,16 +115,25 @@ fn which(cmd: &str) -> Option<PathBuf> {
     None
 }
 
-/// 沙箱：限制 Agent 的文件系统访问范围。
-/// Sandbox: restricts the Agent's file-system access scope.
+/// 简单沙箱：限制 Agent 的文件系统访问范围（基于路径检查 + OS 级后端）。
+/// Simple sandbox: restricts the Agent's file-system access scope
+/// (path-based checks + an OS-level backend).
+///
+/// 这是 `SandboxProvider` trait 的默认实现（todo 4 迁移）——把现有的
+/// 路径检查 / bwrap / seatbelt 后端包装为 seam trait 的一个 provider。
+/// 后续 todo 5 将追加 `LandlockSandbox` 作为 fallback provider。
 ///
 /// `root` 是项目根目录（当前工作目录的规范化绝对路径）。
 /// `root` is the project root (canonicalized absolute path of the current working directory).
 /// `authorized` 是用户已手动授权的额外目录集合（通过 Arc<Mutex> 共享，Clone 时共享同一份）。
 /// `authorized` is the set of extra directories the user has manually authorized
 /// (shared via Arc<Mutex>, so clones share the same underlying set).
+///
+/// 类型别名 `Sandbox` 指向 `SimpleSandbox`，保持现有调用点编译通过（todo 4 纯重构）。
+/// The `Sandbox` type alias points to `SimpleSandbox`, keeping existing call sites
+/// compiling (todo 4 behavior-equivalent refactor).
 #[derive(Clone)]
-pub struct Sandbox {
+pub struct SimpleSandbox {
     /// 项目根目录（规范化后的绝对路径）。
     /// Project root (canonicalized absolute path).
     root: PathBuf,
@@ -137,7 +148,14 @@ pub struct Sandbox {
     backend: SandboxBackend,
 }
 
-impl Sandbox {
+/// 向后兼容别名：现有代码以 `Sandbox` 名引用具体类型，todo 4 重命名为 `SimpleSandbox`
+/// 后通过此别名保持不变。新代码应直接使用 `SimpleSandbox`。
+/// Backward-compat alias: existing code references the concrete type as `Sandbox`;
+/// after the todo 4 rename to `SimpleSandbox`, this alias keeps it working. New code
+/// should use `SimpleSandbox` directly.
+pub type Sandbox = SimpleSandbox;
+
+impl SimpleSandbox {
     /// 创建沙箱，以当前工作目录为根。
     /// Creates a sandbox with the current working directory as root.
     /// 通过 `AGENT_SANDBOX=off` 可禁用。
@@ -209,6 +227,7 @@ impl Sandbox {
 
     /// 返回 OS 级沙箱后端（已解析）。
     /// Returns the resolved OS-level sandbox backend.
+    #[allow(dead_code)] // infrastructure for future phases
     pub fn backend(&self) -> SandboxBackend {
         self.backend
     }
@@ -253,11 +272,7 @@ impl Sandbox {
             }
             SandboxBackend::Seatbelt => {
                 let policy = self.seatbelt_policy();
-                let argv = vec![
-                    "sandbox-exec".to_string(),
-                    "-p".into(),
-                    policy,
-                ];
+                let argv = vec!["sandbox-exec".to_string(), "-p".into(), policy];
                 Some(argv)
             }
             _ => None,
@@ -332,9 +347,7 @@ impl Sandbox {
             return Ok(());
         }
         for path in extract_paths_from_command(command) {
-            if let Err(e) = self.check_path(&path) {
-                return Err(e);
-            }
+            self.check_path(&path)?;
         }
         Ok(())
     }
@@ -457,11 +470,11 @@ impl Sandbox {
         }
         // 路径不存在时，规范化父目录再拼接文件名
         // When the path doesn't exist, canonicalize the parent and append the filename
-        if let Some(parent) = path.parent() {
-            if let Ok(canon_parent) = parent.canonicalize() {
-                let filename = path.file_name().unwrap_or_default();
-                return canon_parent.join(filename);
-            }
+        if let Some(parent) = path.parent()
+            && let Ok(canon_parent) = parent.canonicalize()
+        {
+            let filename = path.file_name().unwrap_or_default();
+            return canon_parent.join(filename);
         }
         // 最后兜底：返回原始路径
         // Last resort: return the path as-is
@@ -469,9 +482,42 @@ impl Sandbox {
     }
 }
 
-impl Default for Sandbox {
+impl Default for SimpleSandbox {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SandboxProvider trait impl —— 把现有 SimpleSandbox 包装为 seam provider (todo 4)
+// ---------------------------------------------------------------------------
+
+/// 把 `SimpleSandbox` 暴露为 `SandboxProvider` trait 的一个实现。
+///
+/// 行为等价映射：
+/// - `probe()`: Bwrap/Seatbelt → `Full`，Path → `Partial`，Off → `Unusable`。
+///   （Off 时 `enabled=false`，沙箱完全禁用，调用方应 fail-closed。）
+/// - `grant_args(read_only, read_write)`: 直接委托现有 `wrap_command()`。
+///   `SimpleSandbox` 已在内部知道自己的 root + authorized 目录，路径参数
+///   由现有逻辑内部管理，故忽略入参（与 trait doc 注释一致：todo 4 一行迁移）。
+/// - `check_path(path)`: `self.check_path(path).is_ok()`（trait 返回 bool）。
+impl SandboxProvider for SimpleSandbox {
+    fn probe(&self) -> ProbeLevel {
+        match self.backend {
+            SandboxBackend::Bwrap | SandboxBackend::Seatbelt => ProbeLevel::Full,
+            SandboxBackend::Path => ProbeLevel::Partial,
+            SandboxBackend::Off | SandboxBackend::Auto => ProbeLevel::Unusable,
+        }
+    }
+
+    fn grant_args(&self, _read_only: &[String], _read_write: &[String]) -> Option<Vec<String>> {
+        // 委托给现有 wrap_command()——SimpleSandbox 内部已知 root + authorized，
+        // 入参路径由现有内部逻辑管理，保持行为等价。
+        self.wrap_command()
+    }
+
+    fn check_path(&self, path: &str) -> bool {
+        SimpleSandbox::check_path(self, path).is_ok()
     }
 }
 
@@ -481,10 +527,10 @@ pub fn expand_tilde(path: &str) -> String {
     if path == "~" {
         return std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
     }
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}/{rest}");
     }
     path.to_string()
 }
@@ -950,12 +996,14 @@ mod tests {
     #[test]
     fn check_tool_file_path() {
         let sb = Sandbox::new();
-        assert!(sb
-            .check_tool("read_file", r#"{"path":"/etc/passwd"}"#)
-            .is_some());
-        assert!(sb
-            .check_tool("read_file", r#"{"path":"src/main.rs"}"#)
-            .is_none());
+        assert!(
+            sb.check_tool("read_file", r#"{"path":"/etc/passwd"}"#)
+                .is_some()
+        );
+        assert!(
+            sb.check_tool("read_file", r#"{"path":"src/main.rs"}"#)
+                .is_none()
+        );
     }
 
     /// check_tool 应正确检查 bash 命令。
@@ -963,12 +1011,14 @@ mod tests {
     #[test]
     fn check_tool_bash() {
         let sb = Sandbox::new();
-        assert!(sb
-            .check_tool("run_bash", r#"{"command":"cat /etc/passwd"}"#)
-            .is_some());
-        assert!(sb
-            .check_tool("run_bash", r#"{"command":"ls -la"}"#)
-            .is_none());
+        assert!(
+            sb.check_tool("run_bash", r#"{"command":"cat /etc/passwd"}"#)
+                .is_some()
+        );
+        assert!(
+            sb.check_tool("run_bash", r#"{"command":"ls -la"}"#)
+                .is_none()
+        );
     }
 
     /// check_tool 对不涉及文件的工具应返回 None。
@@ -976,12 +1026,11 @@ mod tests {
     #[test]
     fn check_tool_web_tools() {
         let sb = Sandbox::new();
-        assert!(sb
-            .check_tool("web_fetch", r#"{"url":"https://example.com"}"#)
-            .is_none());
-        assert!(sb
-            .check_tool("web_search", r#"{"query":"test"}"#)
-            .is_none());
+        assert!(
+            sb.check_tool("web_fetch", r#"{"url":"https://example.com"}"#)
+                .is_none()
+        );
+        assert!(sb.check_tool("web_search", r#"{"query":"test"}"#).is_none());
     }
 
     /// 禁用沙箱后所有检查应通过。
@@ -996,7 +1045,10 @@ mod tests {
         };
         assert!(sb.check_path("/etc/passwd").is_ok());
         assert!(sb.check_bash("cat /etc/passwd").is_ok());
-        assert!(sb.check_tool("read_file", r#"{"path":"/etc/passwd"}"#).is_none());
+        assert!(
+            sb.check_tool("read_file", r#"{"path":"/etc/passwd"}"#)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1057,7 +1109,10 @@ mod tests {
         assert!(argv.contains(&"--tmpfs".to_string()));
         assert!(argv.contains(&"--die-with-parent".to_string()));
         let ws_str = workspace.to_string_lossy().to_string();
-        assert!(argv.contains(&ws_str), "workspace path must appear in bwrap argv");
+        assert!(
+            argv.contains(&ws_str),
+            "workspace path must appear in bwrap argv"
+        );
     }
 
     #[test]
@@ -1066,9 +1121,9 @@ mod tests {
         let workspace = workspace.canonicalize().unwrap();
         let sb = Sandbox {
             root: workspace,
-            authorized: Arc::new(Mutex::new(HashSet::from([
-                PathBuf::from("/tmp/authorized"),
-            ]))),
+            authorized: Arc::new(Mutex::new(HashSet::from([PathBuf::from(
+                "/tmp/authorized",
+            )]))),
             enabled: true,
             backend: SandboxBackend::Bwrap,
         };

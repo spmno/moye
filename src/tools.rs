@@ -5,7 +5,9 @@
 // （本项目主要使用中文模型：DeepSeek / GLM / Kimi）。
 // (this project primarily uses Chinese models: DeepSeek / GLM / Kimi).
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::path::Path;
+use std::process::Output;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -13,6 +15,13 @@ use html2md_rs::to_md::safe_from_html_to_md;
 use rig_core::tool::PortableTool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+use crate::seam::{FileSystemProvider, SandboxProvider, ShellExecutor};
+
+/// 3-stage waterfall 工具执行管线（todo 9）。
+/// 3-stage waterfall tool execution pipeline (todo 9).
+#[allow(dead_code)] // infrastructure for future phases
+pub mod pipeline;
 
 /// 工具统一错误类型。
 /// Unified error type for tools.
@@ -48,7 +57,10 @@ impl PortableTool for ReadFile {
     /// 返回面向 LLM 的工具描述（中文）。
     /// Returns the LLM-facing tool description (Chinese).
     fn description(&self) -> String {
-        format!("从项目工作树读取一个 UTF-8 文本文件。支持 offset/limit 分页读取大文件。默认从第0行开始，读取前{}行。使用 offset 跳过已读部分。", self.max_read_lines)
+        format!(
+            "从项目工作树读取一个 UTF-8 文本文件。支持 offset/limit 分页读取大文件。默认从第0行开始，读取前{}行。使用 offset 跳过已读部分。",
+            self.max_read_lines
+        )
     }
 
     /// 返回 JSON Schema 形式的参数定义。
@@ -170,7 +182,8 @@ impl PortableTool for WriteFile {
     fn description(&self) -> String {
         "创建一个新文件，或用给定的完整内容覆盖已存在的文件。\
          当用户要求『写/生成/创建一个文件』（如 HTML、脚本、配置、文档等）时，必须使用本工具，\
-         把完整文件内容放入 content 参数，不要只在回复里贴代码。".to_string()
+         把完整文件内容放入 content 参数，不要只在回复里贴代码。"
+            .to_string()
     }
 
     /// 返回 JSON Schema 形式的参数定义。
@@ -206,7 +219,7 @@ struct BashArgs {
 /// Tool that runs a shell command inside the project worktree.
 struct RunBash {
     max_bash_output_chars: usize,
-    sandbox: crate::sandbox::Sandbox,
+    sandbox: Arc<dyn SandboxProvider>,
     timeout_secs: u64,
 }
 
@@ -221,7 +234,10 @@ impl PortableTool for RunBash {
     /// 返回面向 LLM 的工具描述（中文）。
     /// Returns the LLM-facing tool description (Chinese).
     fn description(&self) -> String {
-        format!("在项目工作树内运行一条 shell 命令，返回 stdout+stderr。输出截断到 {} 字符。", self.max_bash_output_chars)
+        format!(
+            "在项目工作树内运行一条 shell 命令，返回 stdout+stderr。输出截断到 {} 字符。",
+            self.max_bash_output_chars
+        )
     }
 
     /// 返回 JSON Schema 形式的参数定义。
@@ -248,7 +264,7 @@ impl PortableTool for RunBash {
         let timeout = Duration::from_secs(self.timeout_secs);
         let timeout_err = || ToolError(format!("command timed out after {}s", self.timeout_secs));
 
-        let out = if let Some(bwrap_argv) = self.sandbox.wrap_command() {
+        let out = if let Some(bwrap_argv) = self.sandbox.grant_args(&[], &[]) {
             let mut cmd = tokio::process::Command::new(&bwrap_argv[0]);
             for arg in &bwrap_argv[1..] {
                 cmd.arg(arg);
@@ -264,9 +280,7 @@ impl PortableTool for RunBash {
                 .map_err(|e| ToolError(e.to_string()))?
         } else {
             let mut cmd = tokio::process::Command::new("sh");
-            cmd.arg("-c")
-                .arg(&args.command)
-                .kill_on_drop(true);
+            cmd.arg("-c").arg(&args.command).kill_on_drop(true);
             tokio::time::timeout(timeout, cmd.output())
                 .await
                 .map_err(|_| timeout_err())?
@@ -313,7 +327,7 @@ struct RunFileArgs {
 /// `.sh` → bash, `.py` → python3, `.js` → node.
 struct RunFile {
     max_output_chars: usize,
-    sandbox: crate::sandbox::Sandbox,
+    sandbox: Arc<dyn SandboxProvider>,
 }
 
 impl PortableTool for RunFile {
@@ -359,7 +373,7 @@ impl PortableTool for RunFile {
                 )));
             }
         };
-        let out = if let Some(bwrap_argv) = self.sandbox.wrap_command() {
+        let out = if let Some(bwrap_argv) = self.sandbox.grant_args(&[], &[]) {
             let mut cmd = tokio::process::Command::new(&bwrap_argv[0]);
             for arg in &bwrap_argv[1..] {
                 cmd.arg(arg);
@@ -497,11 +511,11 @@ impl PortableTool for WebFetch {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         const MAX_CONTENT: usize = 8000;
         let client = build_web_client()?;
-        let resp = client
-            .get(&args.url)
-            .send()
-            .await
-            .map_err(|e| ToolError(format!("请求失败: {e}。提示: 可能需要设置代理，如 export AGENT_PROXY=http://127.0.0.1:7890")))?;
+        let resp = client.get(&args.url).send().await.map_err(|e| {
+            ToolError(format!(
+                "请求失败: {e}。提示: 可能需要设置代理，如 export AGENT_PROXY=http://127.0.0.1:7890"
+            ))
+        })?;
         let status = resp.status();
         let content_type = resp
             .headers()
@@ -513,11 +527,12 @@ impl PortableTool for WebFetch {
             .text()
             .await
             .map_err(|e| ToolError(format!("读取响应体失败: {e}")))?;
-        let text = if content_type.contains("text/html") || content_type.contains("application/xhtml") {
-            html_to_markdown(&body)
-        } else {
-            body
-        };
+        let text =
+            if content_type.contains("text/html") || content_type.contains("application/xhtml") {
+                html_to_markdown(&body)
+            } else {
+                body
+            };
         let truncated = if text.len() > MAX_CONTENT {
             // 先找到不超过 MAX_CONTENT 的最后一个字符边界，再切片，
             // First find the last char boundary not exceeding MAX_CONTENT, then slice,
@@ -611,7 +626,11 @@ impl PortableTool for WebSearch {
     /// Executes the tool: checks the in-process cache first, then Tavily, then DuckDuckGo.
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let max_results = args.max_results.clamp(1, 10);
-        let depth = if args.search_depth == "basic" { "basic" } else { "advanced" };
+        let depth = if args.search_depth == "basic" {
+            "basic"
+        } else {
+            "advanced"
+        };
 
         // 缓存命中直接返回：同一 query 同一会话内不重复烧额度。
         // Cache hit: return immediately — don't double-burn quota for the same query in a session.
@@ -728,7 +747,7 @@ async fn tavily_search(
         .await
         .map_err(|e| ToolError(format!("解析 Tavily 响应失败: {e}")))?;
 
-    if parsed.results.is_empty() && parsed.answer.as_deref().map_or(true, |a| a.trim().is_empty()) {
+    if parsed.results.is_empty() && parsed.answer.as_deref().is_none_or(|a| a.trim().is_empty()) {
         return Err(ToolError("Tavily 返回空结果".into()));
     }
 
@@ -747,7 +766,11 @@ async fn tavily_search(
         if content.is_empty() {
             parts.push(format!("  {}. {title}{score}\n     {}", i + 1, r.url));
         } else {
-            parts.push(format!("  {}. {title}{score}\n     {content}\n     {}", i + 1, r.url));
+            parts.push(format!(
+                "  {}. {title}{score}\n     {content}\n     {}",
+                i + 1,
+                r.url
+            ));
         }
     }
     Ok(parts.join("\n"))
@@ -788,25 +811,36 @@ async fn ddg_search(
     }
 
     let mut parts = Vec::with_capacity(results.len() * 2 + 2);
-    parts.push(format!("搜索结果（共 {} 条，显示前 {} 条）:", results.len(), results.len().min(max_results)));
+    parts.push(format!(
+        "搜索结果（共 {} 条，显示前 {} 条）:",
+        results.len(),
+        results.len().min(max_results)
+    ));
     for (i, item) in results.iter().take(max_results).enumerate() {
         let title = item.title.trim();
         let snippet = item.snippet.trim();
         if snippet.is_empty() {
             parts.push(format!("  {}. {title}\n     {}", i + 1, item.url));
         } else {
-            parts.push(format!("  {}. {title}\n     {snippet}\n     {}", i + 1, item.url));
+            parts.push(format!(
+                "  {}. {title}\n     {snippet}\n     {}",
+                i + 1,
+                item.url
+            ));
         }
     }
     if results.len() > max_results {
-        parts.push(format!("  …（还有 {} 条结果已省略）", results.len() - max_results));
+        parts.push(format!(
+            "  …（还有 {} 条结果已省略）",
+            results.len() - max_results
+        ));
     }
 
     // P3：抓取首条结果的全文 Markdown，省去模型的二次 web_fetch。
-    if let Some(top) = results.first() {
-        if let Some(md) = fetch_page_markdown(client, &top.url, 4000).await {
-            parts.push(format!("\n── 首条结果全文（Markdown）──\n{md}"));
-        }
+    if let Some(top) = results.first()
+        && let Some(md) = fetch_page_markdown(client, &top.url, 4000).await
+    {
+        parts.push(format!("\n── 首条结果全文（Markdown）──\n{md}"));
     }
 
     Ok(parts.join("\n"))
@@ -837,7 +871,10 @@ async fn fetch_page_markdown(
     };
     let (truncated, was_truncated) = truncate_chars(&markdown, max_chars);
     if was_truncated {
-        Some(format!("{truncated}…(截断，共 {} 字符)", markdown.chars().count()))
+        Some(format!(
+            "{truncated}…(截断，共 {} 字符)",
+            markdown.chars().count()
+        ))
     } else {
         Some(truncated)
     }
@@ -959,7 +996,11 @@ fn parse_ddg_html(html: &str) -> Vec<SearchResult> {
             .unwrap_or_default();
 
         if !title.is_empty() && !url.is_empty() {
-            results.push(SearchResult { title, url, snippet });
+            results.push(SearchResult {
+                title,
+                url,
+                snippet,
+            });
         }
 
         pos = after_close + 4;
@@ -1018,10 +1059,10 @@ fn decode_ddg_redirect(raw: &str) -> String {
     if let Some(qpos) = normalized.find('?') {
         let query = &normalized[qpos + 1..];
         for pair in query.split('&') {
-            if let Some(value) = pair.strip_prefix("uddg=") {
-                if let Ok(decoded) = urlencoding_decode(value) {
-                    return decoded;
-                }
+            if let Some(value) = pair.strip_prefix("uddg=")
+                && let Ok(decoded) = urlencoding_decode(value)
+            {
+                return decoded;
             }
         }
     }
@@ -1114,10 +1155,7 @@ fn strip_html(html: &str) -> String {
     text = decode_html_entities(&text);
     // 折叠连续空白为单个空格
     // Collapse consecutive whitespace into a single space
-    let collapsed: String = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     collapsed
 }
 
@@ -1183,9 +1221,18 @@ fn split_shell_segments(command: &str) -> Vec<String> {
             continue;
         }
         match ch {
-            '\\' if !in_single => { escaped = true; current.push(ch); }
-            '\'' if !in_double => { in_single = !in_single; current.push(ch); }
-            '"' if !in_single => { in_double = !in_double; current.push(ch); }
+            '\\' if !in_single => {
+                escaped = true;
+                current.push(ch);
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                current.push(ch);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                current.push(ch);
+            }
             '|' | ';' | '\n' if !in_single && !in_double => {
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() {
@@ -1209,7 +1256,9 @@ fn split_shell_segments(command: &str) -> Vec<String> {
                     current.clear();
                 }
             }
-            _ => { current.push(ch); }
+            _ => {
+                current.push(ch);
+            }
         }
         i += 1;
     }
@@ -1234,9 +1283,15 @@ fn contains_unquoted(s: &str, target: char) -> bool {
             continue;
         }
         match ch {
-            '\\' if !in_single => { escaped = true; }
-            '\'' if !in_double => { in_single = !in_single; }
-            '"' if !in_single => { in_double = !in_double; }
+            '\\' if !in_single => {
+                escaped = true;
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+            }
             c if c == target && !in_single && !in_double => return true,
             _ => {}
         }
@@ -1260,13 +1315,23 @@ fn has_file_redirect(s: &str) -> bool {
             continue;
         }
         match chars[i] {
-            '\\' if !in_single => { escaped = true; }
-            '\'' if !in_double => { in_single = !in_single; }
-            '"' if !in_single => { in_double = !in_double; }
+            '\\' if !in_single => {
+                escaped = true;
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+            }
             '>' if !in_single && !in_double => {
                 let mut j = i + 1;
-                while j < chars.len() && chars[j] == '>' { j += 1; }
-                while j < chars.len() && chars[j] == ' ' { j += 1; }
+                while j < chars.len() && chars[j] == '>' {
+                    j += 1;
+                }
+                while j < chars.len() && chars[j] == ' ' {
+                    j += 1;
+                }
                 let rest: String = chars[j..].iter().collect();
                 if rest.starts_with("/dev/null")
                     || rest.starts_with("/dev/stdout")
@@ -1295,27 +1360,88 @@ fn has_file_redirect(s: &str) -> bool {
 pub fn is_readonly_bash(command: &str) -> bool {
     const READONLY_PREFIXES: &[&str] = &[
         // 目录/文件查看 / Directory & file viewing
-        "ls", "cat", "head", "tail", "tree", "file", "stat", "du", "df",
-        "wc", "nl", "tac", "rev", "bat", "eza", "exa",
+        "ls",
+        "cat",
+        "head",
+        "tail",
+        "tree",
+        "file",
+        "stat",
+        "du",
+        "df",
+        "wc",
+        "nl",
+        "tac",
+        "rev",
+        "bat",
+        "eza",
+        "exa",
         // 搜索 / Search
-        "grep", "rg", "ag", "ack", "find", "fd",
+        "grep",
+        "rg",
+        "ag",
+        "ack",
+        "find",
+        "fd",
         // Git 只读 / Git read-only
-        "git status", "git log", "git diff", "git show",
+        "git status",
+        "git log",
+        "git diff",
+        "git show",
         // 文本处理 / Text processing
-        "sort", "uniq", "cut", "tr", "diff", "comm", "join", "paste",
-        "fold", "fmt", "pr", "column", "expand", "unexpand",
-        "shuf", "tsort", "seq", "sed", "awk",
+        "sort",
+        "uniq",
+        "cut",
+        "tr",
+        "diff",
+        "comm",
+        "join",
+        "paste",
+        "fold",
+        "fmt",
+        "pr",
+        "column",
+        "expand",
+        "unexpand",
+        "shuf",
+        "tsort",
+        "seq",
+        "sed",
+        "awk",
         // 路径 / Path utilities
-        "pwd", "basename", "dirname", "realpath", "readlink", "which",
+        "pwd",
+        "basename",
+        "dirname",
+        "realpath",
+        "readlink",
+        "which",
         // 校验和 / Checksums
-        "md5sum", "sha1sum", "sha256sum", "sha512sum",
+        "md5sum",
+        "sha1sum",
+        "sha256sum",
+        "sha512sum",
         // 十六进制/字符串 / Hex & strings
-        "xxd", "od", "hexdump", "strings",
+        "xxd",
+        "od",
+        "hexdump",
+        "strings",
         // 编码 / Encoding
-        "iconv", "base64", "base32",
+        "iconv",
+        "base64",
+        "base32",
         // 系统信息 / System info
-        "printenv", "whoami", "uname", "arch", "nproc", "uptime", "hostname",
-        "echo", "date", "test", "true", "false",
+        "printenv",
+        "whoami",
+        "uname",
+        "arch",
+        "nproc",
+        "uptime",
+        "hostname",
+        "echo",
+        "date",
+        "test",
+        "true",
+        "false",
     ];
     // 命令替换（$(...) / 反引号）可在只读前缀内部执行任意命令——例如
     // `ls $(rm -rf ~)` 首 token 是只读的 `ls`，但实际会删除用户主目录。
@@ -1399,7 +1525,15 @@ pub fn is_readonly_bash(command: &str) -> bool {
 /// 内置工具名称列表（供侧边栏显示）。
 /// Built-in tool name list (for sidebar display).
 pub fn tool_names() -> Vec<&'static str> {
-    vec!["read_file", "edit_file", "write_file", "run_bash", "run_file", "web_fetch", "web_search"]
+    vec![
+        "read_file",
+        "edit_file",
+        "write_file",
+        "run_bash",
+        "run_file",
+        "web_fetch",
+        "web_search",
+    ]
 }
 
 /// 内置工具集合 + 动态工具（tools_ext）。
@@ -1410,7 +1544,7 @@ pub fn tool_names() -> Vec<&'static str> {
 #[allow(dead_code)]
 pub fn builtin_tools(
     config: &crate::context::ContextConfig,
-    sandbox: &crate::sandbox::Sandbox,
+    sandbox: Arc<dyn SandboxProvider>,
 ) -> anyhow::Result<rig_agent::tool::ToolSet> {
     let mut tools = rig_agent::tool::ToolSet::default();
     tools.add_tool(ReadFile {
@@ -1439,31 +1573,93 @@ pub fn builtin_tools(
 /// `builtin_tools()` returns a `ToolSet` for sidebar/listing use; the builder does not accept
 /// 故在两处 builder 调用点使用此 helper 逐一注册。
 /// a `ToolSet`, so this helper registers them one by one at the two builder call sites.
+///
+/// 沙箱以 `Arc<dyn SandboxProvider>` trait 对象注入（todo 4 迁移）——使后端可在
+/// 配置层切换，build() 不再依赖具体 `SimpleSandbox` 类型。
+///
+/// todo 9: 每个工具用 `TimeoutRetryTool::passthrough` 包裹（around-execute 层）。
+/// 工具体本身不变——仅 `call()` 外层多一道 300s 超时安全网（0 次重试，避免对会改变
+/// 状态的工具双重执行）。pre/post 层由 `HitlHook`（rig hook）独立处理。
+/// todo 9: each tool is wrapped with `TimeoutRetryTool::passthrough` (around-execute layer).
+/// Tool bodies are unchanged — `call()` only gains a 300s timeout safety net (0 retries,
+/// avoiding double-execution of state-changing tools). The pre/post layer is handled
+/// independently by `HitlHook` (rig hook).
 pub fn add_builtin_tools<M>(
     builder: rig_agent::agent::AgentBuilder<M, rig_agent::agent::NoToolConfig>,
     config: &crate::context::ContextConfig,
-    sandbox: &crate::sandbox::Sandbox,
+    sandbox: Arc<dyn SandboxProvider>,
 ) -> rig_agent::agent::AgentBuilder<M, rig_agent::agent::WithBuilderTools>
 where
     M: rig_core::completion::CompletionModel,
 {
+    use pipeline::TimeoutRetryTool;
     builder
-        .tool(ReadFile {
+        .tool(TimeoutRetryTool::passthrough(ReadFile {
             max_read_lines: config.max_read_lines,
-        })
-        .tool(EditFile)
-        .tool(WriteFile)
-        .tool(RunBash {
+        }))
+        .tool(TimeoutRetryTool::passthrough(EditFile))
+        .tool(TimeoutRetryTool::passthrough(WriteFile))
+        .tool(TimeoutRetryTool::passthrough(RunBash {
             max_bash_output_chars: config.max_bash_output_chars,
             sandbox: sandbox.clone(),
             timeout_secs: 300,
-        })
-        .tool(RunFile {
+        }))
+        .tool(TimeoutRetryTool::passthrough(RunFile {
             max_output_chars: config.max_bash_output_chars,
             sandbox: sandbox.clone(),
-        })
-        .tool(WebFetch)
-        .tool(WebSearch)
+        }))
+        .tool(TimeoutRetryTool::passthrough(WebFetch))
+        .tool(TimeoutRetryTool::passthrough(WebSearch))
+}
+
+// ---------------------------------------------------------------------------
+// Seam trait impls —— 把现有 read_file/edit_file/write_file/run_bash 核心逻辑
+// 包装为 FileSystemProvider / ShellExecutor trait 实现 (todo 4)。
+// 现有 PortableTool impl（带分页/截断/格式化）保持不变，行为等价。
+// ---------------------------------------------------------------------------
+
+/// `FileSystemProvider` 的默认实现：包装现有 read_file/edit_file/write_file 的
+/// 核心 `std::fs` 逻辑（无分页/截断/格式化——那是 PortableTool 层的职责）。
+/// 未在 production code 直接构造；todo 9 工具管线接入后使用。
+#[allow(dead_code)]
+pub struct SimpleFileSystem;
+
+impl FileSystemProvider for SimpleFileSystem {
+    fn read(&self, path: &Path) -> Result<String> {
+        std::fs::read_to_string(path).map_err(anyhow::Error::from)
+    }
+
+    fn write(&self, path: &Path, content: &str) -> Result<()> {
+        std::fs::write(path, content).map_err(anyhow::Error::from)
+    }
+
+    fn edit(&self, path: &Path, old: &str, new: &str) -> Result<()> {
+        let content = std::fs::read_to_string(path).map_err(anyhow::Error::from)?;
+        if !content.contains(old) {
+            anyhow::bail!("old text not found in file");
+        }
+        let updated = content.replacen(old, new, 1);
+        std::fs::write(path, updated).map_err(anyhow::Error::from)
+    }
+}
+
+/// `ShellExecutor` 的默认实现：包装现有 run_bash 的核心 `sh -c` 执行逻辑。
+///
+/// 同步阻塞（trait 要求 `-> Result<Output>`）；与现有 `RunBash` 的
+/// `tokio::process::Command` 路径行为等价（无 bwrap、无超时、无截断——
+/// 那些是 PortableTool 层 RunBash 的职责）。bwrap 包装由 SandboxProvider
+/// 的 `grant_args` 负责，调用方在需要时组合两者。
+#[allow(dead_code)]
+pub struct SimpleShell;
+
+impl ShellExecutor for SimpleShell {
+    fn run(&self, command: &str) -> Result<Output> {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .map_err(anyhow::Error::from)
+    }
 }
 
 #[cfg(test)]
@@ -1540,7 +1736,9 @@ mod tests {
         assert!(is_readonly_bash("find src -type f | sort"));
         assert!(is_readonly_bash("grep -r foo . | sort | uniq"));
         assert!(is_readonly_bash("cat file | tr 'a-z' 'A-Z' | head"));
-        assert!(is_readonly_bash("git log --oneline | head -10 | cut -d' ' -f1"));
+        assert!(is_readonly_bash(
+            "git log --oneline | head -10 | cut -d' ' -f1"
+        ));
         assert!(is_readonly_bash("ls -la | sort -k5 -n | tail -10"));
     }
 
@@ -1623,11 +1821,18 @@ mod tests {
     async fn read_file_default_pagination() {
         let dir = std::env::temp_dir();
         let path = dir.join("test_read_file_pagination.txt");
-        let content: String = (0..50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let content: String = (0..50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(&path, &content).unwrap();
 
         let tool = ReadFile { max_read_lines: 10 };
-        let args = ReadFileArgs { path: path.to_string_lossy().to_string(), offset: None, limit: None };
+        let args = ReadFileArgs {
+            path: path.to_string_lossy().to_string(),
+            offset: None,
+            limit: None,
+        };
         let result = tool.call(args).await.unwrap();
 
         assert!(result.contains("line 0"));
@@ -1644,11 +1849,18 @@ mod tests {
     async fn read_file_offset_limit() {
         let dir = std::env::temp_dir();
         let path = dir.join("test_read_file_offset.txt");
-        let content: String = (0..50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let content: String = (0..50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(&path, &content).unwrap();
 
         let tool = ReadFile { max_read_lines: 10 };
-        let args = ReadFileArgs { path: path.to_string_lossy().to_string(), offset: Some(20), limit: Some(5) };
+        let args = ReadFileArgs {
+            path: path.to_string_lossy().to_string(),
+            offset: Some(20),
+            limit: Some(5),
+        };
         let result = tool.call(args).await.unwrap();
 
         assert!(result.contains("line 20"));
@@ -1670,7 +1882,11 @@ mod tests {
         std::fs::write(&path, "only one line\n").unwrap();
 
         let tool = ReadFile { max_read_lines: 10 };
-        let args = ReadFileArgs { path: path.to_string_lossy().to_string(), offset: Some(100), limit: None };
+        let args = ReadFileArgs {
+            path: path.to_string_lossy().to_string(),
+            offset: Some(100),
+            limit: None,
+        };
         let result = tool.call(args).await.unwrap();
 
         // offset is clamped to total (1 line), end = min(1+10, 1) = 1, selected = lines[1..1] = empty

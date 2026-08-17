@@ -2,24 +2,24 @@ use std::io::stdout;
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
-    EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
-    Frame, Terminal,
 };
 
 use crate::config;
-use crate::providers::{provider_models_for_plan, ApiPlan, Provider};
+use crate::providers::{ApiPlan, Provider, provider_models_for_plan};
 use crate::ui::selector::{SelectorItem, SelectorState};
 
 struct ProviderEntry {
@@ -30,16 +30,66 @@ struct ProviderEntry {
 }
 
 const PROVIDERS: &[ProviderEntry] = &[
-    ProviderEntry { slug: "deepseek", label: "DeepSeek", detail: "V4 Pro / Flash · 1M 上下文", api_key_env: "DEEPSEEK_API_KEY" },
-    ProviderEntry { slug: "openai", label: "OpenAI", detail: "GPT-5.6 Sol / Terra / Luna", api_key_env: "OPENAI_API_KEY" },
-    ProviderEntry { slug: "claude", label: "Anthropic Claude", detail: "Fable 5 / Opus 5 / Sonnet 5", api_key_env: "ANTHROPIC_API_KEY" },
-    ProviderEntry { slug: "mimo", label: "Xiaomi MiMo", detail: "MiMo v2.5 Pro · 1M 上下文", api_key_env: "MIMO_API_KEY" },
-    ProviderEntry { slug: "gemini", label: "Google Gemini", detail: "Gemini 3.1 Pro / 3.6 Flash", api_key_env: "GEMINI_API_KEY" },
-    ProviderEntry { slug: "zhipu", label: "Zhipu GLM", detail: "智谱 GLM-5.2 / GLM-5", api_key_env: "ZAI_API_KEY" },
-    ProviderEntry { slug: "bailian", label: "Bailian (DashScope)", detail: "百炼 · Qwen3.8 Max / Qwen3.7 Plus", api_key_env: "DASHSCOPE_API_KEY" },
-    ProviderEntry { slug: "moonshot", label: "Moonshot Kimi", detail: "Kimi K3 · 1M 上下文", api_key_env: "MOONSHOT_API_KEY" },
-    ProviderEntry { slug: "volcengine", label: "Volcengine Ark", detail: "Doubao Seed Evolving · 周迭代", api_key_env: "ARK_API_KEY" },
-    ProviderEntry { slug: "custom", label: "Custom (OpenAI-compatible)", detail: "自定义 base URL + API key", api_key_env: "AGENT_API_KEY" },
+    ProviderEntry {
+        slug: "deepseek",
+        label: "DeepSeek",
+        detail: "V4 Pro / Flash · 1M 上下文",
+        api_key_env: "DEEPSEEK_API_KEY",
+    },
+    ProviderEntry {
+        slug: "openai",
+        label: "OpenAI",
+        detail: "GPT-5.6 Sol / Terra / Luna",
+        api_key_env: "OPENAI_API_KEY",
+    },
+    ProviderEntry {
+        slug: "claude",
+        label: "Anthropic Claude",
+        detail: "Fable 5 / Opus 5 / Sonnet 5",
+        api_key_env: "ANTHROPIC_API_KEY",
+    },
+    ProviderEntry {
+        slug: "mimo",
+        label: "Xiaomi MiMo",
+        detail: "MiMo v2.5 Pro · 1M 上下文",
+        api_key_env: "MIMO_API_KEY",
+    },
+    ProviderEntry {
+        slug: "gemini",
+        label: "Google Gemini",
+        detail: "Gemini 3.1 Pro / 3.6 Flash",
+        api_key_env: "GEMINI_API_KEY",
+    },
+    ProviderEntry {
+        slug: "zhipu",
+        label: "Zhipu GLM",
+        detail: "智谱 GLM-5.2 / GLM-5",
+        api_key_env: "ZAI_API_KEY",
+    },
+    ProviderEntry {
+        slug: "bailian",
+        label: "Bailian (DashScope)",
+        detail: "百炼 · Qwen3.8 Max / Qwen3.7 Plus",
+        api_key_env: "DASHSCOPE_API_KEY",
+    },
+    ProviderEntry {
+        slug: "moonshot",
+        label: "Moonshot Kimi",
+        detail: "Kimi K3 · 1M 上下文",
+        api_key_env: "MOONSHOT_API_KEY",
+    },
+    ProviderEntry {
+        slug: "volcengine",
+        label: "Volcengine Ark",
+        detail: "Doubao Seed Evolving · 周迭代",
+        api_key_env: "ARK_API_KEY",
+    },
+    ProviderEntry {
+        slug: "custom",
+        label: "Custom (OpenAI-compatible)",
+        detail: "自定义 base URL + API key",
+        api_key_env: "AGENT_API_KEY",
+    },
 ];
 
 enum Phase {
@@ -192,8 +242,12 @@ impl SetupState {
         }
     }
 
-    fn home(&mut self) { self.cursor = 0; }
-    fn end(&mut self) { self.cursor = self.input.len(); }
+    fn home(&mut self) {
+        self.cursor = 0;
+    }
+    fn end(&mut self) {
+        self.cursor = self.input.len();
+    }
 
     fn is_done(&self) -> bool {
         matches!(self.phase, Phase::Done)
@@ -238,10 +292,8 @@ pub async fn run_setup() -> Result<()> {
 
         match event::read()? {
             Event::Key(key) => handle_key(key, &mut state),
-            Event::Paste(text) => {
-                if state.selector.is_none() {
-                    state.input_paste(&text);
-                }
+            Event::Paste(text) if state.selector.is_none() => {
+                state.input_paste(&text);
             }
             _ => {}
         }
@@ -302,7 +354,9 @@ fn handle_selector_key(key: KeyEvent, state: &mut SetupState) {
             if let Some(item) = selected {
                 match state.phase {
                     Phase::Provider => {
-                        state.provider = PROVIDERS.iter().find(|p| p.slug == item.data.as_deref().unwrap_or(""));
+                        state.provider = PROVIDERS
+                            .iter()
+                            .find(|p| p.slug == item.data.as_deref().unwrap_or(""));
                         if let Some(p) = state.provider {
                             if p.slug == "custom" {
                                 state.start_custom_url();
@@ -378,13 +432,7 @@ fn write_config(state: &SetupState) -> Result<()> {
         None
     };
 
-    let content = config::render_agent_toml(
-        provider.slug,
-        model,
-        base_url,
-        api_key_env,
-        plan_str,
-    );
+    let content = config::render_agent_toml(provider.slug, model, base_url, api_key_env, plan_str);
     std::fs::write("agent.toml", &content)?;
 
     let mut env_lines = vec![format!("AGENT_PROVIDER={}", provider.slug)];
@@ -507,7 +555,10 @@ fn draw_selector(f: &mut Frame, area: Rect, sel: &SelectorState) {
     for (i, item) in visible.iter().enumerate() {
         let is_cursor = i == sel.cursor();
         let style = if is_cursor {
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
         };
@@ -525,7 +576,10 @@ fn draw_selector(f: &mut Frame, area: Rect, sel: &SelectorState) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        format!("  {}  | \u{2191}\u{2193} navigate, Enter select", sel.filter()),
+        format!(
+            "  {}  | \u{2191}\u{2193} navigate, Enter select",
+            sel.filter()
+        ),
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -537,7 +591,12 @@ fn input_line<'a>(input: &'a str, cursor: usize, prompt: &'a str) -> Line<'a> {
     let mut spans = vec![Span::styled(prompt, Style::default().fg(Color::Yellow))];
     spans.push(Span::raw(input));
     if cursor == input.len() {
-        spans.push(Span::styled("_", Style::default().fg(Color::Gray).add_modifier(Modifier::SLOW_BLINK)));
+        spans.push(Span::styled(
+            "_",
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::SLOW_BLINK),
+        ));
     }
     Line::from(spans)
 }

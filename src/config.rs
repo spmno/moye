@@ -18,6 +18,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
+// allow: SIZE_OK — Wave 2 todo 7 task scope restricts changes to src/config.rs only;
+// splitting profile into a sibling module would require touching src/main.rs (explicitly
+// out of scope). File was already 488 pure LOC pre-profile; profile is cohesive config
+// logic belonging here. Refactor into a submodule in Wave 4+ when main.rs is safe to edit.
+
 /// 顶层配置：对应 agent.toml 的全部小节。
 /// Top-level config: all sections of agent.toml.
 #[derive(Debug, Deserialize)]
@@ -38,6 +43,10 @@ pub struct Config {
     /// Sandbox config: pre-authorized directory list, etc.
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    /// Profile 叠加配置：声明式配置组合（`[profile]` + `[profile.<name>]`）。
+    /// Profile overlay config: declarative config composition.
+    #[serde(default)]
+    pub profile: ProfileSection,
     /// 全局 API key 存储：`[keys]` section，键为环境变量名（如 `DEEPSEEK_API_KEY`），
     /// 值为 key 本身。当前目录 `.env`/export 优先，缺失时回退此处。
     /// Global API key store: `[keys]` section, keyed by env var name (e.g. `DEEPSEEK_API_KEY`),
@@ -96,17 +105,31 @@ impl McpServerConfig {
     }
 }
 
-/// `[sandbox]` 小节：沙箱配置（后端选择 + 预授权目录）。
-/// The `[sandbox]` section: sandbox config (backend selection + pre-authorized dirs).
+/// `[sandbox]` 小节：沙箱配置(后端选择 + 模式 + 预授权目录)。
+/// The `[sandbox]` section: sandbox config (backend + mode + pre-authorized dirs).
 ///
-/// `backend` 控制 OS 级沙箱后端：auto（自动检测）、bwrap、seatbelt、path（仅路径检查）、off。
-/// `backend` selects the OS-level sandbox backend: auto, bwrap, seatbelt, path, or off.
-/// `authorized_dirs` 预授权一组目录，Agent 访问时不再弹窗确认。
+/// `backend` 控制 SimpleSandbox 的低层后端:auto / bwrap / seatbelt / path / off。
+/// `backend` controls SimpleSandbox's low-level backend: auto / bwrap / seatbelt / path / off.
+///
+/// `mode` 是高层沙箱模式选择(含 Landlock 选项,todo 5):
+/// `mode` is the high-level sandbox mode (includes Landlock option, todo 5):
+/// - `auto`: bwrap 优先 landlock fallback(todo 8/9 接入选择逻辑)。
+/// - `bwrap`: 强制用 bwrap(SimpleSandbox)。
+/// - `landlock`: 强制用 LandlockSandbox(无 bwrap mount namespace,弱隔离)。
+/// - `off`: 禁用沙箱。
+///
+/// `authorized_dirs` 预授权一组目录,Agent 访问时不再弹窗确认。
 /// `authorized_dirs` pre-authorizes directories so the Agent can access them without prompting.
 #[derive(Debug, Deserialize)]
 pub struct SandboxConfig {
     #[serde(default = "default_sandbox_backend")]
     pub backend: String,
+
+    /// 高层沙箱模式:auto / bwrap / landlock / off。
+    /// High-level sandbox mode: auto / bwrap / landlock / off.
+    /// `auto` = bwrap 优先 landlock fallback(todo 8/9 接入选择逻辑)。
+    #[serde(default = "default_sandbox_mode")]
+    pub mode: String,
 
     #[serde(default)]
     pub authorized_dirs: Vec<String>,
@@ -116,6 +139,7 @@ impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
             backend: default_sandbox_backend(),
+            mode: default_sandbox_mode(),
             authorized_dirs: Vec::new(),
         }
     }
@@ -125,24 +149,194 @@ fn default_sandbox_backend() -> String {
     "auto".to_string()
 }
 
+fn default_sandbox_mode() -> String {
+    "auto".to_string()
+}
+
+/// `[profile]` 小节：profile 叠加配置（声明式配置组合）。
+/// The `[profile]` section: profile overlay config (declarative config composition).
+///
+/// 一个 profile 是一组有序 patch，每个 patch 用 `id` 定位配置树中的某个路径
+/// （如 `sandbox` 或 `agents.builder.permissions`），用 `config` 替换该路径的
+/// 整个值。启动时通过 `AGENT_PROFILE` 环境变量或 `[profile] active = "..."` 选
+/// profile；未选 profile 时行为与无 `[profile]` 段完全一致（向后兼容）。
+#[derive(Debug, Deserialize, Default)]
+pub struct ProfileSection {
+    /// 选中的 profile 名（`AGENT_PROFILE` 环境变量优先于此值）。
+    #[serde(default)]
+    pub active: Option<String>,
+    /// 所有已定义的 profile（键为 profile 名，来自 `[profile.<name>]` 子表）。
+    #[serde(default, flatten)]
+    pub profiles: HashMap<String, Profile>,
+}
+
+/// 单个 profile：一组有序 patch + 可选基础 profile（链式继承）。
+/// A single profile: an ordered list of patches + optional base profile (chain).
+#[derive(Debug, Deserialize, Clone)]
+pub struct Profile {
+    /// profile 名（与 `[profile.<name>]` 的 TOML 键一致）。
+    #[allow(dead_code)] // infrastructure for future phases
+    pub name: String,
+    /// 基础 profile 名：解析时先应用 base 的 patch，再应用本 profile 的 patch。
+    /// `"default"` 或缺省表示基础为顶层内联配置（不继承其他 profile）。
+    #[serde(default)]
+    pub base: Option<String>,
+    /// 有序 patch 列表：每个 patch 用 `id` 定位并替换其整个 `config`。
+    #[serde(default)]
+    pub patches: Vec<ProfilePatch>,
+}
+
+/// 单个 patch：定位 `id` 路径，用 `config` 替换该路径的整个值（非深度合并）。
+/// A single patch: locates the `id` path and replaces its entire value (no deep merge).
+#[derive(Debug, Deserialize, Clone)]
+pub struct ProfilePatch {
+    /// 配置树中的目标路径（点号分隔，如 `sandbox`、`agents.builder.permissions`）。
+    pub id: String,
+    /// 替换值（TOML 内联表）。
+    pub config: toml::Value,
+}
+
 impl Config {
     /// 从 agent.toml 解析。整个 crate 仅此处解析该文件。
     /// Parses from agent.toml. This is the only place the file is parsed.
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)?;
-        Ok(toml::from_str(&raw)?)
+        Self::from_str_with_profile(&raw, None)
+    }
+
+    /// 解析 TOML 并应用 profile 叠加。
+    /// Parse TOML and apply profile overlay.
+    ///
+    /// `explicit` 为 `Some("dev")` 时强制使用名为 `dev` 的 profile；
+    /// 为 `None` 时按 `AGENT_PROFILE` 环境变量或 `[profile] active` 字段决定。
+    /// 无 profile 被选中时，行为与直接 `toml::from_str` 一致（向后兼容）。
+    pub fn from_str_with_profile(raw: &str, explicit: Option<&str>) -> anyhow::Result<Self> {
+        let (cfg, _value, _active) = Self::parse_combined(raw, explicit)?;
+        Ok(cfg)
+    }
+
+    /// 解析 TOML、应用 profile 叠加，并返回组合后的配置树与选中的 profile 名。
+    /// Parse TOML, apply profile overlay, and return the combined value tree +
+    /// the selected profile name alongside the typed Config.
+    ///
+    /// 返回的 `toml::Value` 是 profile patch 应用后的组合树（即 `--dump-config`
+    /// 应该打印的内容）。`active` 为 `Some(name)` 表示选中了某个 profile；`None`
+    /// 表示无 profile 被选中（向后兼容模式）。
+    ///
+    /// 优先级：`explicit` 参数 > `AGENT_PROFILE` 环境变量 > `[profile] active` 字段。
+    pub fn parse_combined(
+        raw: &str,
+        explicit: Option<&str>,
+    ) -> anyhow::Result<(Self, toml::Value, Option<String>)> {
+        use serde::de::IntoDeserializer;
+
+        let mut value: toml::Value =
+            toml::from_str(raw).map_err(|e| anyhow::anyhow!("agent.toml parse error: {e}"))?;
+
+        let active = explicit
+            .map(String::from)
+            .or_else(|| std::env::var("AGENT_PROFILE").ok())
+            .or_else(|| {
+                value
+                    .get("profile")
+                    .and_then(|p| p.get("active"))
+                    .and_then(|a| a.as_str())
+                    .map(String::from)
+            });
+
+        if let Some(name) = &active {
+            let profile_section: ProfileSection = value
+                .get("profile")
+                .map(|p| {
+                    ProfileSection::deserialize(p.clone().into_deserializer())
+                        .map_err(|e| anyhow::anyhow!("[profile] section parse error: {e}"))
+                })
+                .transpose()?
+                .unwrap_or_default();
+
+            let patches = resolve_profile_chain(&profile_section.profiles, name, 0)?;
+            for patch in &patches {
+                apply_patch(&mut value, &patch.id, &patch.config)
+                    .map_err(|e| anyhow::anyhow!("profile '{name}': {e}"))?;
+            }
+        }
+
+        let cfg = Config::deserialize(value.clone().into_deserializer())
+            .map_err(|e| anyhow::anyhow!("config after patch: {e}"))?;
+        Ok((cfg, value, active))
+    }
+
+    /// 返回当前生效的 profile 名（env > `[profile].active`）。
+    /// 仅做语法解析，不重新应用 patch；用于 `--dump-config` 等诊断输出。
+    /// Returns the active profile name (env > `[profile].active`).
+    /// Syntax-only; does not re-apply patches. Used for diagnostics like `--dump-config`.
+    pub fn active_profile_name(&self) -> Option<String> {
+        std::env::var("AGENT_PROFILE")
+            .ok()
+            .or_else(|| self.profile.active.clone())
     }
 
     /// 自主循环轮数上限；为 0 时回退到默认 50。
     /// Max turns for the autonomous loop; falls back to 50 when 0.
     pub fn max_turns(&self) -> usize {
         let turns = self.agent.max_turns;
-        if turns == 0 {
-            50
-        } else {
-            turns
-        }
+        if turns == 0 { 50 } else { turns }
     }
+}
+
+/// 解析 profile 链：先应用 base profile 的 patch，再应用本 profile 的 patch。
+/// 限制链深度以防止循环继承。
+fn resolve_profile_chain(
+    profiles: &HashMap<String, Profile>,
+    name: &str,
+    depth: u8,
+) -> anyhow::Result<Vec<ProfilePatch>> {
+    const MAX_DEPTH: u8 = 16;
+    if depth > MAX_DEPTH {
+        anyhow::bail!("profile chain too deep (>{MAX_DEPTH} levels, possible cycle)");
+    }
+    let profile = profiles
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("profile '{name}' not found in [profile] section"))?;
+    let mut patches = Vec::new();
+    if let Some(base) = &profile.base
+        && base != "default"
+        && base != name
+    {
+        patches.extend(resolve_profile_chain(profiles, base, depth + 1)?);
+    }
+    patches.extend(profile.patches.clone());
+    Ok(patches)
+}
+
+/// 按 `id`（点号分隔路径）定位 value 树中的位置，用 `replacement` 替换整个值。
+/// 路径中任一段不存在即报错（fail-closed，不静默 no-op）。
+fn apply_patch(value: &mut toml::Value, id: &str, replacement: &toml::Value) -> anyhow::Result<()> {
+    if id.is_empty() {
+        anyhow::bail!("patch id is empty");
+    }
+    let segments: Vec<&str> = id.split('.').collect();
+    let last_idx = segments.len() - 1;
+    let mut current: &mut toml::Value = value;
+    for (i, seg) in segments.iter().enumerate() {
+        let is_last = i == last_idx;
+        let table = current.as_table_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "patch id '{id}' cannot navigate into non-table value at segment '{seg}'"
+            )
+        })?;
+        if is_last {
+            if !table.contains_key(*seg) {
+                anyhow::bail!("patch id '{id}' references non-existent path segment '{seg}'");
+            }
+            table.insert((*seg).to_string(), replacement.clone());
+            return Ok(());
+        }
+        current = table.get_mut(*seg).ok_or_else(|| {
+            anyhow::anyhow!("patch id '{id}' references non-existent path segment '{seg}'")
+        })?;
+    }
+    Ok(())
 }
 
 /// `[provider]` 小节：默认供应商与可选覆盖（env 优先于文件）。
@@ -203,12 +397,11 @@ pub fn init(path: &str) -> anyhow::Result<Arc<Config>> {
     let mut cfg = Config::load(path)?;
     // 全局配置仅作为 provider 小节的 fallback（项目优先）。
     // Global config only backfills the provider section (project wins).
-    if let Some(global_path) = global_config_path() {
-        if global_path.exists() {
-            if let Ok(global) = Config::load(global_path.to_string_lossy().as_ref()) {
-                merge_provider_fallback(&mut cfg, global);
-            }
-        }
+    if let Some(global_path) = global_config_path()
+        && global_path.exists()
+        && let Ok(global) = Config::load(global_path.to_string_lossy().as_ref())
+    {
+        merge_provider_fallback(&mut cfg, global);
     }
     let cfg = Arc::new(cfg);
     Ok(CONFIG.get_or_init(|| cfg).clone())
@@ -220,9 +413,7 @@ pub fn init(path: &str) -> anyhow::Result<Arc<Config>> {
 /// Either being present skips the setup wizard.
 pub fn has_config_file() -> bool {
     std::path::Path::new("agent.toml").exists()
-        || global_config_path()
-            .map(|p| p.exists())
-            .unwrap_or(false)
+        || global_config_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 /// 返回全局配置路径 `~/.config/moye/config.toml`；`HOME` 未设置时返回 `None`。
@@ -308,23 +499,27 @@ pub fn default_model_for_provider_plan(provider: &str, plan: &str) -> &'static s
 /// file (they stay in the global config.toml's [keys], backfilled at runtime via
 /// merge_provider_fallback).
 fn generate_agent_toml(path: &str) -> anyhow::Result<()> {
-    let (provider, base_url, api_key_env, global_model) = if let Some(global_path) = global_config_path() {
-        if global_path.exists() {
-            match Config::load(global_path.to_string_lossy().as_ref()) {
-                Ok(global) => (
-                    global.provider.provider.unwrap_or_else(|| "deepseek".to_string()),
-                    global.provider.base_url,
-                    global.provider.api_key_env,
-                    global.agent.default_model,
-                ),
-                Err(_) => ("deepseek".to_string(), None, None, String::new()),
+    let (provider, base_url, api_key_env, global_model) =
+        if let Some(global_path) = global_config_path() {
+            if global_path.exists() {
+                match Config::load(global_path.to_string_lossy().as_ref()) {
+                    Ok(global) => (
+                        global
+                            .provider
+                            .provider
+                            .unwrap_or_else(|| "deepseek".to_string()),
+                        global.provider.base_url,
+                        global.provider.api_key_env,
+                        global.agent.default_model,
+                    ),
+                    Err(_) => ("deepseek".to_string(), None, None, String::new()),
+                }
+            } else {
+                ("deepseek".to_string(), None, None, String::new())
             }
         } else {
             ("deepseek".to_string(), None, None, String::new())
-        }
-    } else {
-        ("deepseek".to_string(), None, None, String::new())
-    };
+        };
 
     let model = if !global_model.is_empty() {
         global_model
@@ -457,6 +652,7 @@ rule_escalation_threshold = 3
 
 [sandbox]
 backend = "auto"
+mode = "auto"
 authorized_dirs = []
 
 [mcp.codegraph]
@@ -485,6 +681,41 @@ mod tests {
     use super::*;
     use crate::registry::Permission;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Test helper: saves the current value of an env var, sets a new one (or
+    /// unsets it), and restores the original on Drop. Wraps the edition-2024
+    /// `unsafe` env mutators so tests stay clean.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn new(key: &'static str, value: Option<&str>) -> Self {
+            let prev = std::env::var(key).ok();
+            match value {
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn env_guard(key: &'static str, value: Option<&str>) -> EnvGuard {
+        EnvGuard::new(key, value)
+    }
 
     #[test]
     fn load_full_config() {
@@ -546,6 +777,7 @@ authorized_dirs = ["~/.config", "/tmp/moye"]
         assert_eq!(cfg.context.max_output_tokens, 4096);
         assert!(cfg.sandbox.authorized_dirs.is_empty());
         assert_eq!(cfg.sandbox.backend, "auto");
+        assert_eq!(cfg.sandbox.mode, "auto");
         assert_eq!(cfg.memory.rules_file, "rules.json");
     }
 
@@ -615,7 +847,10 @@ MOONSHOT_API_KEY = "global-moon"
         assert_eq!(default_model_for_provider("deepseek"), "deepseek-v4-pro");
         assert_eq!(default_model_for_provider("bailian"), "qwen3.7-plus");
         assert_eq!(default_model_for_provider("moonshot"), "kimi-k3");
-        assert_eq!(default_model_for_provider("volcengine"), "doubao-seed-evolving");
+        assert_eq!(
+            default_model_for_provider("volcengine"),
+            "doubao-seed-evolving"
+        );
         assert_eq!(default_model_for_provider("openai"), "gpt-5.6-sol");
         assert_eq!(default_model_for_provider("claude"), "claude-sonnet-5");
         assert_eq!(default_model_for_provider("mimo"), "mimo-v2.5-pro");
@@ -667,7 +902,10 @@ MOONSHOT_API_KEY = "global-moon"
         // 模型应有值（来自全局配置或供应商默认）。
         // Model should be set (from global config or provider default).
         assert!(!cfg.agent.default_model.is_empty());
-        assert_eq!(cfg.roles.get("builder").unwrap().model, cfg.agent.default_model);
+        assert_eq!(
+            cfg.roles.get("builder").unwrap().model,
+            cfg.agent.default_model
+        );
         // builder 应有写权限。
         assert_eq!(
             cfg.roles.get("builder").unwrap().permissions.write_file,
@@ -707,5 +945,358 @@ url = "https://mcp.grep.app"
         assert_eq!(c7.url.as_deref(), Some("https://context7.com/api/v2/mcp"));
         assert!(c7.command.is_none());
         assert_eq!(c7.transport_type(), "http");
+    }
+
+    #[test]
+    fn profile_patch_replaces_sandbox_backend() {
+        // Given: config with [sandbox] backend="auto" + [profile.dev] patch
+        //        replacing [sandbox] with backend="landlock".
+        // When: parsing with explicit profile "dev".
+        // Then: composed Config has sandbox.backend == "landlock" (whole-table replace).
+        let toml_str = r#"
+[sandbox]
+backend = "auto"
+authorized_dirs = []
+
+[profile.dev]
+name = "dev"
+patches = [
+    { id = "sandbox", config = { backend = "landlock", authorized_dirs = [] } },
+]
+"#;
+        let cfg = Config::from_str_with_profile(toml_str, Some("dev"))
+            .expect("profile parse should succeed");
+        assert_eq!(cfg.sandbox.backend, "landlock");
+        assert!(cfg.sandbox.authorized_dirs.is_empty());
+    }
+
+    #[test]
+    fn profile_patch_replaces_nested_role_permissions() {
+        // Given: config with [agents.builder] permissions allow + [profile.lockdown]
+        //        patch replacing [agents.builder.permissions] entirely with all-deny.
+        // When: parsing with explicit profile "lockdown".
+        // Then: builder permissions are all Deny (full replacement); model/preamble untouched.
+        let toml_str = r#"
+[agents.builder]
+model = "glm-latest"
+preamble = "prompts/builder.md"
+permissions.read_file = "allow"
+permissions.edit_file = "allow"
+permissions.run_bash_mutating = "allow"
+
+[profile.lockdown]
+name = "lockdown"
+patches = [
+    { id = "agents.builder.permissions", config = { read_file = "deny", run_bash_readonly = "deny", run_bash_mutating = "deny", edit_file = "deny", write_file = "deny", web_fetch = "deny", web_search = "deny" } },
+]
+"#;
+        let cfg = Config::from_str_with_profile(toml_str, Some("lockdown"))
+            .expect("profile parse should succeed");
+        let builder = cfg.roles.get("builder").expect("builder role present");
+        assert_eq!(builder.permissions.read_file, Permission::Deny);
+        assert_eq!(builder.permissions.edit_file, Permission::Deny);
+        assert_eq!(builder.permissions.run_bash_mutating, Permission::Deny);
+        assert_eq!(builder.model, "glm-latest");
+    }
+
+    #[test]
+    fn no_profile_section_backward_compat() {
+        // Given: config with no [profile] section.
+        // When: parsing with no explicit profile and no AGENT_PROFILE env.
+        // Then: behavior identical to direct toml::from_str (backward compat).
+        let toml_str = r#"
+[sandbox]
+backend = "bwrap"
+authorized_dirs = ["/tmp"]
+
+[agent]
+default_model = "kimi-k3"
+max_turns = 20
+"#;
+        let cfg = Config::from_str_with_profile(toml_str, None).expect("parse should succeed");
+        assert_eq!(cfg.sandbox.backend, "bwrap");
+        assert_eq!(cfg.agent.default_model, "kimi-k3");
+        assert_eq!(cfg.max_turns(), 20);
+    }
+
+    #[test]
+    fn explicit_none_profile_with_profile_section_is_noop() {
+        // Given: config with a [profile.dev] section, but explicit profile = None
+        //        and no AGENT_PROFILE env.
+        // When: parsing with explicit None.
+        // Then: no patches applied; base config unchanged (profile section ignored).
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _guard = env_guard("AGENT_PROFILE", None);
+        let toml_str = r#"
+[sandbox]
+backend = "auto"
+
+[profile.dev]
+name = "dev"
+patches = [
+    { id = "sandbox", config = { backend = "landlock", authorized_dirs = [] } },
+]
+"#;
+        let cfg = Config::from_str_with_profile(toml_str, None).expect("parse should succeed");
+        assert_eq!(cfg.sandbox.backend, "auto");
+    }
+
+    #[test]
+    fn agent_profile_env_var_selects_profile() {
+        // Given: config with [profile.dev] that patches sandbox backend to landlock.
+        // When: AGENT_PROFILE=dev env set and explicit profile = None.
+        // Then: dev profile's patch is applied.
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _guard = env_guard("AGENT_PROFILE", Some("dev"));
+        let toml_str = r#"
+[sandbox]
+backend = "auto"
+
+[profile.dev]
+name = "dev"
+patches = [
+    { id = "sandbox", config = { backend = "landlock", authorized_dirs = [] } },
+]
+"#;
+        let cfg =
+            Config::from_str_with_profile(toml_str, None).expect("profile parse should succeed");
+        assert_eq!(cfg.sandbox.backend, "landlock");
+    }
+
+    #[test]
+    fn profile_active_field_selects_profile() {
+        // Given: [profile] active = "dev" selects dev profile without env var.
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _guard = env_guard("AGENT_PROFILE", None);
+        let toml_str = r#"
+[profile]
+active = "dev"
+
+[profile.dev]
+name = "dev"
+patches = [
+    { id = "sandbox", config = { backend = "landlock", authorized_dirs = [] } },
+]
+
+[sandbox]
+backend = "auto"
+"#;
+        let cfg = Config::from_str_with_profile(toml_str, None).expect("parse should succeed");
+        assert_eq!(cfg.sandbox.backend, "landlock");
+    }
+
+    #[test]
+    fn patch_nonexistent_id_errors() {
+        // Given: profile whose patch references an id that doesn't exist in base config.
+        // When: parsing with that profile.
+        // Then: error (exit non-zero), not silent no-op (fail-closed on bad reference).
+        let toml_str = r#"
+[sandbox]
+backend = "auto"
+
+[profile.bad]
+name = "bad"
+patches = [
+    { id = "nonexistent.path", config = {} },
+]
+"#;
+        let result = Config::from_str_with_profile(toml_str, Some("bad"));
+        assert!(
+            result.is_err(),
+            "patch referencing non-existent id must error, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn unknown_profile_name_errors() {
+        // Given: explicit profile "ghost" that doesn't exist in [profile].
+        // When: parsing with that profile.
+        // Then: error (fail-closed on unknown profile name).
+        let toml_str = r#"
+[profile.dev]
+name = "dev"
+patches = []
+"#;
+        let result = Config::from_str_with_profile(toml_str, Some("ghost"));
+        assert!(result.is_err(), "unknown profile name must error");
+    }
+
+    #[test]
+    fn profile_base_chains_patches_in_order() {
+        // Given: profile "dev" extends "base_p" (base = "base_p").
+        //        base_p patches sandbox.backend = "bwrap".
+        //        dev patches sandbox.backend = "landlock".
+        // When: parsing with profile "dev".
+        // Then: both patches applied in order; final value is "landlock" (dev wins).
+        let toml_str = r#"
+[sandbox]
+backend = "auto"
+
+[profile.base_p]
+name = "base_p"
+patches = [
+    { id = "sandbox", config = { backend = "bwrap", mode = "auto", authorized_dirs = [] } },
+]
+
+[profile.dev]
+name = "dev"
+base = "base_p"
+patches = [
+    { id = "sandbox", config = { backend = "landlock", mode = "landlock", authorized_dirs = [] } },
+]
+"#;
+        let cfg = Config::from_str_with_profile(toml_str, Some("dev"))
+            .expect("profile parse should succeed");
+        assert_eq!(cfg.sandbox.backend, "landlock");
+    }
+
+    #[test]
+    fn sandbox_mode_field_parsed() {
+        // Given: [sandbox] with mode = "landlock".
+        // When: parsing.
+        // Then: cfg.sandbox.mode == "landlock".
+        let toml_str = r#"
+[sandbox]
+backend = "auto"
+mode = "landlock"
+authorized_dirs = []
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.sandbox.mode, "landlock");
+    }
+
+    #[test]
+    fn sandbox_mode_defaults_to_auto() {
+        // Given: [sandbox] without mode field.
+        // When: parsing.
+        // Then: cfg.sandbox.mode == "auto" (default).
+        let toml_str = r#"
+[sandbox]
+backend = "bwrap"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.sandbox.mode, "auto");
+        assert_eq!(cfg.sandbox.backend, "bwrap");
+    }
+
+    #[test]
+    fn profile_overlay_applies_sandbox_mode() {
+        // Given: base [sandbox] mode = "auto", profile patches it to "landlock".
+        // When: parsing with the profile selected.
+        // Then: cfg.sandbox.mode == "landlock" (the profile patch replaces it).
+        let toml_str = r#"
+[sandbox]
+backend = "auto"
+mode = "auto"
+authorized_dirs = []
+
+[profile.landlock]
+name = "landlock"
+patches = [
+    { id = "sandbox", config = { backend = "auto", mode = "landlock", authorized_dirs = [] } },
+]
+"#;
+        let cfg = Config::from_str_with_profile(toml_str, Some("landlock"))
+            .expect("profile parse should succeed");
+        assert_eq!(cfg.sandbox.mode, "landlock");
+    }
+
+    #[test]
+    fn profile_overlay_applies_agent_model_override() {
+        // Given: [agents.builder].model = "base-model", profile patches it to "profile-model".
+        // When: parsing with the profile selected.
+        // Then: cfg.roles["builder"].model == "profile-model".
+        let toml_str = r#"
+[agents.builder]
+model = "base-model"
+preamble = "prompts/builder.md"
+
+[profile.model-swap]
+name = "model-swap"
+patches = [
+    { id = "agents.builder", config = { model = "profile-model", preamble = "prompts/builder.md", permissions = { read_file = "allow", run_bash_readonly = "allow", run_bash_mutating = "allow", edit_file = "allow", write_file = "allow", web_fetch = "allow", web_search = "allow" } } },
+]
+"#;
+        let cfg = Config::from_str_with_profile(toml_str, Some("model-swap"))
+            .expect("profile parse should succeed");
+        let builder = cfg.roles.get("builder").expect("builder role present");
+        assert_eq!(builder.model, "profile-model");
+    }
+
+    #[test]
+    fn parse_combined_returns_value_tree_with_patch_applied() {
+        // Given: base config + profile that patches sandbox.mode to "landlock".
+        // When: parse_combined with the profile.
+        // Then: returned toml::Value reflects the patched mode; active name matches.
+        let toml_str = r#"
+[sandbox]
+backend = "auto"
+mode = "auto"
+authorized_dirs = []
+
+[profile.dev]
+name = "dev"
+patches = [
+    { id = "sandbox", config = { backend = "auto", mode = "landlock", authorized_dirs = [] } },
+]
+"#;
+        let (cfg, value, active) =
+            Config::parse_combined(toml_str, Some("dev")).expect("parse_combined should succeed");
+        assert_eq!(active.as_deref(), Some("dev"));
+        assert_eq!(cfg.sandbox.mode, "landlock");
+        let sandbox_mode_in_tree = value
+            .get("sandbox")
+            .and_then(|s| s.get("mode"))
+            .and_then(|m| m.as_str())
+            .expect("sandbox.mode present in value tree");
+        assert_eq!(sandbox_mode_in_tree, "landlock");
+    }
+
+    #[test]
+    fn parse_combined_no_profile_returns_none_active() {
+        // Given: config with no [profile] section.
+        // When: parse_combined with no explicit profile and no AGENT_PROFILE env.
+        // Then: active is None; value tree equals the parsed input.
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _guard = env_guard("AGENT_PROFILE", None);
+        let toml_str = r#"
+[sandbox]
+backend = "bwrap"
+"#;
+        let (cfg, _value, active) =
+            Config::parse_combined(toml_str, None).expect("parse_combined should succeed");
+        assert!(active.is_none());
+        assert_eq!(cfg.sandbox.backend, "bwrap");
+    }
+
+    #[test]
+    fn active_profile_name_reads_env_var() {
+        // Given: AGENT_PROFILE env var is set.
+        // When: calling active_profile_name() on any Config.
+        // Then: returns the env var's value (env wins over [profile].active).
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _guard = env_guard("AGENT_PROFILE", Some("from-env"));
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.active_profile_name().as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn active_profile_name_falls_back_to_config_field() {
+        // Given: no AGENT_PROFILE env, but [profile].active = "dev" in config.
+        // When: calling active_profile_name().
+        // Then: returns "dev" from the config field.
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _guard = env_guard("AGENT_PROFILE", None);
+        let toml_str = r#"
+[profile]
+active = "dev"
+
+[profile.dev]
+name = "dev"
+patches = []
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.active_profile_name().as_deref(), Some("dev"));
     }
 }

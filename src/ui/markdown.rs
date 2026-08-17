@@ -75,10 +75,7 @@ pub fn render_markdown(text: &str) -> Text<'static> {
             }
             Event::End(TagEnd::CodeBlock) => {
                 for code_line in code_buf.lines() {
-                    lines.push(Line::styled(
-                        format!("  {code_line}"),
-                        theme::code_block(),
-                    ));
+                    lines.push(Line::styled(format!("  {code_line}"), theme::code_block()));
                 }
                 lines.push(Line::default());
                 in_code_block = false;
@@ -112,15 +109,10 @@ pub fn render_markdown(text: &str) -> Text<'static> {
                 }
             }
             Event::Code(code) => {
-                spans.push(Span::styled(
-                    code.to_string(),
-                    theme::code_inline(),
-                ));
+                spans.push(Span::styled(code.to_string(), theme::code_inline()));
             }
-            Event::SoftBreak | Event::HardBreak => {
-                if !spans.is_empty() {
-                    lines.push(Line::from(std::mem::take(&mut spans)));
-                }
+            Event::SoftBreak | Event::HardBreak if !spans.is_empty() => {
+                lines.push(Line::from(std::mem::take(&mut spans)));
             }
             _ => {}
         }

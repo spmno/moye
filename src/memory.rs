@@ -174,7 +174,10 @@ impl MemoryStore {
             return Ok(None);
         }
         let lessons = self.load_lessons()?;
-        let count = lessons.iter().filter(|l| l.summary == lesson.summary).count();
+        let count = lessons
+            .iter()
+            .filter(|l| l.summary == lesson.summary)
+            .count();
         if count < threshold {
             return Ok(None);
         }
@@ -213,6 +216,133 @@ pub fn load_rules_from_file(path: &std::path::Path) -> Vec<Rule> {
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
+/// 一条结构化 Agent Note，位于 `memory/notes/implemented/<topic>/`。
+/// A single structured Agent Note file under `memory/notes/implemented/<topic>/`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // used in tests
+pub struct NoteEntry {
+    pub path: PathBuf,
+    pub topic: String,
+    pub date: String,
+    pub slug: String,
+    pub content: String,
+}
+
+/// Agent Notes 管理器。Note 存放在 `<base>/notes/implemented/<topic>/` 下，
+/// 文件名为 `YYYY-MM-DD-<slug>.md`，带 YAML frontmatter。
+/// 与现有 `lessons.jsonl` + `rules.json` 并存，不替换。
+/// Agent Notes manager. Notes live under `<base>/notes/implemented/<topic>/`
+/// as `YYYY-MM-DD-<slug>.md` files with YAML frontmatter. Coexists with the
+/// legacy `lessons.jsonl` + `rules.json` stores — does not replace them.
+pub struct NotesManager {
+    notes_dir: PathBuf,
+}
+
+impl NotesManager {
+    pub fn new(base_dir: &std::path::Path) -> Result<Self> {
+        let notes_dir = base_dir.join("notes").join("implemented");
+        std::fs::create_dir_all(&notes_dir)?;
+        Ok(Self { notes_dir })
+    }
+
+    pub fn append(&self, topic: &str, slug: &str, content: &str) -> Result<PathBuf> {
+        let topic_dir = self.notes_dir.join(topic);
+        std::fs::create_dir_all(&topic_dir)?;
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let filename = format!("{date}-{slug}.md");
+        let path = topic_dir.join(&filename);
+        let body = format!("---\ntopic: {topic}\ndate: {date}\nslug: {slug}\n---\n{content}");
+        std::fs::write(&path, body)?;
+        Ok(path)
+    }
+
+    #[allow(dead_code)] // used in tests
+    pub fn load(&self, topic: &str) -> Result<Vec<NoteEntry>> {
+        let topic_dir = self.notes_dir.join(topic);
+        if !topic_dir.exists() {
+            return Ok(vec![]);
+        }
+        let mut entries = vec![];
+        for entry in std::fs::read_dir(&topic_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path)?;
+            if let Ok(mut note) = parse_note(&raw) {
+                note.path = path;
+                entries.push(note);
+            }
+        }
+        entries.sort_by(|a, b| a.date.cmp(&b.date).then_with(|| a.slug.cmp(&b.slug)));
+        Ok(entries)
+    }
+
+    #[allow(dead_code)] // used in tests
+    pub fn verify(&self) -> Result<()> {
+        if !self.notes_dir.exists() {
+            return Ok(());
+        }
+        for topic_entry in std::fs::read_dir(&self.notes_dir)? {
+            let topic_entry = topic_entry?;
+            let topic_dir = topic_entry.path();
+            if !topic_dir.is_dir() {
+                continue;
+            }
+            for note_entry in std::fs::read_dir(&topic_dir)? {
+                let note_entry = note_entry?;
+                let path = note_entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let raw = std::fs::read_to_string(&path)?;
+                parse_note(&raw).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[allow(dead_code)] // used in tests
+fn parse_note(raw: &str) -> Result<NoteEntry> {
+    let after = raw
+        .strip_prefix("---\n")
+        .ok_or_else(|| anyhow::anyhow!("missing frontmatter opening '---'"))?;
+    let fm_end = after
+        .find("\n---\n")
+        .ok_or_else(|| anyhow::anyhow!("missing frontmatter closing '---'"))?;
+    let fm = &after[..fm_end];
+    let body = &after[fm_end + "\n---\n".len()..];
+
+    let (mut topic, mut date, mut slug) = (String::new(), String::new(), String::new());
+    for line in fm.lines() {
+        if let Some(v) = line.strip_prefix("topic: ") {
+            topic = v.trim().into();
+        } else if let Some(v) = line.strip_prefix("date: ") {
+            date = v.trim().into();
+        } else if let Some(v) = line.strip_prefix("slug: ") {
+            slug = v.trim().into();
+        }
+    }
+    let missing = match () {
+        _ if topic.is_empty() => Some("topic"),
+        _ if date.is_empty() => Some("date"),
+        _ if slug.is_empty() => Some("slug"),
+        _ => None,
+    };
+    if let Some(field) = missing {
+        return Err(anyhow::anyhow!("frontmatter missing '{field}' field"));
+    }
+    Ok(NoteEntry {
+        path: PathBuf::new(),
+        topic,
+        date,
+        slug,
+        content: body.into(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,7 +368,10 @@ mod tests {
     #[test]
     fn escalate_below_threshold_returns_none() {
         let store = tmp_store("below");
-        let lesson = Lesson { summary: "always commit after edit".into(), ts: 1 };
+        let lesson = Lesson {
+            summary: "always commit after edit".into(),
+            ts: 1,
+        };
         store.record_lesson(&lesson).unwrap();
         assert!(store.check_and_escalate_rule(&lesson, 3).unwrap().is_none());
     }
@@ -246,7 +379,10 @@ mod tests {
     #[test]
     fn escalate_at_threshold_creates_rule() {
         let store = tmp_store("at");
-        let lesson = Lesson { summary: "always commit after edit".into(), ts: 1 };
+        let lesson = Lesson {
+            summary: "always commit after edit".into(),
+            ts: 1,
+        };
         for _ in 0..3 {
             store.record_lesson(&lesson).unwrap();
         }
@@ -261,7 +397,10 @@ mod tests {
     #[test]
     fn escalate_does_not_duplicate() {
         let store = tmp_store("dup");
-        let lesson = Lesson { summary: "always commit after edit".into(), ts: 1 };
+        let lesson = Lesson {
+            summary: "always commit after edit".into(),
+            ts: 1,
+        };
         for _ in 0..3 {
             store.record_lesson(&lesson).unwrap();
         }
@@ -273,7 +412,10 @@ mod tests {
     #[test]
     fn escalate_threshold_zero_disabled() {
         let store = tmp_store("zero");
-        let lesson = Lesson { summary: "always commit after edit".into(), ts: 1 };
+        let lesson = Lesson {
+            summary: "always commit after edit".into(),
+            ts: 1,
+        };
         store.record_lesson(&lesson).unwrap();
         assert!(store.check_and_escalate_rule(&lesson, 0).unwrap().is_none());
     }
@@ -304,14 +446,108 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rules.json");
         let rules = vec![
-            Rule { text: "rule a".into(), count: 3, created_ts: 1 },
-            Rule { text: "rule b".into(), count: 5, created_ts: 2 },
+            Rule {
+                text: "rule a".into(),
+                count: 3,
+                created_ts: 1,
+            },
+            Rule {
+                text: "rule b".into(),
+                count: 5,
+                created_ts: 2,
+            },
         ];
         std::fs::write(&path, serde_json::to_string_pretty(&rules).unwrap()).unwrap();
         let loaded = load_rules_from_file(&path);
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].text, "rule a");
         assert_eq!(loaded[1].count, 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tmp_notes_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "moye-test-notes-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn notes_append_writes_correct_path_with_frontmatter() {
+        let dir = tmp_notes_dir("append");
+        let nm = NotesManager::new(&dir).unwrap();
+        let path = nm.append("test-topic", "smoke", "some content").unwrap();
+
+        let expected_dir = dir.join("notes").join("implemented").join("test-topic");
+        assert!(
+            path.starts_with(&expected_dir),
+            "path {path:?} not under {expected_dir:?}"
+        );
+        let filename = path.file_name().unwrap().to_string_lossy().to_string();
+        assert!(filename.ends_with("-smoke.md"), "filename {filename}");
+        assert_eq!(filename.len(), "YYYY-MM-DD-smoke.md".len());
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with("---\n"), "missing frontmatter opening");
+        assert!(content.contains("topic: test-topic"));
+        assert!(content.contains("slug: smoke"));
+        assert!(content.contains("some content"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notes_load_returns_appended_notes_sorted_by_date() {
+        let dir = tmp_notes_dir("load");
+        let nm = NotesManager::new(&dir).unwrap();
+        nm.append("alpha", "first", "content-1").unwrap();
+        nm.append("alpha", "second", "content-2").unwrap();
+
+        let loaded = nm.load("alpha").unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().all(|n| n.topic == "alpha"));
+        assert!(loaded.iter().any(|n| n.content.contains("content-1")));
+        assert!(loaded.iter().any(|n| n.content.contains("content-2")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notes_load_empty_when_topic_missing() {
+        let dir = tmp_notes_dir("empty");
+        let nm = NotesManager::new(&dir).unwrap();
+        let loaded = nm.load("no-such-topic").unwrap();
+        assert!(loaded.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notes_verify_passes_for_well_formed() {
+        let dir = tmp_notes_dir("verify-ok");
+        let nm = NotesManager::new(&dir).unwrap();
+        nm.append("good", "note-a", "body").unwrap();
+        nm.append("good", "note-b", "body2").unwrap();
+        assert!(nm.verify().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notes_verify_fails_for_missing_frontmatter() {
+        let dir = tmp_notes_dir("verify-bad");
+        let nm = NotesManager::new(&dir).unwrap();
+        let topic_dir = dir.join("notes").join("implemented").join("bad");
+        std::fs::create_dir_all(&topic_dir).unwrap();
+        std::fs::write(
+            topic_dir.join("2026-08-17-broken.md"),
+            "no frontmatter here",
+        )
+        .unwrap();
+        assert!(nm.verify().is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

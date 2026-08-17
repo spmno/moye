@@ -20,19 +20,29 @@
 moye
 ├── src/
 │   ├── main.rs          # 程序入口（日志初始化 + 配置加载 + TUI 启动）
-│   ├── config.rs        # 统一配置模块（agent.toml 一次解析，全 crate 共享）
+│   ├── config.rs        # 统一配置模块（agent.toml 一次解析，全 crate 共享；profile 叠加系统）
 │   ├── event.rs         # 共享事件类型（AgentEvent + EventSender）
-│   ├── agent_loop.rs    # 自主循环 + HITL 门控（AgentHook）
+│   ├── events.rs        # Waterfall 监听器注册中心（emit / waterfall / serial 三种监听器）
+│   ├── agent_loop.rs    # 自主循环 + HITL 门控（HitlHook: waterfall + approval + pipeline hooks; run_autonomous）
 │   ├── providers.rs     # 多供应商统一接入（OpenAI 兼容）
-│   ├── registry.rs      # Agent 角色注册 + 工具权限分级 + SDD 管线编排
+│   ├── registry.rs      # Role 枚举 + ToolPerms + ApprovalChain + SDD 监听器 + SDD 管线编排
+│   ├── seam/            # 能力 seam traits（agent 与具体 provider 之间的边界）
+│   │   ├── mod.rs       #   模块根（re-export traits + 辅助类型）
+│   │   └── traits.rs    #   SandboxProvider / ShellExecutor / FileSystemProvider / ToolApproval / LlmAdapter
 │   ├── tools.rs         # 内置工具（read_file / edit_file / run_bash / write_file / web_fetch / web_search）
+│   ├── tools/           # 工具执行管线子模块
+│   │   └── pipeline.rs  #   TimeoutRetryTool + PipelineHooks（PreAction/PostAction）+ Pipeline 编排器
 │   ├── tools_ext/       # 动态工具模块（由 /add-tool 生成，需重新编译）
-│   │   └── mod.rs       # 动态工具模块（由 /add-tool 生成，需重新编译）
+│   │   └── mod.rs       #   动态工具模块（由 /add-tool 生成，需重新编译）
+│   ├── provider/        # 沙箱 provider 实现
+│   │   ├── mod.rs       #   模块根（re-export LandlockSandbox）
+│   │   └── landlock.rs  #   Landlock LSM 沙箱（Linux 回退方案，bwrap 探测）
 │   ├── sandbox.rs       # 文件系统沙箱（限制访问到项目根目录及子目录）
 │   ├── context.rs       # 上下文管理（token 估算 + 两层压缩 + 工具输出截断）
 │   ├── skills.rs        # 技能系统（运行时加载，无需重编译）
-│   ├── reviewer.rs      # 审计门控（两阶段评审）
-│   ├── memory.rs        # JSONL 对话记忆
+│   ├── reviewer.rs      # 两阶段审计门控（规格符合性 + 代码质量; Verdict: Approve/Reject/Clarify）
+│   ├── session_log.rs   # 会话事件日志（SessionEvent + SessionLog + derive_messages）
+│   ├── memory.rs        # JSONL 对话记忆 + NotesManager（agent 笔记）
 │   ├── model_history.rs # 模型使用历史持久化（~/.config/moye/models.json）
 │   ├── ui/              # TUI 表示层（ratatui + crossterm）
 │   │   ├── tui.rs       #   事件循环 + 渲染 + 输入处理
@@ -43,7 +53,7 @@ moye
 │   │   ├── selector.rs  #   交互式列表选择器（opencode 风格）
 │   │   └── mod.rs       #   模块根
 │   ├── cli/             # 命令行上下文
-│   │   ├── context.rs   #   AppContext + 命令分发
+│   │   ├── context.rs   #   AppContext + 命令分发 + --dump-config + 沙箱 provider 选择
 │   │   ├── repl.rs      #   命令解析
 │   │   └── mod.rs       #   模块根
 │   └── evolution/       # 自我进化（提示词进化 + 代码进化 + 工具扩展）
@@ -51,7 +61,7 @@ moye
 │       ├── prompt_evolve.rs  # 提示词进化
 │       ├── self_modify.rs    # 代码自修改（编译验证 + 回退）
 │       └── tool_ext.rs       # 工具扩展（脚手架生成）
-├── agent.toml           # 运行时配置（供应商 / 模型 / 权限 / 记忆）
+├── agent.toml           # 运行时配置（供应商 / 模型 / 权限 / 记忆 / 沙箱 / profile）
 ├── AGENTS.md            # 系统提示词（主 agent）
 ├── prompts/             # 各角色提示词（investigator / planner / builder / auditor）
 ├── docs/                # 文档（架构 / 上下文管理 / 对比 CrewAI）
@@ -77,6 +87,10 @@ moye
 | **文件系统沙箱** | Agent 默认只能访问项目根目录及子目录；访问其它目录需用户手动授权。 |
 | **联网工具** | 内置 `web_fetch`（抓取网页转纯文本）与 `web_search`（DuckDuckGo 搜索），权限按角色分级。 |
 | **模型历史** | 用过的模型持久化到 `~/.config/moye/models.json`，`/models` 选择器列出最近使用，一键切回。 |
+| **沙箱 Provider** | 启动时根据 `[sandbox].mode` 选择 OS 级沙箱：`auto` 探测 bwrap，`landlock` 为 LSM 回退，`off` 禁用。以 `SandboxProvider` seam trait 注入。 |
+| **工具管线** | 3 阶段执行：pre/post `PipelineHooks` + `TimeoutRetryTool` around-execute 包装器，由 rig 的 `HitlHook` 组合。 |
+| **Waterfall 事件** | 生命周期事件（AgentPreStep / ToolsPreExecute / ToolsPostExecute / AgentTurnStopping）分发给 emit / waterfall / serial 三种监听器。 |
+| **Profile 系统** | 声明式配置叠加（`[profile.<name>]` patches），解析时应用；`--dump-config` 查看合并后的配置树。 |
 
 ---
 
@@ -430,6 +444,39 @@ rules_file = "rules.json"
 [evolution]
 rule_escalation_threshold = 3
 
+[sandbox]
+# 高级沙箱模式（启动时选择，以 SandboxProvider seam trait 注入）：
+#   "auto"（默认）- SimpleSandbox 探测最强可用后端（bwrap / seatbelt / path）
+#   "bwrap"          - 显式指定 bwrap 后端（SimpleSandbox）
+#   "landlock"       - LandlockSandbox: Linux LSM 路径级访问控制（bwrap 不可用时的回退）
+#   "off" / "false" / "0" - 禁用 OS 级沙箱（仅在受信任环境使用）
+# 未识别的值回退到 "auto" 行为。
+mode = "auto"
+# 当 mode 为 auto / bwrap 时传递给 SimpleSandbox 的后端字符串（默认 "auto"）。
+# backend = "auto"
+# 预授权目录：Agent 访问这些目录时无需 HITL 确认。
+# authorized_dirs = ["/tmp"]
+
+[profile]
+# 激活的 profile 名称。所选 profile 的 patches 在解析时叠加到基础配置上
+# （整体替换，无深度合并）。优先级：
+#   AGENT_PROFILE 环境变量 > 此字段 > 无（向后兼容，基础配置不变）。
+# active = "fast"
+
+# 一个 profile 是一个有序的 patch 列表。每个 patch 通过 `id`（点分隔路径）
+# 定位配置树中的位置，用 `config`（TOML inline table）整体替换其值。
+# `id` 在基础配置中不存在时报错（fail-closed）。Profile 可通过 `base` 链式继承
+# （base 的 patches 先应用，再应用本 profile 的）。
+#
+# 示例："fast" profile 跳过调查、规划和审计，直接运行 Builder。
+# 通过 `active = "fast"` 或 `AGENT_PROFILE=fast` 选择。
+# [profile.fast]
+# name = "fast"
+# patches = [
+#   { id = "agent", config = { default_model = "deepseek-v4-flash", max_turns = 5 } },
+#   { id = "agents.auditor.permissions", config = { edit_file = "deny" } },
+# ]
+
 # 可选：全局 API key 存储（项目 .env / export 优先，缺失时回退此处）
 # [keys]
 # DEEPSEEK_API_KEY = "sk-xxx"
@@ -485,6 +532,98 @@ cargo run
 | `deny` | 直接拦截，不执行 | Planner/Auditor 的 `edit_file`、`run_bash_mutating`、Auditor 的 `web_fetch`/`web_search` |
 
 > 工具分类由 `is_readonly_bash()` 自动判断。只读命令（`ls`、`cat`、`git log` 等）自动归为 `run_bash_readonly`，其余归为 `run_bash_mutating`。`web_fetch` 和 `web_search` 也有独立的权限字段，默认为 `ask`。
+
+---
+
+## 沙箱 Provider
+
+除路径检查的文件系统沙箱外，moye 还在启动时根据 `[sandbox].mode` 选择 OS 级沙箱 provider。provider 构建一次后以 `Box<dyn SandboxProvider>` seam trait 注入，后端可替换无需修改工具代码。
+
+| 模式 | Provider | 隔离能力 | 适用场景 |
+|------|------|------|------|
+| `auto`（默认） | `SimpleSandbox` | 探测最强可用后端（bwrap 挂载命名空间 → seatbelt → 仅路径检查） | 推荐大多数场景 |
+| `bwrap` | `SimpleSandbox` | 显式 bwrap 后端 | 需要确保 bwrap 可用，否则启动失败 |
+| `landlock` | `LandlockSandbox` | Linux Landlock LSM 路径级访问控制（无挂载命名空间；弱于 bwrap） | Linux 5.13+ 且无 bwrap |
+| `off` / `false` / `0` | `SimpleSandbox`（禁用） | 无 OS 级隔离 | 仅受信任环境 |
+
+`LandlockSandbox` 是回退方案，而非与 bwrap 同等的 provider。其 `probe()` 在 bwrap 可用时返回 `Full`（bwrap 优先），仅 Landlock 可用时返回 `Partial`，两者都不可用时返回 `Unusable`。选择是 fail-closed 的：当 `mode = "landlock"` 且内核不支持 Landlock 且无 bwrap 时，provider 返回 `Unusable`，命令不执行。
+
+预授权目录（`[sandbox].authorized_dirs`）对路径检查沙箱和 OS 级 provider 都跳过 HITL 确认。
+
+---
+
+## 工具管线
+
+工具执行通过 3 阶段管线，组合在 rig 0.41 的 `AgentHook` before/after 回调之上。两个独立层分离关注点：
+
+| 层 | 机制 | 用途 |
+|------|------|------|
+| Pre/post hooks | `PipelineHooks`（`Vec<Box<dyn Fn>>` 监听器） | 每次工具调用前后运行；映射到 rig 的 `ToolCallAction` / `ToolResultAction` |
+| Around-execute | `TimeoutRetryTool<I: Tool>` 包装 `inner.call()` | 每次调用 `tokio::time::timeout`，超时重试（内部错误不重试） |
+
+**Pre-execute 动作**（`PreAction`）：`Run`（继续）、`Skip(reason)`（拒绝并将原因返回模型）、`Rewrite(args)`（替换参数后继续）。最后一个监听器的裁决生效。
+
+**Post-execute 动作**（`PostAction`）：`Keep`（透传）、`Rewrite(content)`（替换模型所见内容）、`Stop`（终止 agent 循环）。第一个非 `Keep` 动作短路。
+
+`Pipeline` 编排器将 `pre_execute` → 审批（`ApprovalChain`）→ `execute`（`TimeoutRetryTool`）→ `post_execute` 组合成可测试单元。生产环境中，rig 运行时通过 `HitlHook::on_tool_call` / `on_tool_result` 已串联这些阶段。
+
+---
+
+## Waterfall 事件
+
+线程安全的 `WaterfallRegistry` 在 rig 0.41 的 hook 回调之上分发生命周期事件。三种监听器覆盖不同需求：
+
+| 类型 | 分发方式 | 可短路？ | 典型用途 |
+|------|------|------|------|
+| `emit` | fire-and-forget，所有监听器都运行 | 否 | 日志、`SessionLog` |
+| `waterfall` | 顺序执行，每个获得 `(event, next)` | 是，跳过 `next()` 即终止 | 工具前后阶段 |
+| `serial` | 依次 `await` | 否（仅观察的异步） | 异步监听器（SDD 角色） |
+
+**事件**（`WaterfallEvent`）：`AgentPreStep`（角色 + 目标）、`AgentRequest`（消息）、`ToolsPreExecute`（工具 + 参数）、`ToolsPostExecute`（工具 + 结果 + 是否成功）、`AgentTurnStopping`（原因）。仅 `ToolsPreExecute` 和 `ToolsPostExecute` 支持 waterfall 模式。
+
+**动作**（`WaterfallAction`）：`Continue`（调用 `next()` 委托给后续链）或 `ShortCircuit`（不调用 `next()` 直接返回；后续监听器不运行）。空链返回 `Continue`。
+
+---
+
+## SDD 管线与监听器
+
+Investigator、Planner 和 Auditor 注册为 `WaterfallRegistry` 上的 serial 监听器，而非硬编码的顺序调用。`run_autonomous()` 派发 `AgentPreStep` 携带角色和目标；各监听器读写共享的 `PreStepState`（调查报告、计划、目标覆盖、逃逸标志、错误）来协调管线。
+
+| 监听器 | 触发事件 | 写入共享状态 |
+|------|------|------|
+| Investigator | `AgentPreStep`（Builder 角色） | `investigation`，或无需调查时设置 `escape` |
+| Planner | `AgentPreStep`，在 Investigator 之后 | `plan` |
+| Auditor | `AgentTurnStopping` | `AuditState.verdict`（Approve / Reject / Clarify） |
+
+**快速模式**：当激活的 profile 名为 `fast`（`[profile.fast]` 或 `AGENT_PROFILE=fast`）时，`run_sdd_pipeline` 跳过调查、规划和审计，直接运行 Builder。这是快速任务通道；默认 profile 保持完整 SDD 纪律。
+
+---
+
+## Profile 系统
+
+Profile 是在解析时叠加到基础 `agent.toml` 之上的声明式配置覆盖。一个 profile 是一个有序的 patch 列表；每个 patch 通过 `id`（点分隔路径）定位配置树中的位置，用 `config`（TOML inline table）整体替换其值。无深度合并，`id` 处的整个值被替换。
+
+选择优先级：`AGENT_PROFILE` 环境变量 > `[profile].active` 字段 > 无（向后兼容，基础配置不变）。
+
+```toml
+[profile]
+active = "fast"
+
+[profile.fast]
+name = "fast"
+patches = [
+  { id = "agent", config = { default_model = "deepseek-v4-flash", max_turns = 5 } },
+  { id = "sandbox", config = { mode = "landlock", authorized_dirs = [] } },
+]
+
+# Profile 可通过 `base` 链式继承（base 的 patches 先应用，再应用本 profile 的）：
+# [profile.strict]
+# name = "strict"
+# base = "fast"
+# patches = [ { id = "agents.auditor.permissions", config = { edit_file = "deny" } } ]
+```
+
+使用 `--dump-config` CLI 标志查看合并后的配置（基础 + profile 叠加），输出为 TOML 格式，选中 profile 时前缀带 `# Active profile: <name>` 注释。`id` 在基础配置中不存在的 patch 会报错（fail-closed），选择未知的 profile 名也会报错。
 
 ---
 
@@ -654,57 +793,13 @@ tracing_subscriber::EnvFilter::new("info,rig_core=off")
 
 ---
 
-## 项目结构
-
-```
-src/
-├── main.rs              # 入口：日志初始化 + 配置加载 + TUI 启动
-├── config.rs            # 统一配置模块（agent.toml 一次解析，全 crate 共享）
-├── event.rs             # 共享事件类型（AgentEvent + EventSender）
-├── agent_loop.rs        # 自主循环：AgentHook 实现 + HITL 门控
-├── providers.rs         # 多供应商统一接入（OpenAI 兼容）
-├── registry.rs          # 角色注册 + 工具权限分级 + SDD 管线编排
-├── tools.rs             # 内置工具（read_file / edit_file / run_bash / write_file / web_fetch / web_search）
-├── tools_ext/           # 动态工具模块（由 /add-tool 生成，需重新编译）
-│   └── mod.rs           #   动态工具模块（由 /add-tool 生成，需重新编译）
-├── sandbox.rs           # 文件系统沙箱（限制访问到项目根目录及子目录）
-├── context.rs           # 上下文管理（token 估算 + 两层压缩 + 工具输出截断）
-├── skills.rs            # 技能清单 + 注入逻辑
-├── reviewer.rs          # 两阶段审计门控（规格符合性 + 代码质量）
-├── memory.rs            # JSONL 对话记忆
-├── model_history.rs     # 模型使用历史持久化（~/.config/moye/models.json）
-├── ui/                  # TUI 表示层（ratatui + crossterm）
-│   ├── tui.rs           #   事件循环 + 渲染 + 输入处理 + TerminalGuard
-│   ├── markdown.rs      #   Markdown → ratatui Text 渲染器
-│   ├── theme.rs         #   颜色与样式定义
-│   ├── clipboard.rs     #   OSC52 剪贴板复制（穿透 SSH / tmux）
-│   ├── selection.rs     #   字符级文本选择状态机（鼠标拖拽选区）
-│   ├── selector.rs      #   交互式列表选择器（opencode 风格）
-│   └── mod.rs           #   模块根
-├── cli/                 # 命令行上下文
-│   ├── context.rs       #   AppContext + 命令分发 + 记忆集成
-│   ├── repl.rs          #   命令解析（ReplCommand）
-│   └── mod.rs           #   模块根
-└── evolution/           # 自我进化
-    ├── mod.rs           #   进化模块入口
-    ├── prompt_evolve.rs #   提示词进化（benchmark 防漂移）
-    ├── self_modify.rs   #   代码进化（evolve-code）
-    └── tool_ext.rs      #   工具扩展（add-tool）
-
-prompts/                  # 角色提示词文件
-skills/                  # 运行时技能文件（Markdown）
-memory/                  # 对话与经验记录
-logs/                    # 日志文件
-```
-
----
-
 ## 技术栈
 
 | 依赖 | 用途 |
 |------|------|
-| `rig-core 0.40` | LLM 框架（Agent / Tool / Hook / Runner） |
-| `rig-memory 0.40` | rig 记忆扩展 |
+| `rig-core 0.41` | LLM 框架（Agent / Tool / Hook / Runner） |
+| `rig-memory 0.41` | rig 记忆扩展 |
+| `rig-agent 0.41` | rig agent 扩展 |
 | `tokio` | 异步运行时 |
 | `ratatui 0.29` | TUI 框架（全屏渲染、布局、部件） |
 | `crossterm 0.28` | 终端后端（事件流、原始模式、alt-screen） |
@@ -717,6 +812,8 @@ logs/                    # 日志文件
 | `shlex 2` | Shell 命令分词（run_bash 解析） |
 | `futures 0.3` | 异步流处理（事件流） |
 | `dotenvy 0.15` | `.env` 文件自动加载 |
+| `landlock 0.4` | Linux Landlock LSM 沙箱（Linux 目标平台） |
+| `insta 1`（dev） | 快照测试 |
 
 ---
 

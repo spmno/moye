@@ -29,18 +29,7 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 加载项目根 .env（若存在）：把供应商/API Key/模型等配置写进 .env 一次，
-    // 之后无需每次启动前 export。已显式 export 的环境变量优先，不会被覆盖。
-    // Loads the project-root .env (if present): provider/API key/model config can be
-    // written to .env once, no need to export before every launch. Explicitly exported
-    // environment variables take precedence and are never overridden.
-    let env_file = dotenvy::dotenv().ok();
-
     init_logging();
-
-    if let Some(path) = env_file {
-        info!("[env] \u{8f7d}\u{5165}\u{4e86}\u{914d}\u{7f6e}\u{6587}\u{4ef6}: {}", path.display());
-    }
 
     // 统一解析 agent.toml（仅此一处），各模块共享同一份配置。
     // 若本地 agent.toml 和全局 config.toml 均不存在，启动首次配置向导。
@@ -49,6 +38,23 @@ async fn main() -> Result<()> {
     if !crate::config::has_config_file() {
         crate::ui::setup::run_setup().await?;
     }
+
+    // 加载项目根 .env（若存在）：把供应商/API Key/模型等配置写进 .env 一次，
+    // 之后无需每次启动前 export。已显式 export 的环境变量优先，不会被覆盖。
+    // 必须在 setup 向导之后加载——向导会写入 .env，若在此前加载则进程环境里
+    // 拿不到刚配置的 API Key（例如 ARK_API_KEY），随后构建客户端会报"未设置"。
+    // Loads the project-root .env (if present): provider/API key/model config can be
+    // written to .env once, no need to export before every launch. Explicitly exported
+    // environment variables take precedence and are never overridden.
+    // Must run after the setup wizard — the wizard writes .env; loading earlier would
+    // leave the just-configured API key (e.g. ARK_API_KEY) absent from the process env,
+    // and the client would then report it as "not set".
+    let env_file = dotenvy::dotenv().ok();
+
+    if let Some(path) = env_file {
+        info!("[env] \u{8f7d}\u{5165}\u{4e86}\u{914d}\u{7f6e}\u{6587}\u{4ef6}: {}", path.display());
+    }
+
     let config = crate::config::init("agent.toml")?;
     let mcp_manager = crate::mcp::McpManager::connect_all(&config.mcp).await;
     let sandbox_backend =

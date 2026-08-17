@@ -4,11 +4,14 @@
 // The `description()` of each tool is a natural-language prompt aimed at the model (LLM);
 // （本项目主要使用中文模型：DeepSeek / GLM / Kimi）。
 // (this project primarily uses Chinese models: DeepSeek / GLM / Kimi).
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
+use html2md_rs::to_md::safe_from_html_to_md;
 use rig_core::tool::PortableTool;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// 工具统一错误类型。
@@ -414,7 +417,10 @@ impl PortableTool for RunFile {
 fn build_web_client() -> std::result::Result<reqwest::Client, ToolError> {
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .user_agent("moye/0.0.1 (web tool)");
+        .user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        );
     let proxy_url = std::env::var("AGENT_PROXY")
         .or_else(|_| std::env::var("HTTPS_PROXY"))
         .or_else(|_| std::env::var("HTTP_PROXY"))
@@ -426,6 +432,24 @@ fn build_web_client() -> std::result::Result<reqwest::Client, ToolError> {
         builder = builder.proxy(proxy);
     }
     builder.build().map_err(|e| ToolError(e.to_string()))
+}
+
+/// 将 HTML 转换为 Markdown，保留标题/列表/代码块/链接等结构；
+/// 转换失败时退化为纯文本剥离。
+/// Converts HTML to Markdown, preserving headings/lists/code blocks/links;
+/// falls back to plain-text stripping on failure.
+fn html_to_markdown(html: &str) -> String {
+    match safe_from_html_to_md(html.to_string()) {
+        Ok(md) => {
+            let trimmed = md.trim();
+            if trimmed.is_empty() {
+                strip_html(html)
+            } else {
+                trimmed.to_string()
+            }
+        }
+        Err(_) => strip_html(html),
+    }
 }
 
 /// 抓取网页内容并转为纯文本返回。自动去除 HTML 标签、script/style 块，
@@ -452,7 +476,7 @@ impl PortableTool for WebFetch {
     /// 返回面向 LLM 的工具描述（中文）。
     /// Returns the LLM-facing tool description (Chinese).
     fn description(&self) -> String {
-        "抓取指定 URL 的网页内容，返回纯文本（自动去除 HTML 标签）。支持 HTTP/HTTPS。"
+        "抓取指定 URL 的网页内容，返回 Markdown（自动去除脚本/样式，保留标题、列表、代码块与链接）。支持 HTTP/HTTPS。"
             .to_string()
     }
 
@@ -490,7 +514,7 @@ impl PortableTool for WebFetch {
             .await
             .map_err(|e| ToolError(format!("读取响应体失败: {e}")))?;
         let text = if content_type.contains("text/html") || content_type.contains("application/xhtml") {
-            strip_html(&body)
+            html_to_markdown(&body)
         } else {
             body
         };
@@ -513,30 +537,49 @@ impl PortableTool for WebFetch {
     }
 }
 
-/// `web_search` 工具的输入参数：一个查询关键词。
-/// Input args for the `web_search` tool: a single query keyword.
+/// `web_search` 工具的输入参数：查询关键词 + 可选的结果数量与搜索深度。
+/// Input args for the `web_search` tool: query keyword + optional result count and depth.
 #[derive(Deserialize)]
 struct WebSearchArgs {
     query: String,
+    #[serde(default = "default_max_results")]
+    max_results: usize,
+    #[serde(default = "default_search_depth")]
+    search_depth: String,
 }
 
-/// 用 DuckDuckGo HTML 端点（lite 版）搜索网络，返回标题、摘要与链接。
-/// Searches the web via the DuckDuckGo HTML (lite) endpoint, returning title, snippet, and URL.
+fn default_max_results() -> usize {
+    5
+}
+
+fn default_search_depth() -> String {
+    "basic".to_string()
+}
+
+/// 进程内搜索结果缓存：同一会话内重复查询不重复消耗 Tavily 额度。
+/// In-process search cache: repeated queries within a session don't re-consume Tavily quota.
+static WEB_SEARCH_CACHE: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 搜索网络：优先 Tavily API（结构化正文），无密钥时回退 DuckDuckGo + 全文抓取。
+/// Searches the web: prefers the Tavily API (structured content), falling back to
+/// DuckDuckGo + full-text fetch when no API key is configured.
 ///
-/// 历史背景：早期使用 Instant Answer API（api.duckduckgo.com/?format=json），
-/// 但该 API 只对维基百科类实体查询有效，对绝大多数普通查询返回空结果——
-/// 这就是"搜索不好用"的根本原因。HTML 端点 `html.duckduckgo.com/html/` 返回
-/// 真正的搜索结果页，我们手写一个极简解析器提取 `<a class="result__a">`
-/// 和 `<a class="result__snippet">`，无需引入 HTML 解析库。
-/// Historical note: the previous Instant Answer JSON API only returned useful
-/// results for Wikipedia-style entities and was empty for most queries — that
-/// was the root cause of "search doesn't work". The HTML endpoint returns a
-/// real SERP which we parse with a tiny hand-rolled extractor, avoiding a new
-/// HTML-parser dependency.
+/// 历史背景：早期使用 Instant Answer API（api.duckduckgo.com/?format=json）对绝大多数
+/// 普通查询返回空结果；后改用 HTML 端点手写解析器，但仅能拿到标题+摘要（snippet），
+/// 模型仍需二次 web_fetch 才能获得正文。现改为：设置 `TAVILY_API_KEY` 时走 Tavily
+/// 官方 API（每条结果自带清洗后的正文 `content`，并可返回 AI 综合回答），体验对齐
+/// 主流搜索工具；未配置密钥时回退到 DuckDuckGo HTML 端点，并自动抓取首条结果的
+/// 全文 Markdown，省去模型的多余调用。
+/// Historical note: the old DDG HTML endpoint only returned titles + snippets, forcing the
+/// model to do extra web_fetch round-trips for full text. We now use the Tavily API
+/// (TAVILY_API_KEY) for structured per-result content and an AI answer, matching mainstream
+/// search tools; without a key we fall back to the DDG HTML endpoint and auto-fetch the top
+/// result's full Markdown.
 struct WebSearch;
 
-/// 实现 `web_search` 工具：请求 DuckDuckGo HTML 端点并解析结果。
-/// Implements the `web_search` tool: requests the DuckDuckGo HTML endpoint and parses results.
+/// 实现 `web_search` 工具：先尝试 Tavily，失败或无密钥则回退 DuckDuckGo。
+/// Implements `web_search`: tries Tavily first, then falls back to DuckDuckGo.
 impl PortableTool for WebSearch {
     const NAME: &'static str = "web_search";
     type Error = ToolError;
@@ -546,7 +589,7 @@ impl PortableTool for WebSearch {
     /// 返回面向 LLM 的工具描述（中文）。
     /// Returns the LLM-facing tool description (Chinese).
     fn description(&self) -> String {
-        "在互联网上搜索给定查询，返回若干条结果（标题、摘要、链接）。使用 DuckDuckGo 搜索引擎。"
+        "仅在必要时联网搜索（Tavily 有额度限制）：通用常识、训练知识内已知的事实、或已知 URL 都不要搜索；已知 URL 请直接用 web_fetch 抓取。确需搜索时返回标题、URL、正文摘要与（Tavily 时）AI 综合回答；未配置 TAVILY_API_KEY 时回退到 DuckDuckGo。"
             .to_string()
     }
 
@@ -556,60 +599,263 @@ impl PortableTool for WebSearch {
         json!({
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "搜索查询关键词" }
+                "query": { "type": "string", "description": "搜索查询关键词" },
+                "max_results": { "type": "integer", "description": "返回结果数量（1-10，默认 5）" },
+                "search_depth": { "type": "string", "enum": ["basic", "advanced"], "description": "搜索深度：basic 更快省额度（默认），advanced 更全面但更贵" }
             },
             "required": ["query"],
         })
     }
 
-    /// 执行工具：POST 到 DuckDuckGo HTML 端点，解析结果块并格式化。
-    /// Executes the tool: POSTs to the DuckDuckGo HTML endpoint, parses result blocks, formats them.
+    /// 执行工具：先查进程内缓存，再 Tavily，失败/无密钥则 DuckDuckGo 兜底。
+    /// Executes the tool: checks the in-process cache first, then Tavily, then DuckDuckGo.
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        const MAX_RESULTS: usize = 8;
+        let max_results = args.max_results.clamp(1, 10);
+        let depth = if args.search_depth == "basic" { "basic" } else { "advanced" };
+
+        // 缓存命中直接返回：同一 query 同一会话内不重复烧额度。
+        // Cache hit: return immediately — don't double-burn quota for the same query in a session.
+        let cache_key = format!("{}|{max_results}|{depth}", args.query.trim().to_lowercase());
+        if let Some(cached) = WEB_SEARCH_CACHE
+            .lock()
+            .ok()
+            .and_then(|c| c.get(&cache_key).cloned())
+        {
+            return Ok(cached);
+        }
+
         let client = build_web_client()?;
-        let resp = client
-            .get("https://html.duckduckgo.com/html/")
-            .header("Accept", "text/html,application/xhtml+xml")
-            .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-            .query(&[("q", args.query.as_str())])
-            .send()
-            .await
-            .map_err(|e| ToolError(format!(
-                "搜索请求失败: {e}。提示: 在中国大陆可能需要设置代理，如 export AGENT_PROXY=http://127.0.0.1:7890"
-            )))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(ToolError(format!("搜索返回 HTTP {status}")));
-        }
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| ToolError(format!("读取搜索响应失败: {e}")))?;
-        let results = parse_ddg_html(&body);
 
-        if results.is_empty() {
-            return Ok(format!(
-                "未找到与「{}」相关的结果。可尝试更换关键词，或用 web_fetch 直接抓取已知 URL。",
-                args.query
-            ));
-        }
-
-        let mut parts = Vec::with_capacity(results.len() * 2 + 1);
-        parts.push(format!("搜索结果（共 {} 条，显示前 {} 条）:", results.len(), results.len().min(MAX_RESULTS)));
-        for (i, item) in results.iter().take(MAX_RESULTS).enumerate() {
-            let title = item.title.trim();
-            let snippet = item.snippet.trim();
-            if snippet.is_empty() {
-                parts.push(format!("  {}. {title}\n     {}", i + 1, item.url));
+        let output: String = if let Ok(key) = std::env::var("TAVILY_API_KEY") {
+            if !key.trim().is_empty() {
+                match tavily_search(&client, &key, &args.query, max_results, depth).await {
+                    Ok(output) => output,
+                    Err(e) => {
+                        let quota_exhausted = e.0.contains("额度已用尽");
+                        tracing::warn!("Tavily 搜索失败，回退 DuckDuckGo: {e}");
+                        let mut out = ddg_search(&client, &args.query, max_results).await?;
+                        if quota_exhausted {
+                            out = format!(
+                                "[提示] Tavily 额度已用尽或限流，本次已改用免费 DuckDuckGo（质量可能下降）。请尽量少用 web_search，或改用 web_fetch 抓取已知 URL。\n\n{out}"
+                            );
+                        }
+                        out
+                    }
+                }
             } else {
-                parts.push(format!("  {}. {title}\n     {snippet}\n     {}", i + 1, item.url));
+                ddg_search(&client, &args.query, max_results).await?
             }
+        } else {
+            ddg_search(&client, &args.query, max_results).await?
+        };
+
+        if let Ok(mut cache) = WEB_SEARCH_CACHE.lock() {
+            cache.insert(cache_key, output.clone());
         }
-        if results.len() > MAX_RESULTS {
-            parts.push(format!("  …（还有 {} 条结果已省略）", results.len() - MAX_RESULTS));
-        }
-        Ok(parts.join("\n"))
+        Ok(output)
     }
+}
+
+/// Tavily 请求体。
+/// Tavily request body.
+#[derive(Serialize)]
+struct TavilyRequest {
+    api_key: String,
+    query: String,
+    search_depth: String,
+    max_results: usize,
+    include_answer: bool,
+}
+
+/// Tavily 响应体。
+/// Tavily response body.
+#[derive(Deserialize)]
+struct TavilyResponse {
+    #[serde(default)]
+    answer: Option<String>,
+    #[serde(default)]
+    results: Vec<TavilyResult>,
+}
+
+/// Tavily 单条结果。
+/// A single Tavily result.
+#[derive(Deserialize)]
+struct TavilyResult {
+    title: String,
+    url: String,
+    content: String,
+    #[serde(default)]
+    score: Option<f64>,
+}
+
+/// 调用 Tavily Search API 并格式化为文本。
+/// Calls the Tavily Search API and formats the response as text.
+async fn tavily_search(
+    client: &reqwest::Client,
+    key: &str,
+    query: &str,
+    max_results: usize,
+    depth: &str,
+) -> Result<String, ToolError> {
+    let req = TavilyRequest {
+        api_key: key.to_string(),
+        query: query.to_string(),
+        search_depth: depth.to_string(),
+        max_results,
+        include_answer: true,
+    };
+    let resp = client
+        .post("https://api.tavily.com/search")
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| ToolError(format!(
+            "Tavily 请求失败: {e}。提示: 在中国大陆可能需要设置代理，如 export AGENT_PROXY=http://127.0.0.1:7890"
+        )))?;
+    let status = resp.status();
+    if !status.is_success() {
+        // 429 = 限流，402 = 额度/付费问题；其余为一般错误。
+        // 429 = rate limited, 402 = quota/payment; the rest are generic errors.
+        let code = status.as_u16();
+        let msg = match code {
+            429 | 402 => format!("Tavily 额度已用尽或被限流（HTTP {status}）"),
+            _ => format!("Tavily 返回 HTTP {status}"),
+        };
+        return Err(ToolError(msg));
+    }
+    let parsed: TavilyResponse = resp
+        .json()
+        .await
+        .map_err(|e| ToolError(format!("解析 Tavily 响应失败: {e}")))?;
+
+    if parsed.results.is_empty() && parsed.answer.as_deref().map_or(true, |a| a.trim().is_empty()) {
+        return Err(ToolError("Tavily 返回空结果".into()));
+    }
+
+    let mut parts = Vec::with_capacity(parsed.results.len() + 2);
+    if let Some(answer) = parsed.answer.as_deref().filter(|a| !a.trim().is_empty()) {
+        parts.push(format!("AI 综合回答：\n{answer}\n"));
+    }
+    parts.push(format!("搜索结果（共 {} 条）:", parsed.results.len()));
+    for (i, r) in parsed.results.iter().enumerate() {
+        let title = r.title.trim();
+        let content = r.content.trim();
+        let score = r
+            .score
+            .map(|s| format!("（相关度 {:.0}%）", (s * 100.0).round()))
+            .unwrap_or_default();
+        if content.is_empty() {
+            parts.push(format!("  {}. {title}{score}\n     {}", i + 1, r.url));
+        } else {
+            parts.push(format!("  {}. {title}{score}\n     {content}\n     {}", i + 1, r.url));
+        }
+    }
+    Ok(parts.join("\n"))
+}
+
+/// 回退搜索：请求 DuckDuckGo HTML 端点，解析结果并抓取首条结果的全文 Markdown。
+/// Fallback search: requests the DDG HTML endpoint, parses results, and fetches the
+/// top result's full Markdown (saves the model a follow-up web_fetch round-trip).
+async fn ddg_search(
+    client: &reqwest::Client,
+    query: &str,
+    max_results: usize,
+) -> Result<String, ToolError> {
+    let resp = client
+        .get("https://html.duckduckgo.com/html/")
+        .header("Accept", "text/html,application/xhtml+xml")
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .query(&[("q", query)])
+        .send()
+        .await
+        .map_err(|e| ToolError(format!(
+            "搜索请求失败: {e}。提示: 在中国大陆可能需要设置代理，如 export AGENT_PROXY=http://127.0.0.1:7890"
+        )))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(ToolError(format!("搜索返回 HTTP {status}")));
+    }
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| ToolError(format!("读取搜索响应失败: {e}")))?;
+    let results = parse_ddg_html(&body);
+
+    if results.is_empty() {
+        return Ok(format!(
+            "未找到与「{query}」相关的结果。可尝试更换关键词，或用 web_fetch 直接抓取已知 URL。"
+        ));
+    }
+
+    let mut parts = Vec::with_capacity(results.len() * 2 + 2);
+    parts.push(format!("搜索结果（共 {} 条，显示前 {} 条）:", results.len(), results.len().min(max_results)));
+    for (i, item) in results.iter().take(max_results).enumerate() {
+        let title = item.title.trim();
+        let snippet = item.snippet.trim();
+        if snippet.is_empty() {
+            parts.push(format!("  {}. {title}\n     {}", i + 1, item.url));
+        } else {
+            parts.push(format!("  {}. {title}\n     {snippet}\n     {}", i + 1, item.url));
+        }
+    }
+    if results.len() > max_results {
+        parts.push(format!("  …（还有 {} 条结果已省略）", results.len() - max_results));
+    }
+
+    // P3：抓取首条结果的全文 Markdown，省去模型的二次 web_fetch。
+    if let Some(top) = results.first() {
+        if let Some(md) = fetch_page_markdown(client, &top.url, 4000).await {
+            parts.push(format!("\n── 首条结果全文（Markdown）──\n{md}"));
+        }
+    }
+
+    Ok(parts.join("\n"))
+}
+
+/// 抓取 URL 并转换为 Markdown，返回前 `max_chars` 个字符；失败返回 None。
+/// Fetches a URL and converts to Markdown, truncated to `max_chars`; returns None on failure.
+async fn fetch_page_markdown(
+    client: &reqwest::Client,
+    url: &str,
+    max_chars: usize,
+) -> Option<String> {
+    let resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = resp.text().await.ok()?;
+    let markdown = if ct.contains("text/html") || ct.contains("application/xhtml") {
+        html_to_markdown(&body)
+    } else {
+        body
+    };
+    let (truncated, was_truncated) = truncate_chars(&markdown, max_chars);
+    if was_truncated {
+        Some(format!("{truncated}…(截断，共 {} 字符)", markdown.chars().count()))
+    } else {
+        Some(truncated)
+    }
+}
+
+/// 在 UTF-8 字符边界处截断字符串，返回 (截断结果, 是否发生了截断)。
+/// Truncates a string at a UTF-8 char boundary; returns (result, was_truncated).
+fn truncate_chars(s: &str, max: usize) -> (String, bool) {
+    if s.len() <= max {
+        return (s.to_string(), false);
+    }
+    let end = s
+        .char_indices()
+        .take_while(|(i, _)| *i <= max)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    (s[..end].to_string(), true)
 }
 
 /// DuckDuckGo HTML 端点解析出的单条搜索结果。

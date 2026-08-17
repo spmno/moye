@@ -23,7 +23,8 @@ futures = "0.3"
 ratatui = { version = "0.30", features = ["crossterm"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 pulldown-cmark = "0.13"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query"] }
+html2md-rs = "0.12"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query", "gzip", "brotli", "deflate"] }
 dotenvy = "0.15.7"
 libc = "0.2"
 rig-agent = { version = "0.41", features = ["rmcp"] }

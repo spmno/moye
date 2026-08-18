@@ -5,10 +5,11 @@
 /// TUI command dispatch and task execution.
 use crate::event::{AgentEvent, EventSender};
 use crate::evolution::prompt_evolve::PromptEvolver;
-use crate::memory::{Lesson, MemoryStore, Turn};
+use crate::memory::{Lesson, MemoryStore};
 use crate::model_history::ModelHistory;
 use crate::registry::{AgentRegistry, Orchestrator};
 use crate::seam::SandboxProvider;
+use crate::session::Session;
 use crate::{evolution, skills};
 use std::sync::{Arc, Mutex};
 
@@ -100,6 +101,11 @@ pub struct AppContext {
     pub memory: MemoryStore,
     pub evolver: PromptEvolver,
     pub rule_threshold: usize,
+    /// 当前用户级会话（每次打开工具对应一次）。记录本次任务的完整对话，
+    /// `--continue` 时会复用上一次会话。
+    /// The current user-level session (one per tool invocation). Records the full
+    /// conversation of this invocation; `--continue` reuses the previous session.
+    pub session: Arc<Mutex<Session>>,
     /// 跨会话持久化的模型历史，供 `/models` 选择器列出"最近使用"分区。
     /// Cross-session persisted model history, listed as a "recently used" section in `/models`.
     pub model_history: Arc<Mutex<ModelHistory>>,
@@ -292,28 +298,31 @@ impl AppContext {
     /// `/history [n]`: load and format the last n turns of conversation (default 10).
     pub fn cmd_history(&self, limit: Option<usize>) -> String {
         let limit = limit.unwrap_or(10);
-        match self.memory.load_turns(Some(limit)) {
-            Ok(turns) if turns.is_empty() => {
-                "\u{ff08}\u{6682}\u{65e0}\u{5bf9}\u{8bdd}\u{8bb0}\u{5f55}\u{ff09}".to_string()
-            }
-            Ok(turns) => {
-                let mut out = format!(
-                    "\u{2500}\u{2500}\u{2500} \u{6700}\u{8fd1} {} \u{8f6e}\u{5bf9}\u{8bdd} \u{2500}\u{2500}\u{2500}",
-                    turns.len()
-                );
-                for t in &turns {
-                    let role = match t.role.as_str() {
-                        "user" => "\u{7528}\u{6237}",
-                        "agent" => "Agent",
-                        other => other,
-                    };
-                    let preview = truncate(&t.content, 200);
-                    out.push_str(&format!("\n  [{role}] {preview}"));
-                }
-                out
-            }
-            Err(e) => format!("history error: {e}"),
+        let session = self.session.lock().unwrap();
+        let turns = session.turns();
+        let turns: Vec<_> = if turns.len() > limit {
+            turns[turns.len() - limit..].to_vec()
+        } else {
+            turns.to_vec()
+        };
+        if turns.is_empty() {
+            return "\u{ff08}\u{6682}\u{65e0}\u{5bf9}\u{8bdd}\u{8bb0}\u{5f55}\u{ff09}".to_string();
         }
+        let mut out = format!(
+            "\u{5f53}\u{524d}\u{4f1a}\u{8bdd} {} \u{ff08}\u{6700}\u{8fd1} {} \u{8f6e}\u{ff09}",
+            session.meta.id,
+            turns.len()
+        );
+        for t in &turns {
+            let role = match t.role.as_str() {
+                "user" => "\u{7528}\u{6237}",
+                "agent" => "Agent",
+                other => other,
+            };
+            let preview = truncate(&t.content, 200);
+            out.push_str(&format!("\n  [{role}] {preview}"));
+        }
+        out
     }
 
     /// `/lessons`：加载并格式化已积累的经验教训清单。
@@ -344,19 +353,15 @@ impl AppContext {
     pub async fn run_goal_tui(&self, goal: &str, tx: &EventSender) {
         match self.orchestrator.handle(goal, tx).await {
             Ok(out) => {
-                // consume_stream already emitted AgentEvent::Agent — only record memory here.
-                // consume_stream 已经发送过 AgentEvent::Agent —— 这里只负责落记忆。
+                // consume_stream already emitted AgentEvent::Agent — record the session
+                // conversation here (and extract a lesson from it).
+                // consume_stream 已经发送过 AgentEvent::Agent —— 这里负责记录会话对话并提取教训。
                 let ts = now();
-                let _ = self.memory.append_turn(&Turn {
-                    role: "user".into(),
-                    content: goal.into(),
-                    ts,
-                });
-                let _ = self.memory.append_turn(&Turn {
-                    role: "agent".into(),
-                    content: out.clone(),
-                    ts,
-                });
+                {
+                    let mut session = self.session.lock().unwrap();
+                    let _ = session.append_turn("user", goal);
+                    let _ = session.append_turn("agent", &out);
+                }
 
                 let summary = format!(
                     "\u{4efb}\u{52a1}: {goal} \u{2192} \u{4ea7}\u{51fa}: {}",

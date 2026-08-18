@@ -17,6 +17,7 @@ mod registry;
 mod reviewer;
 mod sandbox;
 mod seam;
+mod session;
 mod session_log;
 mod skills;
 mod tools;
@@ -77,6 +78,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `--continue`：继续上一次会话（加载最新 session 的对话注入 Orchestrator 历史）。
+    // `--continue`: resume the most recent session (inject its conversation into the
+    // Orchestrator's history).
+    let resume = cli_args.iter().any(|a| a == "--continue");
+
     let mcp_manager = crate::mcp::McpManager::connect_all(&config.mcp).await;
     // 根据 [sandbox].mode 选择 OS 级沙箱 provider（todo 8）：
     // - "landlock": 用 LandlockSandbox（bwrap 不可用时的 fallback）
@@ -94,6 +100,26 @@ async fn main() -> Result<()> {
     let memory = memory::MemoryStore::new(&config.memory)?;
     let rule_threshold = config.evolution.rule_escalation_threshold;
 
+    // 会话：新建或继续。--continue 时加载最新会话并恢复其对话历史。
+    // Session: start fresh or resume. With --continue, load the latest session and
+    // restore its conversation into the Orchestrator's history.
+    let session_store = crate::session::SessionStore::new(&config.memory.dir);
+    let session = match resume {
+        true => match session_store.latest()? {
+            Some(s) => {
+                orchestrator.seed_history(s.messages());
+                info!("[session] \u{7ee7}\u{7eed}\u{4f1a}\u{8bdd} / resumed session {}", s.meta.id);
+                s
+            }
+            None => {
+                info!("[session] \u{65e0}\u{53ef}\u{7ee7}\u{7eed}\u{7684}\u{4f1a}\u{8bdd}\u{ff0c}\u{5f00}\u{59cb}\u{65b0}\u{4f1a}\u{8bdd} / no session to resume, starting a new one");
+                session_store.start()?
+            }
+        },
+        false => session_store.start()?,
+    };
+    let session = Arc::new(Mutex::new(session));
+
     // 加载跨会话模型历史（~/.config/moye/models.json）；失败时回退空历史，不阻断启动。
     // Load cross-session model history (~/.config/moye/models.json); fall back to empty
     // on failure without blocking startup.
@@ -105,6 +131,7 @@ async fn main() -> Result<()> {
         memory,
         evolver,
         rule_threshold,
+        session,
         model_history,
     });
 

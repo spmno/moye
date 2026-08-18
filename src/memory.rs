@@ -91,6 +91,9 @@ impl MemoryStore {
 
     /// 追加一轮对话到会话 JSONL 文件。
     /// Append a conversation turn to the JSONL conversation file.
+    /// 已被 `SessionStore`（src/session.rs）取代，保留以便兼容旧路径。
+    /// Superseded by `SessionStore` (src/session.rs); kept for backward compatibility.
+    #[allow(dead_code)]
     pub fn append_turn(&self, turn: &Turn) -> Result<()> {
         let line = serde_json::to_string(turn)?;
         use std::io::Write;
@@ -120,6 +123,9 @@ impl MemoryStore {
     /// Load recent conversation turns (per-line JSONL deserialization).
     /// `limit` of None returns all; `Some(n)` returns only the last n turns.
     /// Unparseable lines are skipped silently (no error).
+    /// 已被 `SessionStore`（src/session.rs）取代，保留以便兼容旧路径。
+    /// Superseded by `SessionStore` (src/session.rs); kept for backward compatibility.
+    #[allow(dead_code)]
     pub fn load_turns(&self, limit: Option<usize>) -> Result<Vec<Turn>> {
         if !self.conversation_file.exists() {
             return Ok(vec![]);

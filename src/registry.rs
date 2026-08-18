@@ -1088,6 +1088,19 @@ impl Orchestrator {
         self.trust_sandbox.clone()
     }
 
+    /// 用 `--continue` 会话的对话历史替换当前历史，让新会话继承上一轮的上下文。
+    /// Replaces the current history with a resumed session's conversation, so the
+    /// new session inherits prior context (`--continue`).
+    pub fn seed_history(&self, messages: Vec<Message>) {
+        let mut history = self.history.lock().unwrap();
+        *history = messages;
+        info!(
+            "[session] \u{6062}\u{590d}\u{4e86} {} \u{6761}\u{5386}\u{53f2}\u{6d88}\u{606f} / restored {} history messages",
+            history.len(),
+            history.len()
+        );
+    }
+
     pub async fn handle(&self, message: &str, tx: &EventSender) -> anyhow::Result<String> {
         let history = self.history.lock().unwrap().clone();
         let intent = classify_intent(message, &history, &self.registry).await;

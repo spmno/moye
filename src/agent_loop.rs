@@ -1196,8 +1196,7 @@ fn build_runner_agent(registry: &AgentRegistry, role: Role) -> anyhow::Result<Ag
         .role_config(role)
         .ok_or_else(|| anyhow::anyhow!("no config for role {role:?}"))?;
     let client = registry.create_client()?;
-    let preamble = std::fs::read_to_string(&rc.preamble)
-        .unwrap_or_else(|_| format!("\u{4f60}\u{662f} {role:?} agent\u{3002}"));
+    let preamble = crate::prompts::load(role, &rc.preamble);
     let preamble = crate::registry::inject_skills_public(&preamble);
     let model = registry.session_model().unwrap_or_else(|| rc.model.clone());
     let max_turns = registry.max_turns_for_role(role);

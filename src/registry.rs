@@ -430,8 +430,7 @@ impl AgentRegistry {
             .get(&key)
             .ok_or_else(|| anyhow::anyhow!("no config for role {key}"))?;
         let client = self.create_client()?;
-        let preamble =
-            std::fs::read_to_string(&rc.preamble).unwrap_or_else(|_| format!("你是 {key} agent。"));
+        let preamble = crate::prompts::load(role, &rc.preamble);
         // 把与角色领域相关的技能指令注入提示词，使模型遵循技能中的步骤。
         // Injects role-domain skill instructions into the preamble so the model follows the steps in skills.
         let preamble = inject_skills_public(&preamble);
@@ -839,6 +838,14 @@ pub fn sdd_clarify_response(question: &str, built: &str) -> String {
     format!("需需要澄清：{question}\n\n已产出的工作：\n{built}")
 }
 
+/// 判断构建者产出是否为退化输出（空白或过短），用于拦截静默失败。
+/// Returns true when a Builder output is degenerate (blank or too short),
+/// used to intercept silent failures before they are returned as final results.
+pub fn is_degenerate_output(s: &str) -> bool {
+    let trimmed = s.trim();
+    trimmed.is_empty() || trimmed.chars().count() < 4
+}
+
 // ── todo 12: Investigator + Planner as agent_pre_step waterfall listeners ──
 
 /// Registers an `InvestigatorListener` on the shared waterfall. When the
@@ -1209,7 +1216,7 @@ impl Orchestrator {
                     "[SDD] 审计驳回，带反馈重试一次 / Audit rejected, retrying with feedback:\n  · 驳回原因: {reason}"
                 )));
                 let retry = sdd_retry_prompt(message, &plan, &built, &reason);
-                crate::agent_loop::run_autonomous(
+                let rebuilt = crate::agent_loop::run_autonomous(
                     &self.registry,
                     &self.sandbox,
                     self.trust_sandbox.clone(),
@@ -1220,7 +1227,50 @@ impl Orchestrator {
                     None,
                     None,
                 )
-                .await
+                .await?;
+
+                // 拦截退化产出（空白/过短），避免静默失败被当作成功返回。
+                // Intercept degenerate output (blank/too short) to avoid silently
+                // returning a silent failure as success.
+                if is_degenerate_output(&rebuilt) {
+                    let _ = tx.send(AgentEvent::Error(format!(
+                        "[SDD] 重试产出无效（空白或过短），任务未完成 / Retry produced degenerate output, task incomplete: {:?}",
+                        rebuilt.trim()
+                    )));
+                    return Ok(format!(
+                        "任务未完成：审计驳回后重试仍没有产出有效内容。\n\
+                         [System] Task incomplete: the retry after audit rejection produced no meaningful output."
+                    ));
+                }
+
+                // 重试产出仍需通过审计，而非直接当作最终结果。
+                // The retry output must still pass audit, rather than being returned directly.
+                *audit_state.built.lock().unwrap() = Some(rebuilt.clone());
+                let stop_event = WaterfallEvent::AgentTurnStopping {
+                    reason: "retry-completed".to_string(),
+                };
+                waterfall.emit(&stop_event);
+                waterfall.serial(&stop_event).await;
+
+                let verdict = audit_state
+                    .verdict
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap_or(crate::reviewer::Verdict::Approve);
+
+                match verdict {
+                    crate::reviewer::Verdict::Approve => Ok(rebuilt),
+                    crate::reviewer::Verdict::Reject(reason) => {
+                        let _ = tx.send(AgentEvent::Error(format!(
+                            "[SDD] 重试后审计仍驳回，任务未完成 / Retry still rejected: {reason}"
+                        )));
+                        Ok(format!(
+                            "{rebuilt}\n\n[未通过审计 / Audit rejected again]\n{reason}"
+                        ))
+                    }
+                    crate::reviewer::Verdict::Clarify(q) => Ok(sdd_clarify_response(&q, &rebuilt)),
+                }
             }
             crate::reviewer::Verdict::Clarify(q) => Ok(sdd_clarify_response(&q, &built)),
         }
@@ -1230,6 +1280,16 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn degenerate_output_detection() {
+        assert!(is_degenerate_output(""));
+        assert!(is_degenerate_output("   "));
+        assert!(is_degenerate_output(" \n\t "));
+        assert!(is_degenerate_output("abc"));
+        assert!(!is_degenerate_output("-between"));
+        assert!(!is_degenerate_output("created three files"));
+    }
 
     #[test]
     fn keyword_fallback_upgrade_keywords() {

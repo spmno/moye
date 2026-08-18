@@ -12,6 +12,7 @@ mod memory;
 mod model_history;
 mod provider;
 mod providers;
+mod prompts;
 mod registry;
 mod reviewer;
 mod sandbox;

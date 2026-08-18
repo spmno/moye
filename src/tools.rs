@@ -970,7 +970,7 @@ fn parse_ddg_html(html: &str) -> Vec<SearchResult> {
 
         // 在该结果块后续一小段窗口内找 result__snippet
         // Look for result__snippet within a short window after this anchor
-        let window_end = (after_close + 4096).min(html.len());
+        let window_end = lower.floor_char_boundary((after_close + 4096).min(lower.len()));
         let snippet = lower[after_close..window_end]
             .find("result__snippet")
             .and_then(|rel| {
@@ -990,7 +990,8 @@ fn parse_ddg_html(html: &str) -> Vec<SearchResult> {
                     .map(|end| content_start + end)
             })
             .map(|content_end| {
-                let start = content_end.saturating_sub(2048).max(after_close);
+                let content_end = html.floor_char_boundary(content_end.min(html.len()));
+                let start = html.floor_char_boundary(content_end.saturating_sub(2048).max(after_close));
                 strip_html_inline(&html[start..content_end])
             })
             .unwrap_or_default();

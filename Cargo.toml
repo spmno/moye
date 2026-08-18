@@ -20,6 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "time", "local
 chrono = "0.4"
 shlex = "2"
 futures = "0.3"
+bytes = "1"
 ratatui = { version = "0.30", features = ["crossterm"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 pulldown-cmark = "0.13"

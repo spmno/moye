@@ -20,7 +20,7 @@ use rig_agent::agent::{
 };
 use rig_agent::client::AgentClientExt;
 use rig_core::completion::{Message, Usage};
-use rig_core::providers::openai::CompletionModel as OpenAiModel;
+use crate::providers::CompletionModel as OpenAiModel;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
@@ -1346,7 +1346,8 @@ mod tests {
         let http = reqwest::Client::builder()
             .build()
             .expect("reqwest client build");
-        CompletionsClient::builder()
+        let http = crate::http_trace::TracingHttpClient::new(http).expect("tracing client build");
+        crate::providers::openai::CompletionsClient::builder()
             .api_key("dummy-key".to_string())
             .base_url("http://localhost:1")
             .http_client(http)

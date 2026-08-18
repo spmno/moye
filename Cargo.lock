@@ -1625,6 +1625,7 @@ name = "moye"
 version = "0.0.2"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
  "crossterm",
  "dotenvy",

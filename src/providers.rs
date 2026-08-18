@@ -3,8 +3,20 @@
 // 均使用 OpenAI 兼容接口，Bailian 百炼平台、Moonshot Kimi 平台和火山引擎 Ark 通过自定义 base URL 接入。
 // All providers use the OpenAI-compatible interface; Bailian, Moonshot Kimi, and Volcengine Ark connect via custom base URLs.
 use anyhow::Result;
-pub use rig_core::providers::openai::{self, CompletionsClient};
+pub use rig_core::providers::openai;
 use tracing::info;
+
+/// 全应用统一使用的 HTTP 客户端类型（带可选的原始 HTTP 跟踪，见 http_trace 模块）。
+/// The HTTP client type used app-wide (with optional raw HTTP tracing, see the http_trace module).
+pub type HttpClient = crate::http_trace::TracingHttpClient;
+
+/// OpenAI 兼容 CompletionsClient（H 固定为带跟踪的客户端）。
+/// OpenAI-compatible CompletionsClient (H fixed to the tracing client).
+pub type CompletionsClient = openai::CompletionsClient<HttpClient>;
+
+/// OpenAI 兼容 CompletionModel（H 与 CompletionsClient 一致）。
+/// OpenAI-compatible CompletionModel (H matches CompletionsClient).
+pub type CompletionModel = openai::CompletionModel<HttpClient>;
 
 /// 供应商类型。
 /// Provider type.
@@ -310,12 +322,13 @@ pub fn create_client_with(
         &api_key[..8.min(api_key.len())],
         &api_key[api_key.len().saturating_sub(4)..],
     );
-    let http = rig_core::http_client::ReqwestClient::builder()
+    let http = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .tcp_keepalive(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| anyhow::anyhow!("HTTP client build failed: {e}"))?;
-    let client = CompletionsClient::builder()
+    let http = crate::http_trace::TracingHttpClient::new(http)?;
+    let client = openai::CompletionsClient::builder()
         .api_key(api_key)
         .base_url(&base_url)
         .http_client(http)
@@ -403,7 +416,7 @@ pub fn is_reasoning_model(model: &str) -> bool {
 
 /// 对话型 Agent 别名：基于 OpenAI CompletionModel 的 rig Agent（兼容所有供应商）。
 /// Chat Agent alias: a rig Agent based on OpenAI CompletionModel (compatible with all providers).
-pub type ChatAgent = rig_agent::agent::Agent<openai::CompletionModel>;
+pub type ChatAgent = rig_agent::agent::Agent<CompletionModel>;
 
 /// 模型目录条目：slug + 面向用户的中文说明。
 /// Model catalog entry: slug + user-facing Chinese description.

@@ -7,6 +7,7 @@ mod context;
 mod event;
 mod events;
 mod evolution;
+mod http_trace;
 mod mcp;
 mod memory;
 mod model_history;

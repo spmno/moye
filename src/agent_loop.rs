@@ -1204,8 +1204,19 @@ fn build_runner_agent(registry: &AgentRegistry, role: Role) -> anyhow::Result<Ag
     let params = crate::providers::provider_additional_params();
     let max_output = registry.context_config().max_output_tokens as u64;
     let reasoning = crate::providers::is_reasoning_model(&model);
+    // 推理模型的 max_tokens 包含 reasoning + 可见输出 + 工具调用。
+    // 给一个足够大的值（doubao-seed 256K，其他 32K），避免端点默认上限
+    // （如 volcengine agent plan 的 4096）导致输出被 finish_reason:"length" 截断。
+    // Reasoning models share max_tokens across reasoning + visible output + tool calls.
+    // Use a generous value (doubao-seed 256K, others 32K) to avoid endpoint defaults
+    // (e.g. volcengine agent plan's 4096) truncating output with finish_reason:"length".
+    let effective_max_tokens = if reasoning {
+        crate::providers::reasoning_max_tokens(&model)
+    } else {
+        max_output
+    };
     if reasoning {
-        info!("[runner] reasoning model detected, skipping max_tokens (model default applies)");
+        info!("[runner] reasoning model detected, using max_tokens={effective_max_tokens}");
     }
     let builder = client
         .agent(&model)
@@ -1218,11 +1229,7 @@ fn build_runner_agent(registry: &AgentRegistry, role: Role) -> anyhow::Result<Ag
         crate::tools::add_builtin_tools(builder, registry.context_config(), sandbox_provider)
             .additional_params(params)
             .default_max_turns(max_turns);
-    let agent = if reasoning {
-        builder.build()
-    } else {
-        builder.max_tokens(max_output).build()
-    };
+    let agent = builder.max_tokens(effective_max_tokens).build();
     Ok(agent)
 }
 

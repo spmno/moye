@@ -463,8 +463,13 @@ impl AgentRegistry {
         info!("[build] role={key} model={model} max_turns={max_turns}");
         let max_output = self.context_config().max_output_tokens as u64;
         let reasoning = crate::providers::is_reasoning_model(&model);
+        let effective_max_tokens = if reasoning {
+            crate::providers::reasoning_max_tokens(&model)
+        } else {
+            max_output
+        };
         if reasoning {
-            info!("[build] reasoning model detected, skipping max_tokens (model default applies)");
+            info!("[build] reasoning model detected, using max_tokens={effective_max_tokens}");
         }
         let agent = if with_tools {
             let builder = client
@@ -487,11 +492,7 @@ impl AgentRegistry {
             } else {
                 builder
             };
-            if reasoning {
-                builder.build()
-            } else {
-                builder.max_tokens(max_output).build()
-            }
+            builder.max_tokens(effective_max_tokens).build()
         } else {
             let builder = client
                 .agent(&model)
@@ -499,11 +500,7 @@ impl AgentRegistry {
                 .temperature(crate::providers::Provider::clamp_temperature(0.7))
                 .additional_params(params)
                 .default_max_turns(max_turns);
-            if reasoning {
-                builder.build()
-            } else {
-                builder.max_tokens(max_output).build()
-            }
+            builder.max_tokens(effective_max_tokens).build()
         };
         Ok(RoleAgent { role, agent })
     }

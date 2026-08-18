@@ -398,8 +398,11 @@ pub fn is_reasoning_model(model: &str) -> bool {
     // GLM 系列（glm-latest, glm-4.7, glm-5, glm-5.2 等）支持 thinking 模式
     // GLM series supports thinking mode
     lower.contains("glm-")
-        // DeepSeek R1 是推理模型 / DeepSeek R1 is a reasoning model
-        || lower.contains("deepseek-r1")
+        // DeepSeek V4 系列（deepseek-v4-pro / deepseek-v4-flash）thinking 默认开启，
+        // 输出 `reasoning_content` 字段，属于推理模型。
+        // DeepSeek V4 series (pro/flash) has thinking enabled by default and
+        // emits `reasoning_content`, so it is a reasoning model.
+        || lower.starts_with("deepseek-v4")
         // OpenAI o 系列（o1, o3, o4）/ OpenAI o-series
         || lower.starts_with("o1") || lower.starts_with("o3") || lower.starts_with("o4")
         // GPT-5+ 系列 / GPT-5+ series
@@ -417,6 +420,32 @@ pub fn is_reasoning_model(model: &str) -> bool {
 /// 对话型 Agent 别名：基于 OpenAI CompletionModel 的 rig Agent（兼容所有供应商）。
 /// Chat Agent alias: a rig Agent based on OpenAI CompletionModel (compatible with all providers).
 pub type ChatAgent = rig_agent::agent::Agent<CompletionModel>;
+
+/// 推理模型应使用的 max_tokens。
+/// max_tokens to use for reasoning models.
+///
+/// 推理模型的 max_tokens 包含 reasoning + 可见输出 + 工具调用。
+/// 各推理模型按厂商文档的最大输出上限配置，避免端点默认上限
+/// 导致输出被 finish_reason:"length" 截断。
+/// Reasoning models share max_tokens across reasoning + visible output + tool calls.
+/// Each model uses its vendor-documented max output limit to avoid endpoint defaults
+/// truncating output with finish_reason:"length".
+pub fn reasoning_max_tokens(model: &str) -> u64 {
+    let lower = model.to_lowercase();
+    // doubao-seed 系列单独设 256K（agent plan 端点/模型约束）。
+    // doubao-seed series uses 256K (agent plan endpoint/model constraint).
+    if lower.starts_with("doubao-seed") {
+        return 262_144;
+    }
+    // DeepSeek V4 系列（deepseek-v4-pro / deepseek-v4-flash）最大输出 384K。
+    // DeepSeek V4 series (pro/flash) max output is 384K.
+    if lower.starts_with("deepseek-v4") {
+        return 384_000;
+    }
+    // 其余推理模型（glm / deepseek-r1 / o 系列 / gpt-5 / claude-3.7+ 等）设 1M。
+    // Other reasoning models (glm / deepseek-r1 / o-series / gpt-5 / claude-3.7+ etc.) use 1M.
+    1_000_000
+}
 
 /// 模型目录条目：slug + 面向用户的中文说明。
 /// Model catalog entry: slug + user-facing Chinese description.
@@ -921,7 +950,13 @@ mod tests {
         assert!(is_reasoning_model("glm-latest"));
         assert!(is_reasoning_model("GLM-5.2"));
         assert!(is_reasoning_model("glm-4.7"));
-        assert!(is_reasoning_model("deepseek-r1-250120"));
+        // DeepSeek V4 系列（pro/flash）thinking 默认开启，输出 reasoning_content，
+        // 属于推理模型。
+        // DeepSeek V4 series (pro/flash) has thinking enabled by default and emits
+        // reasoning_content, so it is a reasoning model.
+        assert!(is_reasoning_model("deepseek-v4-pro"));
+        assert!(is_reasoning_model("deepseek-v4-flash"));
+        assert!(is_reasoning_model("DEEPSEEK-V4-PRO"));
         assert!(is_reasoning_model("o1-mini"));
         assert!(is_reasoning_model("o3-mini"));
         assert!(is_reasoning_model("o4-mini"));
@@ -940,10 +975,26 @@ mod tests {
     #[test]
     fn is_reasoning_model_rejects_non_reasoning_models() {
         assert!(!is_reasoning_model("kimi-k3"));
-        assert!(!is_reasoning_model("deepseek-v4-pro"));
         assert!(!is_reasoning_model("gpt-4o"));
         assert!(!is_reasoning_model("qwen-plus"));
         assert!(!is_reasoning_model("doubao-1-5-pro-256k"));
         assert!(!is_reasoning_model("claude-3-haiku"));
+    }
+
+    #[test]
+    fn reasoning_max_tokens_returns_vendor_documented_limits() {
+        // doubao-seed 系列：256K（agent plan 端点约束）。
+        // doubao-seed series: 256K (agent plan endpoint constraint).
+        assert_eq!(reasoning_max_tokens("doubao-seed-evolving"), 262_144);
+        assert_eq!(reasoning_max_tokens("doubao-seed-2-1-pro-260628"), 262_144);
+        // DeepSeek V4 系列：384K（厂商文档 MAX OUTPUT）。
+        // DeepSeek V4 series: 384K (vendor-documented MAX OUTPUT).
+        assert_eq!(reasoning_max_tokens("deepseek-v4-pro"), 384_000);
+        assert_eq!(reasoning_max_tokens("deepseek-v4-flash"), 384_000);
+        // 其他推理模型：1M。
+        // Other reasoning models: 1M.
+        assert_eq!(reasoning_max_tokens("glm-latest"), 1_000_000);
+        assert_eq!(reasoning_max_tokens("o1-mini"), 1_000_000);
+        assert_eq!(reasoning_max_tokens("claude-4-opus"), 1_000_000);
     }
 }

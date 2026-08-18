@@ -457,6 +457,10 @@ fn merge_provider_fallback(project: &mut Config, global: Config) {
 
 /// 根据供应商 slug 返回推荐默认模型。
 /// Return a recommended default model for the given provider slug.
+///
+/// 仅测试使用；生产代码直接调用 `default_model_for_provider_plan`。
+/// Test-only; production code calls `default_model_for_provider_plan` directly.
+#[cfg(test)]
 pub fn default_model_for_provider(provider: &str) -> &'static str {
     default_model_for_provider_plan(provider, "standard")
 }

@@ -72,10 +72,15 @@ impl SandboxBackend {
 
     /// 在当前平台上检测可用的 OS 级沙箱后端。
     /// Detect the available OS-level sandbox backend on the current platform.
+    ///
+    /// Linux: 仅 `which("bwrap")` 不够——IDE 集成终端 / snap / flatpak / 受限
+    /// systemd user session 会让当前进程位于受限 user namespace 内，PATH 里有
+    /// bwrap 但 spawn 时写 `/proc/self/uid_map` 被拒。这里再 spawn 一次最小命令
+    /// 真实探活；失败时降级到 `Path`（无 OS 隔离，但 `run_bash` 仍可用）。
     pub fn detect() -> SandboxBackend {
         #[cfg(target_os = "linux")]
         {
-            if which("bwrap").is_some() {
+            if which("bwrap").is_some() && Self::bwrap_usable() {
                 SandboxBackend::Bwrap
             } else {
                 SandboxBackend::Path
@@ -89,6 +94,43 @@ impl SandboxBackend {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             SandboxBackend::Path
+        }
+    }
+
+    /// 真实探活 bwrap：spawn 最小命令验证能否写 uid_map + 建 mount namespace。
+    /// 用 thread + `recv_timeout(1.5s)` 避免极端 hang 卡死 TUI 启动；bwrap 失败时
+    /// 立即 exit，正常情况几十毫秒内返回。
+    fn bwrap_usable() -> bool {
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // `--ro-bind / /` 是关键——缺它 bwrap 不尝试创建 mount namespace，
+        // 无法探出 "setting up uid map: Permission denied" 这种真实失败。
+        let argv = [
+            "bwrap",
+            "--ro-bind", "/", "/",
+            "--dev", "/dev",
+            "--proc", "/proc",
+            "--tmpfs", "/tmp",
+            "--", "/bin/true",
+        ];
+
+        let (tx, rx) = mpsc::channel::<std::io::Result<std::process::ExitStatus>>();
+        std::thread::spawn(move || {
+            let result = Command::new(argv[0])
+                .args(&argv[1..])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(Duration::from_millis(1500)) {
+            Ok(Ok(status)) => status.success(),
+            Ok(Err(_)) => false,
+            Err(_) => false,
         }
     }
 
@@ -1108,6 +1150,22 @@ mod tests {
         let auto = SandboxBackend::Auto;
         let resolved = auto.resolve();
         assert_ne!(resolved, SandboxBackend::Auto);
+    }
+
+    /// 不强断言 `== true`：bwrap 不可用的 CI 会挂；这里只验证不 panic。
+    #[test]
+    fn bwrap_usable_returns_bool_without_panic() {
+        let _ = SandboxBackend::bwrap_usable();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detect_on_linux_returns_bwrap_or_path() {
+        let backend = SandboxBackend::detect();
+        assert!(
+            matches!(backend, SandboxBackend::Bwrap | SandboxBackend::Path),
+            "Linux detect() should return Bwrap (probe ok) or Path (probe failed), got {backend:?}"
+        );
     }
 
     #[test]

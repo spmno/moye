@@ -463,13 +463,23 @@ impl AgentRegistry {
         info!("[build] role={key} model={model} max_turns={max_turns}");
         let max_output = self.context_config().max_output_tokens as u64;
         let reasoning = crate::providers::is_reasoning_model(&model);
-        let effective_max_tokens = if reasoning {
-            crate::providers::reasoning_max_tokens(&model)
+        // max_tokens 策略：推理模型始终跳过（reasoning+输出+工具共享预算）；
+        // 非推理模型在 max_output_tokens=0 时跳过（用模型默认输出预算），>0 时作为显式上限。
+        // rig 的 OpenAI 路径在 None 时省略该字段。详见 is_reasoning_model 文档。
+        // max_tokens policy: reasoning models always skip (reasoning+output+tools share budget);
+        // non-reasoning skip when max_output_tokens=0 (use model default), >0 = explicit cap.
+        // rig's OpenAI path omits the field when None. See is_reasoning_model doc.
+        let effective_max_tokens: Option<u64> = if reasoning {
+            None
+        } else if max_output > 0 {
+            Some(max_output)
         } else {
-            max_output
+            None
         };
         if reasoning {
-            info!("[build] reasoning model detected, using max_tokens={effective_max_tokens}");
+            info!("[build] reasoning model detected, skipping max_tokens (model default output budget)");
+        } else if effective_max_tokens.is_none() {
+            info!("[build] non-reasoning model, skipping max_tokens (model default output budget; set [context].max_output_tokens>0 to cap)");
         }
         let agent = if with_tools {
             let builder = client
@@ -492,7 +502,12 @@ impl AgentRegistry {
             } else {
                 builder
             };
-            builder.max_tokens(effective_max_tokens).build()
+            let builder = if let Some(v) = effective_max_tokens {
+                builder.max_tokens(v)
+            } else {
+                builder
+            };
+            builder.build()
         } else {
             let builder = client
                 .agent(&model)
@@ -500,7 +515,12 @@ impl AgentRegistry {
                 .temperature(crate::providers::Provider::clamp_temperature(0.7))
                 .additional_params(params)
                 .default_max_turns(max_turns);
-            builder.max_tokens(effective_max_tokens).build()
+            let builder = if let Some(v) = effective_max_tokens {
+                builder.max_tokens(v)
+            } else {
+                builder
+            };
+            builder.build()
         };
         Ok(RoleAgent { role, agent })
     }

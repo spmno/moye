@@ -28,8 +28,11 @@ use std::collections::HashMap;
 /// Context management config, loaded from the `[context]` section of agent.toml.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContextConfig {
-    /// 预留给模型输出的最大 token 数。
-    /// Max tokens reserved for model output.
+    /// 输出 token 上限：0 = 跳过（用模型自身默认输出预算；推理模型始终跳过）；
+    /// >0 = 显式上限，作为 max_tokens 发给非推理模型（勿超过目标模型输出天花板，否则 400）。
+    /// Output token cap: 0 = skip (use model's own default output budget; reasoning
+    /// models always skip); >0 = explicit cap sent as max_tokens to non-reasoning
+    /// models (must not exceed the target model's output ceiling, or 400 returns).
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: usize,
 
@@ -67,7 +70,7 @@ pub struct ContextConfig {
 }
 
 pub(crate) fn default_max_output_tokens() -> usize {
-    4096
+    0
 }
 pub(crate) fn default_compaction_threshold() -> f64 {
     0.5
@@ -1015,7 +1018,7 @@ mod tests {
     #[test]
     fn context_config_defaults() {
         let cfg = ContextConfig::default();
-        assert_eq!(cfg.max_output_tokens, 4096);
+        assert_eq!(cfg.max_output_tokens, 0);
         assert!((cfg.compaction_threshold - 0.5).abs() < f64::EPSILON);
         assert_eq!(cfg.keep_recent_turns, 2);
         assert_eq!(cfg.max_bash_output_chars, 20000);
@@ -1049,7 +1052,7 @@ microcompact_protected_results = 5
     fn context_config_defaults_when_missing() {
         let toml_str = "";
         let cfg: ContextConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.max_output_tokens, 4096);
+        assert_eq!(cfg.max_output_tokens, 0);
         assert_eq!(cfg.keep_recent_turns, 2);
     }
 }

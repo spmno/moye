@@ -48,11 +48,12 @@ default_model = "glm-latest"
 max_turns = 30
 
 [context]
-# 仅对非推理模型生效（作为 API 的 max_tokens 参数）。
-# 推理模型（glm-/deepseek-r1/o系列/gpt-5+等）跳过此参数，使用模型默认输出预算。
-# Only applies to non-reasoning models (as the API max_tokens parameter).
-# Reasoning models (glm-/deepseek-r1/o-series/gpt-5+ etc) skip this, using the model's default output budget.
-max_output_tokens = 32768
+# 输出 token 上限：0 = 跳过（用模型自身默认输出预算，推荐；推理模型始终跳过）；
+# >0 = 显式上限，作为 max_tokens 发给非推理模型（勿超过目标模型输出天花板，否则 400）。
+# Output token cap: 0 = skip (use model's own default output budget, recommended;
+# reasoning models always skip); >0 = explicit cap sent as max_tokens to non-reasoning
+# models (must not exceed the target model's output ceiling, or 400 returns).
+max_output_tokens = 0
 compaction_threshold = 0.5
 keep_recent_turns = 2
 max_bash_output_chars = 20000

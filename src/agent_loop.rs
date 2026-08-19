@@ -1204,19 +1204,22 @@ fn build_runner_agent(registry: &AgentRegistry, role: Role) -> anyhow::Result<Ag
     let params = crate::providers::provider_additional_params();
     let max_output = registry.context_config().max_output_tokens as u64;
     let reasoning = crate::providers::is_reasoning_model(&model);
-    // 推理模型的 max_tokens 包含 reasoning + 可见输出 + 工具调用。
-    // 给一个足够大的值（doubao-seed 256K，其他 32K），避免端点默认上限
-    // （如 volcengine agent plan 的 4096）导致输出被 finish_reason:"length" 截断。
-    // Reasoning models share max_tokens across reasoning + visible output + tool calls.
-    // Use a generous value (doubao-seed 256K, others 32K) to avoid endpoint defaults
-    // (e.g. volcengine agent plan's 4096) truncating output with finish_reason:"length".
-    let effective_max_tokens = if reasoning {
-        crate::providers::reasoning_max_tokens(&model)
+    // max_tokens 策略：推理模型始终跳过；非推理模型在 max_output_tokens=0 时跳过（用模型
+    // 默认输出预算），>0 时作为显式上限。rig 的 OpenAI 路径在 None 时省略该字段。
+    // 详见 is_reasoning_model 文档。
+    // max_tokens policy: reasoning models always skip; non-reasoning skip when
+    // max_output_tokens=0 (model default), >0 = explicit cap. rig's OpenAI path omits None.
+    let effective_max_tokens: Option<u64> = if reasoning {
+        None
+    } else if max_output > 0 {
+        Some(max_output)
     } else {
-        max_output
+        None
     };
     if reasoning {
-        info!("[runner] reasoning model detected, using max_tokens={effective_max_tokens}");
+        info!("[runner] reasoning model detected, skipping max_tokens (model default output budget)");
+    } else if effective_max_tokens.is_none() {
+        info!("[runner] non-reasoning model, skipping max_tokens (model default output budget; set [context].max_output_tokens>0 to cap)");
     }
     let builder = client
         .agent(&model)
@@ -1229,7 +1232,11 @@ fn build_runner_agent(registry: &AgentRegistry, role: Role) -> anyhow::Result<Ag
         crate::tools::add_builtin_tools(builder, registry.context_config(), sandbox_provider)
             .additional_params(params)
             .default_max_turns(max_turns);
-    let agent = builder.max_tokens(effective_max_tokens).build();
+    let agent = if let Some(v) = effective_max_tokens {
+        builder.max_tokens(v).build()
+    } else {
+        builder.build()
+    };
     Ok(agent)
 }
 

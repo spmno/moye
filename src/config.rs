@@ -585,7 +585,7 @@ default_model = "{model}"
 max_turns = 50
 
 [context]
-max_output_tokens = 4096
+max_output_tokens = 0
 compaction_threshold = 0.5
 keep_recent_turns = 2
 max_bash_output_chars = 20000
@@ -783,7 +783,7 @@ authorized_dirs = ["~/.config", "/tmp/moye"]
         assert_eq!(cfg.max_turns(), 50);
         assert!(cfg.roles.is_empty());
         assert_eq!(cfg.evolution.rule_escalation_threshold, 0);
-        assert_eq!(cfg.context.max_output_tokens, 4096);
+        assert_eq!(cfg.context.max_output_tokens, 0);
         assert!(cfg.sandbox.authorized_dirs.is_empty());
         assert_eq!(cfg.sandbox.backend, "auto");
         assert_eq!(cfg.sandbox.mode, "auto");

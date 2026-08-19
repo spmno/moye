@@ -421,32 +421,6 @@ pub fn is_reasoning_model(model: &str) -> bool {
 /// Chat Agent alias: a rig Agent based on OpenAI CompletionModel (compatible with all providers).
 pub type ChatAgent = rig_agent::agent::Agent<CompletionModel>;
 
-/// 推理模型应使用的 max_tokens。
-/// max_tokens to use for reasoning models.
-///
-/// 推理模型的 max_tokens 包含 reasoning + 可见输出 + 工具调用。
-/// 各推理模型按厂商文档的最大输出上限配置，避免端点默认上限
-/// 导致输出被 finish_reason:"length" 截断。
-/// Reasoning models share max_tokens across reasoning + visible output + tool calls.
-/// Each model uses its vendor-documented max output limit to avoid endpoint defaults
-/// truncating output with finish_reason:"length".
-pub fn reasoning_max_tokens(model: &str) -> u64 {
-    let lower = model.to_lowercase();
-    // doubao-seed 系列单独设 256K（agent plan 端点/模型约束）。
-    // doubao-seed series uses 256K (agent plan endpoint/model constraint).
-    if lower.starts_with("doubao-seed") {
-        return 262_144;
-    }
-    // DeepSeek V4 系列（deepseek-v4-pro / deepseek-v4-flash）最大输出 384K。
-    // DeepSeek V4 series (pro/flash) max output is 384K.
-    if lower.starts_with("deepseek-v4") {
-        return 384_000;
-    }
-    // 其余推理模型（glm / deepseek-r1 / o 系列 / gpt-5 / claude-3.7+ 等）设 1M。
-    // Other reasoning models (glm / deepseek-r1 / o-series / gpt-5 / claude-3.7+ etc.) use 1M.
-    1_000_000
-}
-
 /// 模型目录条目：slug + 面向用户的中文说明。
 /// Model catalog entry: slug + user-facing Chinese description.
 pub struct ModelInfo {
@@ -979,22 +953,5 @@ mod tests {
         assert!(!is_reasoning_model("qwen-plus"));
         assert!(!is_reasoning_model("doubao-1-5-pro-256k"));
         assert!(!is_reasoning_model("claude-3-haiku"));
-    }
-
-    #[test]
-    fn reasoning_max_tokens_returns_vendor_documented_limits() {
-        // doubao-seed 系列：256K（agent plan 端点约束）。
-        // doubao-seed series: 256K (agent plan endpoint constraint).
-        assert_eq!(reasoning_max_tokens("doubao-seed-evolving"), 262_144);
-        assert_eq!(reasoning_max_tokens("doubao-seed-2-1-pro-260628"), 262_144);
-        // DeepSeek V4 系列：384K（厂商文档 MAX OUTPUT）。
-        // DeepSeek V4 series: 384K (vendor-documented MAX OUTPUT).
-        assert_eq!(reasoning_max_tokens("deepseek-v4-pro"), 384_000);
-        assert_eq!(reasoning_max_tokens("deepseek-v4-flash"), 384_000);
-        // 其他推理模型：1M。
-        // Other reasoning models: 1M.
-        assert_eq!(reasoning_max_tokens("glm-latest"), 1_000_000);
-        assert_eq!(reasoning_max_tokens("o1-mini"), 1_000_000);
-        assert_eq!(reasoning_max_tokens("claude-4-opus"), 1_000_000);
     }
 }

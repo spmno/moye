@@ -427,7 +427,7 @@ permissions.web_search = "deny"
 
 [context]
 # Context management config
-max_output_tokens = 4096           # Output token reservation
+max_output_tokens = 0              # 0=skip(model default); >0=cap non-reasoning
 compaction_threshold = 0.5         # Overflow ratio for LLM summary
 keep_recent_turns = 2              # Recent turns to keep
 max_bash_output_chars = 20000      # Bash output truncation
@@ -733,7 +733,7 @@ All parameters are configured in the `[context]` section of `agent.toml`:
 
 | Parameter | Default | Description |
 |------|------|------|
-| `max_output_tokens` | `4096` | Tokens reserved for model output |
+| `max_output_tokens` | `0` | 0 = skip `max_tokens` (use model's default output budget; reasoning models always skip); >0 = explicit cap sent to non-reasoning models (must not exceed the target model's output ceiling, or 400). Not used in the context-budget calc. |
 | `compaction_threshold` | `0.5` | Tier 2 trigger ratio (fraction of effective budget, 0.0-1.0) |
 | `keep_recent_turns` | `2` | Recent turns kept during Tier 2 compaction |
 | `max_bash_output_chars` | `20000` | Max chars for `run_bash` output |
@@ -741,7 +741,7 @@ All parameters are configured in the `[context]` section of `agent.toml`:
 | `microcompact_threshold` | `20000` | Tier 1 trigger token threshold |
 | `microcompact_protected_results` | `3` | Number of recent tool results protected during Tier 1 |
 
-> **Effective Budget** = `context window - max_output_tokens`. E.g., 128K window, 4096 reserved, effective budget 123,904 tokens, Tier 2 trigger = 123,904 x 0.5 = 61,952 tokens.
+> **Effective Budget** = `context window × 0.85` (a fixed 15% reserve for model output; `max_output_tokens` is NOT used here). E.g., 128K window → effective budget 108,800 tokens, Tier 2 trigger = 108,800 × 0.5 = 54,400 tokens.
 
 ### Caching
 

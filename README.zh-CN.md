@@ -427,7 +427,7 @@ permissions.web_search = "deny"
 
 [context]
 # 上下文管理配置
-max_output_tokens = 4096           # 预留输出 token
+max_output_tokens = 0              # 0=跳过(模型默认); >0=非推理模型上限
 compaction_threshold = 0.5         # 触发 LLM 摘要的比例
 keep_recent_turns = 2              # 压缩时保留的最近轮数
 max_bash_output_chars = 20000      # run_bash 输出截断
@@ -733,7 +733,7 @@ patches = [
 
 | 参数 | 默认值 | 说明 |
 |------|------|------|
-| `max_output_tokens` | `4096` | 预留给模型输出的 token 数 |
+| `max_output_tokens` | `0` | 0 = 跳过 `max_tokens`（用模型默认输出预算；推理模型始终跳过）；>0 = 显式上限，发给非推理模型（勿超过目标模型输出天花板，否则 400）。不参与上下文预算计算。 |
 | `compaction_threshold` | `0.5` | Tier 2 触发比例（占有效预算的比例，0.0–1.0） |
 | `keep_recent_turns` | `2` | Tier 2 压缩时保留的最近对话轮数 |
 | `max_bash_output_chars` | `20000` | `run_bash` 工具输出截断字符数 |
@@ -741,7 +741,7 @@ patches = [
 | `microcompact_threshold` | `20000` | Tier 1 触发的 token 阈值 |
 | `microcompact_protected_results` | `3` | Tier 1 微压缩时保护的最近工具结果数量 |
 
-> **有效预算** = `上下文窗口大小 - max_output_tokens`。例如 128K 窗口、4096 预留 → 有效预算 123,904 tokens，Tier 2 触发线 = 123,904 × 0.5 ≈ 61,952 tokens。
+> **有效预算** = `上下文窗口大小 × 0.85`（固定预留 15% 给模型输出；`max_output_tokens` 不参与此计算）。例如 128K 窗口 → 有效预算 108,800 tokens，Tier 2 触发线 = 108,800 × 0.5 = 54,400 tokens。
 
 ### 缓存机制
 

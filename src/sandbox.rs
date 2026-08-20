@@ -726,13 +726,13 @@ fn extract_paths_from_command_inner(command: &str, paths: &mut Vec<String>) {
     let stripped = strip_heredocs(command);
     let outer = strip_command_substitutions(&stripped, paths);
 
-    for segment in outer.split(['|', ';', '&', '\n']) {
-        let segment = segment.trim();
+    for seg in split_segments_quote_aware(&outer) {
+        let segment = seg.trim();
         if segment.is_empty() {
             continue;
         }
 
-        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        let tokens: Vec<String> = tokenize_quote_aware(segment);
         if tokens.is_empty() {
             continue;
         }
@@ -745,7 +745,7 @@ fn extract_paths_from_command_inner(command: &str, paths: &mut Vec<String>) {
 
         let mut i = 0;
         while i < tokens.len() {
-            let token = tokens[i];
+            let token = tokens[i].as_str();
 
             // Inline comment: '#' at word boundary starts a comment to end of segment.
             // 行内注释： '#' 在词边界处开始注释，跳过本段剩余 token。
@@ -756,7 +756,7 @@ fn extract_paths_from_command_inner(command: &str, paths: &mut Vec<String>) {
             // cd / pushd <dir> —— 检查目标目录
             // cd / pushd <dir> — check the target directory
             if (token == "cd" || token == "pushd") && i + 1 < tokens.len() {
-                let target = clean_token(tokens[i + 1]);
+                let target = clean_token(tokens[i + 1].as_str());
                 if !target.is_empty() && target != "-" {
                     paths.push(target.to_string());
                 }
@@ -896,6 +896,124 @@ fn clean_token(token: &str) -> &str {
     // Strip surrounding quotes
     s = s.trim_matches(|c| c == '"' || c == '\'');
     s
+}
+
+/// 按命令分隔符（`|` `;` `&` `\n`）切分命令为段落，但尊重 shell 引号与反斜杠转义：
+/// 引号内的分隔符是字面量（不切分）；引号外的 `\|` `\;` `\&` 是转义分隔符（不切分）。
+/// 引号与反斜杠保留在段落中，由下游 `tokenize_quote_aware` / `clean_token` 处理。
+///
+/// 这修复了 `grep "a\|b\|/c" file` 这类误报：旧实现按 `|` 盲切，把引号内正则的
+/// `\|/c\|` 切成裸 `/c` 段，被误判为绝对路径触发沙箱询问。
+fn split_segments_quote_aware(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut segments = Vec::new();
+    let mut cur = String::with_capacity(s.len());
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some(q) => {
+                // 双引号内 `\"` 是转义引号（字面 `"`），不闭合；其余字符（含 `\`）原样。
+                if c == '\\' && q == '"' && i + 1 < chars.len() && chars[i + 1] == '"' {
+                    cur.push('"');
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    quote = None;
+                }
+                cur.push(c);
+                i += 1;
+            }
+            None => {
+                if c == '"' || c == '\'' {
+                    quote = Some(c);
+                    cur.push(c);
+                    i += 1;
+                } else if c == '\\' && i + 1 < chars.len() {
+                    // 引号外反斜杠转义下一字符：保留两者，使其不触发分隔/引号。
+                    cur.push(c);
+                    cur.push(chars[i + 1]);
+                    i += 2;
+                } else if c == '|' || c == ';' || c == '&' || c == '\n' {
+                    segments.push(std::mem::take(&mut cur));
+                    i += 1;
+                } else {
+                    cur.push(c);
+                    i += 1;
+                }
+            }
+        }
+    }
+    segments.push(cur);
+    segments
+}
+
+/// 按空白切分段落为 token，但尊重 shell 引号：引号内空白不切分，整个引号串
+/// （含内部空白）作为一个 token；相邻引号/非引号片段拼接为一个 token
+/// （bash 引号去除语义）。引号被去除，其余字符（含重定向前缀 `2>`/`>` 与反斜杠）
+/// 原样保留，交由 `clean_token` 进一步清理。
+///
+/// 这让 `grep ".../map..."` 的引号串成为单个 token（以 `m` 开头）而非被空白/管道
+/// 拆成裸 `/map`，从而不再被误判为路径。真实路径如 `cat "/etc/passwd"` 仍以
+/// `/` 开头会被提取。
+fn tokenize_quote_aware(segment: &str) -> Vec<String> {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut has_content = false;
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some(q) => {
+                // 双引号内 `\"` → 字面 `"`，不闭合；其余（含 `\`）原样。
+                if c == '\\' && q == '"' && i + 1 < chars.len() && chars[i + 1] == '"' {
+                    cur.push('"');
+                    has_content = true;
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    quote = None;
+                    i += 1;
+                    continue; // 闭合引号本身不计入 token
+                }
+                cur.push(c);
+                has_content = true;
+                i += 1;
+            }
+            None => {
+                if c == '"' || c == '\'' {
+                    quote = Some(c);
+                    has_content = true; // 引号开启即（继续）构建 token
+                    i += 1;
+                } else if c == '\\' && i + 1 < chars.len() {
+                    // 引号外转义：保留反斜杠与下一字符（不触发引号/空白），与 clean_token 一致。
+                    cur.push(c);
+                    cur.push(chars[i + 1]);
+                    has_content = true;
+                    i += 2;
+                } else if c.is_whitespace() {
+                    if has_content {
+                        tokens.push(std::mem::take(&mut cur));
+                        has_content = false;
+                    }
+                    i += 1;
+                } else {
+                    cur.push(c);
+                    has_content = true;
+                    i += 1;
+                }
+            }
+        }
+    }
+    if has_content {
+        tokens.push(cur);
+    }
+    tokens
 }
 
 #[cfg(test)]
@@ -1378,5 +1496,43 @@ mod tests {
         assert!(result.contains("cat > file.rs"));
         assert!(!result.contains("//! content"));
         assert!(result.contains("echo done"));
+    }
+
+    /// 引号内的管道分隔符不应切分：grep 正则 `\|/map\|` 不应被误判为路径。
+    /// 回归守护：旧实现按 `|` 盲切，把引号内正则切成裸 `/map` 段触发沙箱误报。
+    #[test]
+    fn quoted_pipe_in_regex_not_extracted() {
+        let paths = extract_paths_from_command(
+            r#"grep -n "map-btn\|map_page\|/map\|map.html" src/main.rs"#,
+        );
+        assert!(
+            paths.is_empty(),
+            "quoted grep pattern must not yield path-like tokens, got {paths:?}"
+        );
+    }
+
+    /// 引号串含空白与 `/` 子串时整体作为一个 token，不以 `/` 开头，不应提取。
+    #[test]
+    fn quoted_string_with_spaces_and_slash_not_extracted() {
+        let paths = extract_paths_from_command(r#"grep "a /map b" file"#);
+        assert!(
+            !paths.iter().any(|p| p == "/map"),
+            "quoted substring must not be extracted as a path, got {paths:?}"
+        );
+    }
+
+    /// 引号外的转义管道 `\|` 不应切分段落（它是字面 `|` 参数，不是分隔符）。
+    #[test]
+    fn escaped_pipe_outside_quotes_not_split() {
+        let paths = extract_paths_from_command(r#"echo a\|b"#);
+        assert!(paths.is_empty(), "escaped pipe must not split, got {paths:?}");
+    }
+
+    /// 引号包裹的真实路径仍应提取：`cat "/etc/passwd"` 整串是路径，以 `/` 开头。
+    /// 安全守护：引号感知不得放过真实越界访问。
+    #[test]
+    fn quoted_real_path_still_extracted() {
+        let paths = extract_paths_from_command(r#"cat "/etc/passwd""#);
+        assert!(paths.contains(&"/etc/passwd".to_string()));
     }
 }

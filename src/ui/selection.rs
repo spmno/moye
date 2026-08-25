@@ -1,27 +1,31 @@
-//! 字符级文本选择状态机：把消息区屏幕坐标（行, 列）映射到逻辑行 + 字符 offset，
+//! 字符级文本选择状态机：把消息区屏幕坐标（行, 列）映射到显示行 + 字符 offset，
 //! 支持鼠标拖拽选区与文本提取。
 //!
-//! 设计前提：消息区 `Paragraph` 不开 `.wrap()`，且 `markdown::render_markdown`
-//! 不按宽度换行，因此 **1 Line == 1 屏幕行**，屏幕行→逻辑行映射是一次减法。
-//! 屏幕列→字符 offset 按简易显示宽度（ASCII=1，其余=2）累加，与项目其他
-//! 宽度估算（`estimate_input_lines`、`draw_hitl_overlay`）一致。
+//! 设计前提：消息区 `Paragraph` 不开 `.wrap()`，而是在渲染前由
+//! `wrap::wrap_lines` 按内容宽度手动软换行为"显示行"。因此
+//! **1 显示行 == 1 屏幕行**，屏幕行→显示行映射是一次减法。屏幕列→字符
+//! offset 按简易显示宽度（ASCII=1，其余=2，见 `wrap::char_display_width`）
+//! 累加，与换行点计算共用同一宽度模型，保证选区列与换行一致。
 //!
-//! Character-level text selection state machine: maps message-area screen
-//! coordinates (row, col) to logical line + char offset, supporting mouse-drag
-//! selection and text extraction.
+//! Character-level selection state machine: maps message-area screen coordinates
+//! (row, col) to display line + char offset, supporting mouse-drag selection
+//! and text extraction.
 //!
-//! Design premise: the message `Paragraph` is rendered without `.wrap()`, and
-//! `markdown::render_markdown` does not wrap by width, so **1 Line == 1 screen
-//! row**; the screen-row→logical-line map is a single subtraction. Screen-col→
-//! char offset uses a simple display width (ASCII=1, others=2), consistent with
-//! the project's other width estimates (`estimate_input_lines`, `draw_hitl_overlay`).
+//! Design premise: the message `Paragraph` is rendered without `.wrap()`; instead
+//! lines are pre-wrapped into "display lines" by `wrap::wrap_lines` at the content
+//! width before rendering. So **1 display line == 1 screen row**, and the
+//! screen-row→display-line map is a single subtraction. Screen-col→char offset
+//! uses a simple display width (ASCII=1, others=2, see `wrap::char_display_width`),
+//! shared with the wrap-point math so selection columns agree with wrapping.
 
 use ratatui::text::Line;
 
-/// 字符级选区。坐标存"逻辑行 + 屏幕相对列"（列相对消息内容区左边，0 = 内容首列）。
+use crate::ui::wrap::char_display_width;
+
+/// 字符级选区。坐标存"显示行 + 屏幕相对列"（列相对消息内容区左边，0 = 内容首列）。
 /// anchor 在 start_*，focus 在 end_*；选择方向（正向/反向）由 `bounds()` 规范化。
 ///
-/// Character-level selection. Coordinates are "logical line + screen-relative
+/// Character-level selection. Coordinates are "display line + screen-relative
 /// column" (column relative to the content area's left edge; 0 = first content
 /// column). Anchor at start_*, focus at end_*; direction is normalized by `bounds()`.
 #[derive(Clone, Copy, Debug)]
@@ -42,8 +46,9 @@ impl Selection {
         }
     }
 
-    /// 屏幕行→逻辑行：`logical = scroll + (row - inner_y)`。
-    /// 因 Paragraph 无 Wrap，1 Line == 1 屏幕行，映射是一次减法。
+    /// 屏幕行→显示行：`display_line = scroll + (row - inner_y)`。
+    /// 因 Paragraph 无 .wrap()（渲染前已手动软换行），1 显示行 == 1 屏幕行，
+    /// 映射是一次减法。
     pub fn screen_to_logical(row: u16, inner_y: u16, scroll: u16) -> usize {
         scroll as usize + row.saturating_sub(inner_y) as usize
     }
@@ -127,10 +132,6 @@ fn screen_col_to_char_offset(s: &str, target_col: u16) -> usize {
         col = col.saturating_add(char_display_width(ch));
     }
     s.len()
-}
-
-fn char_display_width(c: char) -> u16 {
-    if c.is_ascii() { 1 } else { 2 }
 }
 
 #[cfg(test)]

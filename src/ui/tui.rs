@@ -886,7 +886,13 @@ fn handle_key_event(
 
 fn copy_selection(state: &mut TuiState) {
     if let Some(sel) = state.selection.take() {
-        let text = sel.extract(&state.all_message_lines());
+        // 选区坐标是"显示行"索引，须用与渲染一致的软换行结果来提取，
+        // 否则长行换行后索引与文本错位。
+        // Selection coords are display-line indices; extract against the same
+        // soft-wrapped layout used for rendering, or indices misalign with text
+        // once long lines wrap.
+        let lines = crate::ui::wrap::wrap_lines(&state.all_message_lines(), state.msg_area.width);
+        let text = sel.extract(&lines);
         if text.is_empty() {
             return;
         }
@@ -1428,24 +1434,35 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
 
     let block = Block::default().padding(Padding::horizontal(1));
     let inner = block.inner(area);
-    // 存消息内容区，供 handle_mouse_event 命中测试读取屏幕行→逻辑行映射。
+    // 存消息内容区，供 handle_mouse_event 命中测试读取屏幕行→行映射。
     // Store the message content area for handle_mouse_event hit-testing.
     state.msg_area = inner;
-    let total = all_lines.len() as u16;
+
+    // 按内容区宽度软换行：长行拆成多个"显示行"，避免被终端右边缘截断。
+    // 渲染仍用不带 .wrap() 的 Paragraph，因此"1 显示行 == 1 屏幕行"不变量
+    // 成立，选区 / 高亮 / 滚动逻辑无需改动即可正确工作。
+    // Soft-wrap to content width: long lines split into multiple "display lines"
+    // so they aren't clipped at the terminal's right edge. The Paragraph is still
+    // rendered without .wrap(), so the "1 display line == 1 screen row" invariant
+    // holds and the selection / highlight / scroll logic works unchanged.
+    let display_lines = crate::ui::wrap::wrap_lines(&all_lines, inner.width);
+    let total = display_lines.len() as u16;
 
     let base = total.saturating_sub(inner.height);
     let scroll = base.saturating_sub(state.scroll_offset);
     state.msg_scroll = scroll;
 
-    let text = Text::from(all_lines);
+    let text = Text::from(display_lines);
     let messages = Paragraph::new(text).scroll((scroll, 0)).block(block);
 
     f.render_widget(messages, area);
 
-    // 选区高亮：把选中逻辑行在屏幕上对应的 Cell 叠加反色。
-    // 因为 Paragraph 无 Wrap，逻辑行→屏幕行 = inner.y + (logical - scroll)。
-    // Selection highlight: overlay REVERSED on screen cells for selected logical
-    // lines. Since Paragraph has no Wrap, logical→screen row = inner.y + (logical - scroll).
+    // 选区高亮：把选中显示行在屏幕上对应的 Cell 叠加反色。
+    // 因为 Paragraph 无 .wrap()（已在上方手动软换行），显示行→屏幕行 =
+    // inner.y + (display_line - scroll)。
+    // Selection highlight: overlay REVERSED on screen cells for selected display
+    // lines. Since the Paragraph has no .wrap() (we soft-wrapped manually above),
+    // display-line→screen row = inner.y + (display_line - scroll).
     if let Some(sel) = state.selection {
         let (lo_line, lo_col, hi_line, hi_col) = sel.bounds();
         let buf = f.buffer_mut();

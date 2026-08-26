@@ -300,7 +300,7 @@ Tier 1不够时，才进入Tier 2。V2改进了V1的摘要模板，搞了9段结
 
 ```toml
 [context]
-max_output_tokens = 4096           # 预留输出token
+max_output_tokens = 0              # 0=跳过(模型默认); >0=非推理模型上限
 compaction_threshold = 0.75        # Tier 2触发比例（占有效预算）
 keep_recent_turns = 6              # 压缩时保留最近几轮
 max_bash_output_chars = 20000      # run_bash输出截断
@@ -309,7 +309,7 @@ microcompact_threshold = 20000     # Tier 1触发token阈值
 microcompact_protected_results = 3 # Tier 1保护最近N个工具结果
 ```
 
-有效预算 = 上下文窗口 - max_output_tokens。比如128K窗口、4096预留，有效预算123,904 tokens。Tier 2触发线 = 123,904 × 0.75 ≈ 92,928 tokens。
+有效预算 = 上下文窗口 × 0.85（固定预留 15% 给模型输出；max_output_tokens 不参与此计算）。比如 128K 窗口 → 有效预算 108,800 tokens。Tier 2 触发线 = 108,800 × 0.75 = 81,600 tokens。
 
 ### 缓存
 

@@ -274,7 +274,7 @@ impl AppContext {
             "moye ({provider}) | model: {}\n\
              \u{2500}\u{2500}\u{2500} \u{547d}\u{4ee4} \u{2500}\u{2500}\u{2500}\n\
              /model [slug]       \u{67e5}\u{770b}\u{6216}\u{5207}\u{6362}\u{5f53}\u{524d}\u{4f1a}\u{8bdd}\u{6a21}\u{578b}\n\
-             /models             \u{6253}\u{5f00}\u{4ea4}\u{4e92}\u{5f0f}\u{6a21}\u{578b}\u{9009}\u{62e9}\u{5668}\n\
+             /models             \u{6253}\u{5f00}\u{4f9b}\u{5e94}\u{5546}\u{9009}\u{62e9}\u{ff08}\u{4f9b}\u{5e94}\u{5546} \u{2192} \u{5957}\u{9910} \u{2192} \u{6a21}\u{578b}\u{ff0c}\u{5373}\u{65f6}\u{751f}\u{6548}\u{ff09}\n\
              /plan [plan]        \u{67e5}\u{770b}\u{6216}\u{5207}\u{6362} API \u{5957}\u{9910}\u{ff08}standard/coding/agent\u{ff0c}\u{9700}\u{91cd}\u{542f}\u{751f}\u{6548}\u{ff09}\n\
              /evolve             \u{89e6}\u{53d1}\u{63d0}\u{793a}\u{8bcd}\u{8fdb}\u{5316}\u{ff08}\u{8bc4}\u{4f30}\u{540e}\u{62e9}\u{4f18}\u{91c7}\u{7eb3}\u{ff09}\n\
              /evolve-code <f> <old> <new>  \u{4ee3}\u{7801}\u{81ea}\u{4fee}\u{6539}\u{ff08}\u{7f16}\u{8bd1}\u{9a8c}\u{8bc1} + \u{56de}\u{9000}\u{ff09}\n\

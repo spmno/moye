@@ -41,7 +41,7 @@ api_key_env = "AGENT_API_KEY"
 # Claude:    claude-fable-5 / claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5
 # Gemini:    gemini-3.1-pro-preview / gemini-3.6-flash / gemini-3.5-flash-lite
 # MiMo:      mimo-v2.5-pro / mimo-v2.5
-# Zhipu:     glm-5.2 / glm-5
+# Zhipu:     glm-5.3-flash / glm-5.2 / glm-5
 # 切换模型用 REPL 命令：model <slug>
 default_model = "glm-latest"
 # 自主循环上限：agent 最多执行的轮数。

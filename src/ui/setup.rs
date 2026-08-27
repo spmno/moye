@@ -22,14 +22,17 @@ use crate::config;
 use crate::providers::{ApiPlan, Provider, provider_models_for_plan};
 use crate::ui::selector::{SelectorItem, SelectorState};
 
-struct ProviderEntry {
-    slug: &'static str,
-    label: &'static str,
-    detail: &'static str,
-    api_key_env: &'static str,
+/// 供应商目录条目。setup 向导与 TUI 内 `/models` 供应商级切换共用此目录。
+/// Provider catalog entry. Shared by the setup wizard and the TUI `/models`
+/// provider-level switch flow.
+pub(crate) struct ProviderEntry {
+    pub(crate) slug: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) detail: &'static str,
+    pub(crate) api_key_env: &'static str,
 }
 
-const PROVIDERS: &[ProviderEntry] = &[
+pub(crate) const PROVIDERS: &[ProviderEntry] = &[
     ProviderEntry {
         slug: "deepseek",
         label: "DeepSeek",
@@ -63,7 +66,7 @@ const PROVIDERS: &[ProviderEntry] = &[
     ProviderEntry {
         slug: "zhipu",
         label: "Zhipu GLM",
-        detail: "智谱 GLM-5.2 / GLM-5",
+        detail: "智谱 GLM-5.3 Flash / GLM-5.2",
         api_key_env: "ZAI_API_KEY",
     },
     ProviderEntry {
@@ -258,7 +261,7 @@ fn parse_provider_entry(slug: &str) -> Provider {
     crate::providers::parse_provider(slug)
 }
 
-fn plan_detail(provider: Provider, plan: ApiPlan) -> &'static str {
+pub(crate) fn plan_detail(provider: Provider, plan: ApiPlan) -> &'static str {
     match (provider, plan) {
         (Provider::Volcengine, ApiPlan::Agent) => "api/plan/v3 · 订阅制，含多模态",
         (Provider::Volcengine, ApiPlan::Coding) => "api/coding/v3 · 编程套餐",

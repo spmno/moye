@@ -90,6 +90,16 @@ impl SelectorState {
         self.cursor = 0;
     }
 
+    /// 追加粘贴文本（如 API key），并回到列表顶部。
+    /// Append pasted text (e.g. an API key) and reset the cursor to the top.
+    pub fn input_paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.filter.push_str(text);
+        self.cursor = 0;
+    }
+
     /// 在可见列表上移动光标（边界夹紧）。
     /// Move the cursor over the visible list (clamped to bounds).
     pub fn move_cursor(&mut self, delta: isize) {

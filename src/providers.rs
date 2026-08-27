@@ -593,6 +593,10 @@ pub fn provider_models_for_plan(provider: Provider, plan: ApiPlan) -> Vec<ModelI
         ],
         (Provider::Zhipu, _) => vec![
             ModelInfo {
+                slug: "glm-5.3-flash".into(),
+                desc: "GLM-5.3 Flash · 快速经济，多模态，1M 上下文",
+            },
+            ModelInfo {
                 slug: "glm-5.2".into(),
                 desc: "GLM-5.2 · 旗舰，1M 上下文",
             },
@@ -905,6 +909,18 @@ mod tests {
         assert_eq!(slugs, ["deepseek-v4-pro", "deepseek-v4-flash"],);
     }
 
+    #[test]
+    fn setup_zhipu_standard_catalog_lists_flash_model() {
+        let models = provider_models_for_plan(Provider::Zhipu, ApiPlan::Standard);
+        let slugs: Vec<_> = models.iter().map(|model| model.slug.as_str()).collect();
+
+        assert!(
+            slugs.contains(&"glm-5.3-flash"),
+            "Zhipu standard catalog must expose glm-5.3-flash, got {slugs:?}",
+        );
+        assert_eq!(context_limit_for_model("glm-5.3-flash"), 1_000_000);
+    }
+
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -924,6 +940,7 @@ mod tests {
         assert!(is_reasoning_model("glm-latest"));
         assert!(is_reasoning_model("GLM-5.2"));
         assert!(is_reasoning_model("glm-4.7"));
+        assert!(is_reasoning_model("glm-5.3-flash"));
         // DeepSeek V4 系列（pro/flash）thinking 默认开启，输出 reasoning_content，
         // 属于推理模型。
         // DeepSeek V4 series (pro/flash) has thinking enabled by default and emits

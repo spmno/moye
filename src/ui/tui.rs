@@ -266,6 +266,124 @@ impl InputState {
 // ===== TUI state =====
 // ===== TUI 状态 =====
 
+/// `/models` 供应商级切换流：供应商 → 套餐 → 模型（custom 供应商先输入 base URL）。
+/// `/models` provider-level switch flow: provider → plan → model (custom providers
+/// prompt for a base URL first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitchStage {
+    Provider,
+    Plan,
+    CustomUrl,
+    Model,
+    ApiKey,
+}
+
+struct SwitchFlow {
+    stage: SwitchStage,
+    provider: &'static crate::ui::setup::ProviderEntry,
+    plan: crate::providers::ApiPlan,
+    base_url: Option<String>,
+    /// 模型页已选定、等待 API key 输入时暂存的模型 slug。
+    /// The model slug chosen on the model page while waiting for the API key input.
+    pending_model: Option<String>,
+}
+
+impl SwitchFlow {
+    /// 启动供应商选择页。
+    /// Start at the provider picker.
+    fn start() -> (Self, SelectorState) {
+        let items: Vec<SelectorItem> = crate::ui::setup::PROVIDERS
+            .iter()
+            .map(|p| SelectorItem {
+                label: p.label.to_string(),
+                detail: p.detail.to_string(),
+                data: Some(p.slug.to_string()),
+            })
+            .collect();
+        let selector = SelectorState::new(
+            "Select Provider / 选择供应商".into(),
+            items,
+            false,
+        );
+        (
+            Self {
+                stage: SwitchStage::Provider,
+                // 占位：Provider 页选中后立即覆盖；PROVIDERS 非空。
+                provider: &crate::ui::setup::PROVIDERS[0],
+                plan: crate::providers::ApiPlan::Standard,
+                base_url: None,
+                pending_model: None,
+            },
+            selector,
+        )
+    }
+
+    fn provider_enum(&self) -> crate::providers::Provider {
+        crate::providers::parse_provider(self.provider.slug)
+    }
+
+    /// 进入套餐选择页；供应商只有一个套餐时自动跳到模型页。
+    /// Open the plan picker; auto-advances to the model picker when the provider
+    /// has only one plan.
+    fn goto_plan(&mut self) -> Option<SelectorState> {
+        let provider = self.provider_enum();
+        let plans = provider.supported_plans();
+        if plans.len() <= 1 {
+            self.plan = crate::providers::ApiPlan::Standard;
+            return self.goto_model();
+        }
+        let items: Vec<SelectorItem> = plans
+            .iter()
+            .map(|p| SelectorItem {
+                label: p.label().to_string(),
+                detail: crate::ui::setup::plan_detail(provider, *p).to_string(),
+                data: Some(p.slug().to_string()),
+            })
+            .collect();
+        self.stage = SwitchStage::Plan;
+        Some(SelectorState::new(
+            "Select Plan / 选择套餐".into(),
+            items,
+            false,
+        ))
+    }
+
+    /// 进入模型选择页（custom 供应商无内置清单，靠输入自定义模型 ID）。
+    /// Open the model picker (custom has no catalog; the typed filter becomes the model ID).
+    fn goto_model(&mut self) -> Option<SelectorState> {
+        let provider = self.provider_enum();
+        let models = crate::providers::provider_models_for_plan(provider, self.plan);
+        let items: Vec<SelectorItem> = models
+            .iter()
+            .map(|m| SelectorItem {
+                label: m.slug.clone(),
+                detail: m.desc.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        self.stage = SwitchStage::Model;
+        Some(SelectorState::new(
+            format!("Select Model / 选择模型 ({})", self.provider.label),
+            items,
+            true,
+        ))
+    }
+
+    /// 进入 API key 输入页（空列表 + 自定义输入，回车提交输入内容）。
+    /// Open the API key input page (empty list + custom input; Enter submits the typed value).
+    fn goto_api_key(&mut self) -> SelectorState {
+        self.stage = SwitchStage::ApiKey;
+        SelectorState::new(
+            format!(
+                "API Key / 输入 {} 后回车（Esc 返回）",
+                self.provider.api_key_env
+            ),
+            vec![],
+            true,
+        )
+    }
+}
+
 struct TuiState {
     messages: Vec<AgentEvent>,
     input: InputState,
@@ -295,6 +413,10 @@ struct TuiState {
     /// 打开中的选择器（如 /models 模型选择）。非 None 时键盘输入进入选择器。
     /// Open selector (e.g. the /models model picker). When Some, keyboard input goes to it.
     selector: Option<SelectorState>,
+    /// `/models` 供应商级切换流状态；非 None 时选择器 Enter 结果进入下一级（供应商→套餐→模型）。
+    /// `/models` provider-level switch flow; when Some, selector Enter results advance
+    /// through the stages (provider → plan → model).
+    switch_flow: Option<SwitchFlow>,
     /// 当前文本选区（鼠标拖拽产生）。
     /// Current text selection (produced by mouse drag).
     selection: Option<Selection>,
@@ -340,6 +462,7 @@ impl TuiState {
             task_handle: None,
             needs_full_redraw: false,
             selector: None,
+            switch_flow: None,
             selection: None,
             msg_area: Rect::new(0, 0, 0, 0),
             msg_scroll: 0,
@@ -681,7 +804,14 @@ async fn run_loop(
                         if !state.thinking && state.hitl.is_none() =>
                     {
                         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                        state.input.insert_str(&text);
+                        // 选择器（/models 切换流，含 API key 输入页）打开时粘贴进过滤/输入框。
+                        // Paste into the filter/input box while a selector (the /models
+                        // switch flow, incl. the API key page) is open.
+                        if let Some(sel) = state.selector.as_mut() {
+                            sel.input_paste(text.trim());
+                        } else {
+                            state.input.insert_str(&text);
+                        }
                     }
                     _ => {}
                 }
@@ -762,6 +892,15 @@ fn handle_key_event(
             }
             KeyCode::Enter => {
                 let selected = state.selector.as_ref().and_then(|s| s.selection());
+                // 供应商级切换流：把选择结果交给流程状态机推进，不在此关闭选择器。
+                // Provider switch flow: hand the result to the flow state machine;
+                // it replaces the selector with the next stage (or closes it).
+                if state.switch_flow.is_some() {
+                    if let Some(item) = selected {
+                        handle_switch_select(state, ctx, item);
+                    }
+                    return;
+                }
                 state.selector = None;
                 if let Some(item) = selected {
                     // 历史项在 data 里编码了 "provider\nbase_url"；解码后连同恢复，否则只切 slug。
@@ -783,6 +922,29 @@ fn handle_key_event(
                 }
             }
             KeyCode::Esc => {
+                // 切换流中 Esc 逐级返回：key→模型；模型/套餐/URL 页→供应商页；供应商页→退出。
+                // In the switch flow, Esc goes back one stage: key→model; model/plan/URL
+                // pages → provider picker; provider page → cancel.
+                if let Some(flow) = &state.switch_flow {
+                    match flow.stage {
+                        SwitchStage::Provider => {
+                            state.switch_flow = None;
+                            state.selector = None;
+                        }
+                        SwitchStage::ApiKey => {
+                            if let Some(flow) = state.switch_flow.as_mut() {
+                                flow.pending_model = None;
+                                state.selector = flow.goto_model();
+                            }
+                        }
+                        _ => {
+                            let (flow, selector) = SwitchFlow::start();
+                            state.switch_flow = Some(flow);
+                            state.selector = Some(selector);
+                        }
+                    }
+                    return;
+                }
                 state.selector = None;
             }
             KeyCode::Backspace => {
@@ -1012,35 +1174,11 @@ fn handle_command(
             state.push_event(AgentEvent::Info(format!("model: {}", state.model)));
         }
         ReplCommand::Models => {
-            let provider = crate::providers::current_provider();
-            let plan = crate::providers::current_plan();
-            let mut items: Vec<SelectorItem> =
-                crate::providers::provider_models_for_plan(provider, plan)
-                    .into_iter()
-                    .map(|m| SelectorItem {
-                        label: m.slug,
-                        detail: m.desc.to_string(),
-                        ..Default::default()
-                    })
-                    .collect();
-            // 追加最近使用模型（去重内置清单已列出的 slug），标注使用次数；
-            // Custom 供应商无内置清单时，历史是主要来源。
-            let hist = ctx.model_history.lock().unwrap();
-            for r in hist.recent(10) {
-                if !items.iter().any(|i| i.label == r.slug) {
-                    items.push(SelectorItem {
-                        label: r.slug.clone(),
-                        detail: format!("\u{6700}\u{8fd1}\u{4f7f}\u{7528} {} \u{6b21}", r.uses),
-                        data: Some(format!("{}\n{}", r.provider, r.base_url)),
-                    });
-                }
-            }
-            drop(hist);
-            state.selector = Some(SelectorState::new(
-                format!("{provider:?} \u{6a21}\u{578b}\u{9009}\u{62e9} / Models"),
-                items,
-                true,
-            ));
+            // 供应商级切换流：供应商 → 套餐 → 模型（即时生效 + .env 持久化）。
+            // Provider-level switch flow: provider → plan → model (applies live, persists to .env).
+            let (flow, selector) = SwitchFlow::start();
+            state.switch_flow = Some(flow);
+            state.selector = Some(selector);
         }
         ReplCommand::Plan { plan } => {
             let msg = ctx.cmd_plan(plan);
@@ -1118,6 +1256,247 @@ fn handle_command(
             state.push_event(AgentEvent::Error(msg.to_string()));
         }
     }
+}
+
+/// 处理 `/models` 供应商切换流中选择器 Enter 的结果，按当前阶段推进或完成切换。
+/// Handles a selector Enter in the `/models` provider switch flow: advances the
+/// stage, or finalizes the switch at the model stage.
+fn handle_switch_select(state: &mut TuiState, ctx: &Arc<AppContext>, item: SelectorItem) {
+    let Some(flow) = state.switch_flow.as_mut() else {
+        state.selector = None;
+        return;
+    };
+    match flow.stage {
+        SwitchStage::Provider => {
+            let slug = item.data.as_deref().unwrap_or("");
+            let Some(entry) = crate::ui::setup::PROVIDERS
+                .iter()
+                .find(|p| p.slug == slug)
+            else {
+                state.switch_flow = None;
+                state.selector = None;
+                return;
+            };
+            flow.provider = entry;
+            flow.plan = crate::providers::ApiPlan::Standard;
+            flow.base_url = None;
+            if entry.slug == "custom" {
+                // custom 无内置目录：先让用户输入 base URL，再输入模型 ID。
+                // custom has no catalog: prompt for base URL, then the model ID.
+                flow.stage = SwitchStage::CustomUrl;
+                state.selector = Some(SelectorState::new(
+                    "Custom Base URL / 自定义网关（输入完整 URL 后回车）".into(),
+                    vec![],
+                    true,
+                ));
+            } else if let Some(next) = flow.goto_plan() {
+                state.selector = Some(next);
+            }
+        }
+        SwitchStage::Plan => {
+            if let Some(plan_slug) = item.data.as_deref() {
+                flow.plan = crate::providers::ApiPlan::parse(plan_slug);
+            }
+            state.selector = flow.goto_model();
+        }
+        SwitchStage::CustomUrl => {
+            let url = item.label.trim().to_string();
+            if url.is_empty() {
+                return;
+            }
+            flow.base_url = Some(url);
+            state.selector = Some(SelectorState::new(
+                "Custom Model ID / 模型 ID（输入后回车）".into(),
+                vec![],
+                true,
+            ));
+            flow.stage = SwitchStage::Model;
+        }
+        SwitchStage::Model => {
+            let model = item.label.trim().to_string();
+            if model.is_empty() {
+                return;
+            }
+            let api_key_env = flow.provider.api_key_env;
+            let key_present = std::env::var(api_key_env).is_ok()
+                || crate::config::config()
+                    .map(|c| c.keys.contains_key(api_key_env))
+                    .unwrap_or(false);
+            if key_present {
+                let flow = state.switch_flow.take().unwrap();
+                state.selector = None;
+                finalize_switch(state, ctx, &flow, model, None);
+            } else {
+                flow.pending_model = Some(model);
+                state.selector = Some(flow.goto_api_key());
+            }
+        }
+        SwitchStage::ApiKey => {
+            let key = item.label.trim().to_string();
+            if key.is_empty() {
+                return;
+            }
+            let model = flow.pending_model.clone().unwrap_or_default();
+            let flow = state.switch_flow.take().unwrap();
+            state.selector = None;
+            finalize_switch(state, ctx, &flow, model, Some(key));
+        }
+    }
+}
+
+/// 切换流终点：应用 session 级 provider/base_url/model 覆盖（即时生效），
+/// 持久化到 .env（重启保持）；用户输入了 API key 时一并写入并注入当前进程环境。
+/// Flow endpoint: applies session-level provider/base_url/model overrides (live),
+/// persists to .env (survives restart); when the user entered an API key, writes it
+/// to .env and injects it into the current process env so it works without restart.
+fn finalize_switch(
+    state: &mut TuiState,
+    ctx: &Arc<AppContext>,
+    flow: &SwitchFlow,
+    model: String,
+    api_key: Option<String>,
+) {
+    let provider_enum = flow.provider_enum();
+    let slug = flow.provider.slug;
+    let base_url = flow
+        .base_url
+        .clone()
+        .unwrap_or_else(|| provider_enum.base_url_for_plan(flow.plan).to_string());
+    let api_key_env = flow.provider.api_key_env;
+
+    ctx.registry.set_session_provider(slug);
+    ctx.registry.set_session_base_url(&base_url);
+    ctx.registry.set_session_model(&model);
+
+    {
+        let mut hist = ctx.model_history.lock().unwrap();
+        hist.record(&model, slug, &base_url);
+        let _ = hist.save();
+    }
+
+    let mut env_err: Option<String> = None;
+    if let Err(e) = persist_switch_to_env(slug, flow.plan, flow.base_url.as_deref()) {
+        env_err = Some(e.to_string());
+    }
+    if let Some(ref key) = api_key {
+        if let Err(e) = persist_key_to_env(api_key_env, key) {
+            env_err = Some(e.to_string());
+        } else {
+            // 注入当前进程环境：create_client_with 从 env 读 key，本会话立即生效，无需重启。
+            // Inject into the current process env: create_client_with reads the key from
+            // env, so the new key takes effect this session without a restart.
+            unsafe {
+                std::env::set_var(api_key_env, key);
+            }
+        }
+    }
+
+    state.provider = format!("{provider_enum:?}");
+    state.model = ctx.current_model();
+    match env_err {
+        Some(e) => state.push_event(AgentEvent::Info(format!(
+            "已切换到 {} / {}（.env 写入失败: {e}；本次会话生效）",
+            flow.provider.label, state.model
+        ))),
+        None => state.push_event(AgentEvent::Info(format!(
+            "provider: {} ({}) | model: {} | base_url: {}",
+            flow.provider.label,
+            flow.plan.label(),
+            state.model,
+            base_url,
+        ))),
+    }
+    if api_key.is_some() {
+        state.push_event(AgentEvent::Info(format!(
+            "API key 已保存到 .env（{api_key_env}），本次会话已生效。"
+        )));
+    } else if std::env::var(api_key_env).is_err() {
+        state.push_event(AgentEvent::Info(format!(
+            "⚠ 未检测到 {api_key_env}。请在项目根 .env 中添加 `{api_key_env}=<你的 key>` 后重启 moye。"
+        )));
+    }
+}
+
+/// 把 API key 写入项目根 `.env`：更新或新增 `<KEY_ENV>=<key>` 行，不触碰其他行。
+/// Writes the API key to the project-root `.env`: updates or adds the `<KEY_ENV>=<key>`
+/// line, leaving every other line untouched.
+fn persist_key_to_env(key_env: &str, key: &str) -> std::io::Result<()> {
+    let path = ".env";
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let mut out = String::new();
+    let mut written = false;
+    for line in existing.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('#')
+            && trimmed.contains('=')
+            && trimmed.split('=').next().unwrap_or("").trim() == key_env
+        {
+            out.push_str(&format!("{key_env}={key}\n"));
+            written = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !written {
+        out.push_str(&format!("{key_env}={key}\n"));
+    }
+    std::fs::write(path, out)
+}
+
+/// 把切换结果写入项目根 `.env`：更新 AGENT_PROVIDER / AGENT_PLAN / AGENT_BASE_URL 行，
+/// 不触碰任何 API key 行。文件不存在时创建。
+/// Persists the switch to the project-root `.env`: updates AGENT_PROVIDER /
+/// AGENT_PLAN / AGENT_BASE_URL lines, never touches API-key lines. Creates the file if missing.
+fn persist_switch_to_env(
+    provider: &str,
+    plan: crate::providers::ApiPlan,
+    base_url: Option<&str>,
+) -> std::io::Result<()> {
+    let path = ".env";
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let mut keys: Vec<(&str, Option<String>)> = vec![("AGENT_PROVIDER", Some(provider.to_string()))];
+    let plan_val = if provider != "custom" && plan != crate::providers::ApiPlan::Standard {
+        Some(plan.slug().to_string())
+    } else {
+        None
+    };
+    keys.push(("AGENT_PLAN", plan_val));
+    let url_val = if provider == "custom" {
+        base_url.map(str::to_string)
+    } else {
+        None
+    };
+    keys.push(("AGENT_BASE_URL", url_val));
+
+    let mut handled = vec![false; keys.len()];
+    let mut out = String::new();
+    for line in existing.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') || !trimmed.contains('=') {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let key = trimmed.split('=').next().unwrap_or("").trim();
+        if let Some(idx) = keys.iter().position(|(k, _)| *k == key) {
+            if let Some(val) = &keys[idx].1 {
+                out.push_str(&format!("{key}={val}\n"));
+            }
+            handled[idx] = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    for (i, (k, val)) in keys.iter().enumerate() {
+        if !handled[i] {
+            if let Some(v) = val {
+                out.push_str(&format!("{k}={v}\n"));
+            }
+        }
+    }
+    std::fs::write(path, out)
 }
 
 // ===== Action handling =====

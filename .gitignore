@@ -7,3 +7,5 @@ agent.toml
 logs/
 .sisyphus/
 result/
+.codegraph/codegraph.db
+/.codegraph

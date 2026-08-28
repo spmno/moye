@@ -490,6 +490,18 @@ impl TuiState {
         self.messages.push(event);
     }
 
+    /// 切换模型/供应商后，更新首条 System 消息使其反映当前状态。
+    /// 显示窗口（消息区）的首行是启动时推入的 System 消息，内含 provider/model；
+    /// 若不刷新，切模型后该行仍显示旧值，而侧栏已更新，造成信息不一致。
+    /// Refresh the first System message to reflect the current provider/model after a switch.
+    /// The display window's first line is the System message pushed at startup; without
+    /// refreshing it, the old model/provider lingers while the sidebar already updated.
+    fn refresh_system_header(&mut self) {
+        if let Some(AgentEvent::System(text)) = self.messages.iter_mut().next() {
+            *text = format!("moye ({}) | model: {}", self.provider, self.model);
+        }
+    }
+
     /// 新事件到达时调用：仅在用户未手动上翻时自动滚到底部。
     /// Called when a new event arrives: only auto-scrolls to bottom if the user hasn't manually scrolled up.
     fn reset_scroll(&mut self) {
@@ -916,8 +928,12 @@ fn handle_key_event(
                             Some((Some(p), Some(b)))
                         })
                         .unwrap_or((None, None));
-                    ctx.cmd_model(Some(item.label.clone()), provider, base_url);
+                    ctx.cmd_model(Some(item.label.clone()), provider.clone(), base_url);
                     state.model = ctx.current_model();
+                    if let Some(p) = provider.as_ref() {
+                        state.provider = format!("{:?}", crate::providers::parse_provider(p));
+                    }
+                    state.refresh_system_header();
                     state.push_event(AgentEvent::Info(format!("model: {}", state.model)));
                 }
             }
@@ -1171,6 +1187,7 @@ fn handle_command(
         ReplCommand::Model { slug } => {
             ctx.cmd_model(slug, None, None);
             state.model = ctx.current_model();
+            state.refresh_system_header();
             state.push_event(AgentEvent::Info(format!("model: {}", state.model)));
         }
         ReplCommand::Models => {
@@ -1391,8 +1408,24 @@ fn finalize_switch(
         }
     }
 
+    // persist_switch_to_env 只写 .env 文件，不更新进程环境；current_plan() /
+    // Provider::from_env() 读的是进程 env，不注入则侧栏 plan 和后续 cmd_plan
+    // 仍显示旧值。session 级 override 已由 set_session_* 设置，这里同步 env 仅为
+    // 让读取 env 的显示路径（侧栏 plan、日志）与本会话一致。
+    unsafe {
+        std::env::set_var("AGENT_PROVIDER", slug);
+        if provider_enum != crate::providers::Provider::Custom
+            && flow.plan != crate::providers::ApiPlan::Standard
+        {
+            std::env::set_var("AGENT_PLAN", flow.plan.slug());
+        } else {
+            std::env::remove_var("AGENT_PLAN");
+        }
+    }
+
     state.provider = format!("{provider_enum:?}");
     state.model = ctx.current_model();
+    state.refresh_system_header();
     match env_err {
         Some(e) => state.push_event(AgentEvent::Info(format!(
             "已切换到 {} / {}（.env 写入失败: {e}；本次会话生效）",

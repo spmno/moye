@@ -9,3 +9,4 @@ logs/
 result/
 .codegraph/codegraph.db
 /.codegraph
+pp.txt

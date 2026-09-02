@@ -852,7 +852,7 @@ pub fn sdd_retry_prompt(message: &str, plan: &str, built: &str, reason: &str) ->
 /// 构建审计澄清响应。
 /// Builds the clarify response when the Auditor requests clarification.
 pub fn sdd_clarify_response(question: &str, built: &str) -> String {
-    format!("需需要澄清：{question}\n\n已产出的工作：\n{built}")
+    format!("需要澄清：{question}\n\n已产出的工作：\n{built}")
 }
 
 /// 判断构建者产出是否为退化输出（空白或过短），用于拦截静默失败。

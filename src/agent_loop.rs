@@ -475,8 +475,8 @@ impl ContextHook {
         }
         let remaining = self.max_turns.saturating_sub(turn);
         Some(format!(
-            "[\u{7cfb}\u{7edf}\u{63d0}\u{793a}] \u{4f60}\u{5df2}\u{4f7f}\u{7528} {}/{} \u{8f6e}\u{ff0c}\u{5269}\u{4f59} {} \u{8f6e}\u{3002}\u{8bf7}\u{4f18}\u{5148}\u{6536}\u{655b}\u{5230}\u{7ed3}\u{8bba}\u{ff0c}\u{907f}\u{514d}\u{8fc7}\u{5ea6}\u{63a2}\u{7d22}\u{3002}\n\
-             [System] {}/{} turns used, {} remaining. Prioritize converging to a conclusion, avoid excessive exploration.",
+            "[\u{7cfb}\u{7edf}\u{63d0}\u{793a}] \u{4f60}\u{5df2}\u{4f7f}\u{7528} {}/{} \u{8f6e}\u{ff0c}\u{5269}\u{4f59} {} \u{8f6e}\u{3002}\u{8bf7}\u{4f18}\u{5148}\u{6536}\u{655b}\u{5230}\u{7ed3}\u{8bba}\u{ff0c}\u{907f}\u{514d}\u{8fc7}\u{5ea6}\u{63a2}\u{7d22}\u{3002}\u{4e0d}\u{8981}\u{5411}\u{7528}\u{6237}\u{63d0}\u{95ee}\u{ff0c}\u{9047}\u{5230}\u{56f0}\u{96be}\u{81ea}\u{884c}\u{5224}\u{65ad}\u{5e76}\u{7ee7}\u{7eed}\u{3002}\n\
+             [System] {}/{} turns used, {} remaining. Prioritize converging to a conclusion, avoid excessive exploration. Do not ask the user questions — make your own judgment and continue.",
             turn, self.max_turns, remaining, turn, self.max_turns, remaining,
         ))
     }
@@ -558,8 +558,8 @@ impl ContextHook {
         let summary_msg =
             Message::system(format!("[对话历史摘要 / Conversation Summary]\n{summary}"));
         let continue_msg = Message::system(
-            "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.\n\
-             \u{5982}\u{679c}\u{6709}\u{540e}\u{7eed}\u{6b65}\u{9aa4}\u{8bf7}\u{7ee7}\u{7eed}\u{ff0c}\u{5426}\u{5219}\u{8bf7}\u{6c42}\u{6f84}\u{6e05}\u{3002}",
+            "Continue executing the task based on the summary above. Do not stop to ask questions — make your best judgment and proceed.\n\
+             基于上方摘要继续执行任务，不要停下来提问，自行判断并推进。",
         );
         let compacted: Vec<Message> = std::iter::once(summary_msg)
             .chain(recent.iter().cloned())
@@ -959,8 +959,8 @@ pub async fn run_autonomous(
                     let keep = 4;
                     let retained: Vec<Message> = hist[old_len - keep..].to_vec();
                     *hist = std::iter::once(Message::system(
-                        "[反应式压缩 / Reactive compaction] 上下文溢出，旧对话历史已截断。请基于保留的近期消息继续。\n\
-                         [System] Context overflow — old history truncated. Continue from the retained recent messages."
+                        "[反应式压缩 / Reactive compaction] 上下文溢出，旧对话历史已截断。请基于保留的近期消息继续，不要停下来提问。\n\
+                         [System] Context overflow — old history truncated. Continue from the retained recent messages. Do not stop to ask questions."
                     ))
                     .chain(retained)
                     .collect();

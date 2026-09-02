@@ -260,7 +260,20 @@ pub fn extract_text(msg: &Message) -> String {
                             tc.function.name, tc.function.arguments
                         ));
                     }
-                    _ => {}
+                    AssistantContent::Reasoning(r) => {
+                        // 提取 reasoning 文本用于 token 估算和摘要，跳过加密/不可读变体。
+                        // Extract reasoning text for token estimation and summaries; skip opaque variants.
+                        use rig_core::completion::message::ReasoningContent;
+                        for rc in &r.content {
+                            match rc {
+                                ReasoningContent::Text { text, .. } => parts.push(text.clone()),
+                                ReasoningContent::Summary(s) => parts.push(s.clone()),
+                                ReasoningContent::Encrypted(_) | ReasoningContent::Redacted { .. } => {}
+                            _ => {}
+                            }
+                        }
+                    }
+                    AssistantContent::Image(_) => {} // 图像内容无可提取文本
                 }
             }
             parts.join("\n")

@@ -2010,6 +2010,43 @@ fn parse_usage_tokens(usage: &str) -> u64 {
         .sum()
 }
 
+/// 把当前工作目录格式化为适合侧边栏窄列显示的短路径：
+/// home 目录替换为 `~`；超长时从前面按路径段丢弃并加 `…/` 前缀，
+/// 尽量保留尾部完整段（当前目录名优先可见）。
+/// Format the current working directory into a short path for the narrow
+/// sidebar column: home dir → `~`; when too long, leading segments are dropped
+/// with a `…/` prefix, keeping trailing segments (cwd name) visible.
+fn format_workdir(max_len: usize) -> String {
+    let path = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(_) => return String::from("?"),
+    };
+    let mut s = path.display().to_string();
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() && s.starts_with(&home) {
+            s = format!("~{}", &s[home.len()..]);
+        }
+    }
+    if s.chars().count() <= max_len {
+        return s;
+    }
+    let parts: Vec<&str> = s.split('/').collect();
+    // 从尾部保留尽可能多的完整路径段，前面用 …/ 省略。
+    for keep in (1..parts.len()).rev() {
+        let joined = parts[parts.len() - keep..].join("/");
+        let with_prefix = format!("\u{2026}/{}", joined);
+        if with_prefix.chars().count() <= max_len {
+            return with_prefix;
+        }
+    }
+    // 连最后一个段都放不下，截断末尾字符。
+    let last = parts.last().copied().unwrap_or("");
+    let chars: Vec<char> = last.chars().collect();
+    let take = max_len.saturating_sub(1);
+    let tail: String = chars[chars.len().saturating_sub(take)..].iter().collect();
+    format!("\u{2026}{tail}")
+}
+
 fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
     let block = Block::default()
         .borders(Borders::LEFT)
@@ -2017,6 +2054,13 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
         .padding(Padding::horizontal(1));
 
     let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::styled("CWD", theme::status_dim()));
+    lines.push(Line::styled(
+        format!(" {}", format_workdir(area.width.saturating_sub(5) as usize)),
+        theme::status_model(),
+    ));
+    lines.push(Line::default());
 
     lines.push(Line::styled("Provider", theme::status_dim()));
     lines.push(Line::styled(

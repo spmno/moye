@@ -588,10 +588,25 @@ fn render_event(event: &AgentEvent) -> Vec<Line<'static>> {
             rendered.into_iter().collect()
         }
         AgentEvent::ToolCall { name, desc } => {
-            let mut v = vec![Line::from(vec![
-                Span::styled("\u{1f527} ", theme::tool_call()),
-                Span::styled(format!("{name}: {desc}"), theme::tool_call()),
-            ])];
+            let sty = theme::tool_call();
+            let mut v: Vec<Line<'static>> = vec![];
+            // 按 \n 拆分为多行：ratatui 的 Line 不识别内嵌换行符，
+            // 若把多行 desc 塞进单个 Span，所有内容会被压成一行，
+            // 超出终端宽度后截断，代码无法阅读（edit_file 的 old/new、
+            // run_bash 的多行命令均受此影响）。
+            // Split desc on \n into separate Lines: ratatui's Line does
+            // not honor embedded newlines, so a multi-line desc in a single
+            // Span gets squashed into one visual row and truncated.
+            let mut lines = desc.split('\n');
+            if let Some(first) = lines.next() {
+                v.push(Line::from(vec![
+                    Span::styled("\u{1f527} ", sty),
+                    Span::styled(format!("{name}: {first}"), sty),
+                ]));
+            }
+            for line in lines {
+                v.push(Line::from(Span::styled(line.to_string(), sty)));
+            }
             v.push(Line::default());
             v
         }

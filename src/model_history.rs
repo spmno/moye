@@ -128,6 +128,7 @@ impl ModelHistory {
 
     /// 返回最近 `n` 条记录（已按最近使用排序）。
     /// Return the most recent `n` records (already sorted by most-recently-used first).
+    #[allow(dead_code)] // 仅测试中使用；作为公共 API 保留供未来调用
     pub fn recent(&self, n: usize) -> &[ModelRecord] {
         let end = n.min(self.records.len());
         &self.records[..end]

@@ -680,8 +680,27 @@ fn format_tool_call_desc(tool_name: &str, args: &str) -> String {
             let path = get_str("path").unwrap_or_default();
             let old = get_str("old").unwrap_or_default();
             let new = get_str("new").unwrap_or_default();
+            // 对多行 old/new 做缩进并截断，使代码块在 TUI 中更易读
+            let fmt_block = |s: &str| -> String {
+                let lines: Vec<&str> = s.lines().collect();
+                if lines.is_empty() {
+                    return String::new();
+                }
+                if lines.len() == 1 {
+                    return lines[0].to_string();
+                }
+                const MAX: usize = 10;
+                let head = &lines[..lines.len().min(MAX)];
+                let mut out = format!("\n    {}", head.join("\n    "));
+                if lines.len() > MAX {
+                    out.push_str(&format!("\n    \u{2026}({})", lines.len()));
+                }
+                out
+            };
             format!(
-                "edit_file \u{2192} \u{7f16}\u{8f91}\u{6587}\u{4ef6}: {path}\n  \u{66ff}\u{6362}: {old}\n  \u{66ff}\u{6362}\u{4e3a}: {new}"
+                "edit_file \u{2192} \u{7f16}\u{8f91}\u{6587}\u{4ef6}: {path}\n  \u{66ff}\u{6362}: {}\n  \u{66ff}\u{6362}\u{4e3a}: {}",
+                fmt_block(&old),
+                fmt_block(&new),
             )
         }
         "write_file" => {

@@ -284,6 +284,7 @@ impl AppContext {
              /history [n]        \u{67e5}\u{770b}\u{6700}\u{8fd1} n \u{8f6e}\u{5bf9}\u{8bdd}\u{8bb0}\u{5f55}\u{ff08}\u{9ed8}\u{8ba4} 10\u{ff09}\n\
              /lessons            \u{67e5}\u{770b}\u{5df2}\u{79ef}\u{7d2f}\u{7684}\u{7ecf}\u{9a8c}\u{6559}\u{8bad}\n\
              /trust              \u{5207}\u{6362}\u{6c99}\u{7bb1}\u{4fe1}\u{4efb}\u{6a21}\u{5f0f}\u{ff08}\u{5f00}\u{542f}\u{540e}\u{6c99}\u{7bb1}\u{5916}\u{8bbf}\u{95ee}\u{81ea}\u{52a8}\u{6388}\u{6743}\u{ff0c}\u{4e0d}\u{518d}\u{5f39}\u{7a97}\u{786e}\u{8ba4}\u{ff09}\n\
+             /rewind            \u{56de}\u{6eda}\u{67d0}\u{6b21}\u{4efb}\u{52a1}\u{6539}\u{52a8}\u{7684}\u{6587}\u{4ef6} / rewind a task's file changes\n\
              /context            \u{67e5}\u{770b}\u{5f53}\u{524d}\u{4e0a}\u{4e0b}\u{6587}\u{ff08}\u{6a21}\u{578b}\u{3001}token \u{7528}\u{91cf}\u{3001}\u{6d88}\u{606f}\u{5386}\u{53f2}\u{7b49}\u{ff09}\n\
              /help               \u{663e}\u{793a}\u{672c}\u{5e2e}\u{52a9}\n\
              /quit               \u{9000}\u{51fa}\u{7a0b}\u{5e8f}\n\

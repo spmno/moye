@@ -24,6 +24,28 @@ pub struct FileEdit {
     pub new: String,
 }
 
+/// todo_write 工具的任务状态。
+/// Task status for the todo_write tool.
+///
+/// 序列化为 `snake_case`：`pending` / `in_progress` / `completed`。
+/// Serialized as `snake_case`: `pending` / `in_progress` / `completed`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// todo_write 工具的单条任务项：id + 内容 + 状态。
+/// A single todo item for the todo_write tool: id + content + status.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct TodoItem {
+    pub id: String,
+    pub content: String,
+    pub status: TodoStatus,
+}
+
 /// Agent 事件。领域层产生，表示层消费。
 /// Agent events. Produced by the domain layer, consumed by the presentation layer.
 ///
@@ -122,6 +144,11 @@ pub enum AgentEvent {
         old_tokens: usize,
         new_tokens: usize,
     },
+    /// todo_write 工具更新了任务列表——领域→表示层事件，由侧边栏消费。
+    /// The todo_write tool updated the todo list — domain→presentation event,
+    /// consumed by the sidebar. Sidebar-only: never rendered in the message stream
+    /// (the tool call/result lines already show in-stream).
+    TodoUpdate { todos: Vec<TodoItem> },
 }
 
 /// 事件 channel 发送端。

@@ -13,7 +13,7 @@ use rig_core::completion::Message;
 use rig_core::completion::message::{AssistantContent, UserContent};
 use serde::Deserialize;
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
@@ -88,6 +88,47 @@ impl Default for ToolPerms {
     }
 }
 
+/// 可构建的 agent 规格：把"角色"泛化为可构建的 agent 规格。
+/// A buildable agent spec: generalizes "role" into a constructible spec.
+///
+/// 内置角色通过 `agent_spec(role)` 从现有角色配置构建；
+/// 自定义子代理通过 `custom_spec(name)` 从 `[agents.custom.<name>]` 构建。
+/// Built-in roles build from existing role config via `agent_spec(role)`;
+/// custom sub-agents build from `[agents.custom.<name>]` via `custom_spec(name)`.
+pub struct AgentSpec {
+    /// 用于日志/Info 行的名称（如 "investigator"、"researcher"）。
+    /// Name used in logs and Info lines (e.g. "investigator", "researcher").
+    pub name: String,
+    /// 相对项目根目录的 preamble 文件路径。
+    /// Preamble file path, relative to the project root.
+    pub preamble_path: String,
+    /// 按工具的权限分级（驱动 HitlHook 门控）。
+    /// Per-tool permission tiers (drives the HitlHook gate).
+    pub permissions: ToolPerms,
+    /// 模型；None 时用会话/注册表默认模型。
+    /// Model; None → registry/session default.
+    pub model: Option<String>,
+    /// 自主循环轮数上限；None 时用注册表默认。
+    /// Max turns for the autonomous loop; None → registry default.
+    pub max_turns: Option<usize>,
+    /// 内嵌 preamble 回退（内置角色有，自定义子代理无）。
+    /// Embedded preamble fallback (built-in roles have it, custom sub-agents don't).
+    pub embedded_preamble: Option<&'static str>,
+}
+
+impl std::fmt::Debug for AgentSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentSpec")
+            .field("name", &self.name)
+            .field("preamble_path", &self.preamble_path)
+            .field("permissions", &self.permissions)
+            .field("model", &self.model)
+            .field("max_turns", &self.max_turns)
+            .field("embedded_preamble", &self.embedded_preamble.map(|s| s.len()))
+            .finish()
+    }
+}
+
 /// 单条权限：允许 / 需询问 / 拒绝。
 /// A single permission: Allow / Ask / Deny.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
@@ -125,6 +166,22 @@ impl ToolPerms {
             "web_fetch" => self.web_fetch,
             "web_search" => self.web_search,
             "run_file" => self.run_bash_mutating,
+            // bash_output reads session-state (buffer + status) — same tier as read-only bash.
+            // bash_output 读取会话状态（缓冲区 + 状态）——同只读 bash 等级。
+            "bash_output" => self.run_bash_readonly,
+            // kill_shell terminates a process — same tier as mutating bash.
+            // kill_shell 终止进程——同会改变状态的 bash 等级。
+            "kill_shell" => self.run_bash_mutating,
+            // todo_write 只改 UI 可见会话状态，无文件系统/系统副作用——同 read_file 安全类，静默放行。
+            // todo_write only mutates UI-visible session state, no fs/system side effects —
+            // same safety class as read_file, auto-allow without HITL popup.
+            "todo_write" => Permission::Allow,
+            // task 是编排机制（扇出子代理），子代理自身的权限由其角色决定；
+            // 同 todo_write 安全类，静默放行，否则每次调用都弹窗。
+            // task is an orchestration mechanism (fanout subagents); subagent
+            // permissions are governed by their own role — same safety class as
+            // todo_write, auto-allow without HITL popup.
+            "task" => Permission::Allow,
             "run_bash" => {
                 let command = args.get("command").and_then(|c| c.as_str()).unwrap_or("");
                 if crate::tools::is_readonly_bash(command) {
@@ -319,6 +376,28 @@ pub struct AgentRegistry {
     /// 会话级 base_url 覆盖（切回历史模型时恢复）。None 时走 env > config > 默认。
     /// Session-level base_url override (restored when switching back). None falls through.
     session_base_url: Arc<Mutex<Option<String>>>,
+    /// todo_write 工具的共享 store + 事件发送端。
+    /// Shared store + event sender for the todo_write tool.
+    /// 由 Orchestrator 在 handle() 时设置；build() 时读取并传给 add_builtin_tools。
+    /// Set by the Orchestrator at handle() time; read by build() and passed to add_builtin_tools.
+    todo_ctx: Arc<Mutex<Option<crate::tools::TodoContext>>>,
+    /// task 工具（子代理扇出）的共享上下文。
+    /// Shared context for the task tool (subagent fanout).
+    /// 由 Orchestrator 在 handle() 时设置；build_runner_agent / build 时读取。
+    /// Set by the Orchestrator at handle() time; read by build_runner_agent / build.
+    task_ctx: Arc<Mutex<Option<crate::subagent::SubagentCtx>>>,
+    /// 子代理深度计数器：> 0 时 task_ctx_for_role 返回 None（防止递归扇出）。
+    /// Subagent depth counter: when > 0, task_ctx_for_role returns None
+    /// (prevents recursive fanout — subagents do NOT get the task tool).
+    subagent_depth: Arc<AtomicU32>,
+    /// 文件检查点存储——会话级共享，EditFile/WriteFile 在写入前记录快照。
+    /// File checkpoint store — session-shared; EditFile/WriteFile snapshot before writing.
+    checkpoints: Arc<crate::checkpoint::CheckpointStore>,
+    /// 共享后台 shell 注册表（dev server / watch 模式等长命令）。
+    /// Shared background shell registry (long commands like dev server / watch mode).
+    /// 一个 `Arc<BackgroundRegistry>` 在 Orchestrator 级别共享，通过 ToolDeps 注入。
+    /// One `Arc<BackgroundRegistry>` shared at Orchestrator level, injected via ToolDeps.
+    bg: Arc<crate::shell::BackgroundRegistry>,
 }
 
 impl AgentRegistry {
@@ -328,6 +407,7 @@ impl AgentRegistry {
         sandbox: Arc<dyn crate::seam::SandboxProvider>,
     ) -> Self {
         let session_model = std::env::var("AGENT_MODEL").ok();
+        let max_bash_output_chars = config.context.max_bash_output_chars;
         Self {
             config,
             mcp,
@@ -335,6 +415,13 @@ impl AgentRegistry {
             session_model: Arc::new(Mutex::new(session_model)),
             session_provider: Arc::new(Mutex::new(None)),
             session_base_url: Arc::new(Mutex::new(None)),
+            todo_ctx: Arc::new(Mutex::new(None)),
+            task_ctx: Arc::new(Mutex::new(None)),
+            subagent_depth: Arc::new(AtomicU32::new(0)),
+            checkpoints: Arc::new(crate::checkpoint::CheckpointStore::new()),
+            bg: Arc::new(crate::shell::BackgroundRegistry::new(
+                max_bash_output_chars,
+            )),
         }
     }
 
@@ -348,6 +435,11 @@ impl AgentRegistry {
             session_model: self.session_model.clone(),
             session_provider: self.session_provider.clone(),
             session_base_url: self.session_base_url.clone(),
+            todo_ctx: self.todo_ctx.clone(),
+            task_ctx: self.task_ctx.clone(),
+            subagent_depth: self.subagent_depth.clone(),
+            checkpoints: self.checkpoints.clone(),
+            bg: self.bg.clone(),
         }
     }
 
@@ -381,6 +473,62 @@ impl AgentRegistry {
         self.session_base_url.lock().unwrap().clone()
     }
 
+    /// 设置 todo_write 工具的共享 store + 事件发送端。
+    /// Orchestrator 在 handle() 时调用，把 store + tx 注入 registry，
+    /// 随后 build() / build_runner_agent() 会传给 add_builtin_tools。
+    /// Sets the shared store + event sender for the todo_write tool.
+    /// Called by the Orchestrator at handle() time; build() / build_runner_agent()
+    /// then passes it to add_builtin_tools.
+    pub fn set_todo_ctx(&self, ctx: crate::tools::TodoContext) {
+        *self.todo_ctx.lock().unwrap() = Some(ctx);
+    }
+
+    pub fn todo_ctx(&self) -> Option<crate::tools::TodoContext> {
+        self.todo_ctx.lock().unwrap().clone()
+    }
+
+    /// Returns the todo_write context only for roles that should have the tool
+    /// (Builder + Orchestrator). Read-only roles (Investigator/Planner/Auditor) get None.
+    pub fn todo_ctx_for_role(&self, role: Role) -> Option<crate::tools::TodoContext> {
+        if matches!(role, Role::Builder | Role::Orchestrator) {
+            self.todo_ctx()
+        } else {
+            None
+        }
+    }
+
+    /// 设置 task 工具（子代理扇出）的共享上下文。
+    /// Orchestrator 在 handle() 时调用，把 sandbox + trust + tx + depth 注入 registry，
+    /// 随后 build() / build_runner_agent() 会传给 add_builtin_tools。
+    /// Sets the shared context for the task tool (subagent fanout).
+    /// Called by the Orchestrator at handle() time; build() / build_runner_agent()
+    /// then passes it to add_builtin_tools.
+    pub fn set_task_ctx(&self, ctx: crate::subagent::SubagentCtx) {
+        *self.task_ctx.lock().unwrap() = Some(ctx);
+    }
+
+    /// 返回子代理深度计数器的共享引用。
+    /// Returns the shared subagent depth counter.
+    pub fn subagent_depth(&self) -> Arc<AtomicU32> {
+        self.subagent_depth.clone()
+    }
+
+    /// 返回 task 工具上下文，仅限 Builder + Orchestrator 角色，且深度为 0 时。
+    /// 深度 > 0 时返回 None——子代理构建的 agent 不包含 task 工具（防止递归扇出）。
+    /// Returns the task tool context only for Builder + Orchestrator roles
+    /// when depth is 0. When depth > 0, returns None — subagent-built agents
+    /// do NOT include the task tool (prevents recursive fanout).
+    pub fn task_ctx_for_role(&self, role: Role) -> Option<crate::subagent::SubagentCtx> {
+        if self.subagent_depth.load(Ordering::Relaxed) > 0 {
+            return None;
+        }
+        if matches!(role, Role::Builder | Role::Orchestrator) {
+            self.task_ctx.lock().unwrap().clone()
+        } else {
+            None
+        }
+    }
+
     /// 构建客户端，应用 session 级 provider/base_url 覆盖（切回历史模型时走当时的网关）。
     /// Build a client applying session-level provider/base_url overrides
     /// (uses the gateway from the time when switching back to a historical model).
@@ -401,9 +549,23 @@ impl AgentRegistry {
         self.sandbox.clone()
     }
 
+    /// 返回共享的后台 shell 注册表。
+    /// Returns the shared background shell registry.
+    pub fn bg(&self) -> Arc<crate::shell::BackgroundRegistry> {
+        self.bg.clone()
+    }
+
+    /// 返回共享的文件检查点存储。
+    /// Returns the shared file checkpoint store.
+    pub fn checkpoints(&self) -> Arc<crate::checkpoint::CheckpointStore> {
+        self.checkpoints.clone()
+    }
+
+    #[allow(dead_code)]
     pub fn max_turns_for_role(&self, role: Role) -> usize {
         let key = format!("{role:?}").to_lowercase();
         self.config
+            .agents
             .roles
             .get(&key)
             .and_then(|rc| rc.max_turns)
@@ -426,6 +588,7 @@ impl AgentRegistry {
         let key = format!("{role:?}").to_lowercase();
         let rc = self
             .config
+            .agents
             .roles
             .get(&key)
             .ok_or_else(|| anyhow::anyhow!("no config for role {key}"))?;
@@ -491,8 +654,20 @@ impl AgentRegistry {
             // 沙箱以 `Arc<dyn SandboxProvider>` trait 对象注入（todo 4 迁移）——
             // build() 不再直接传具体 `Sandbox` 类型，使后端可在配置层切换。
             let sandbox_provider: Arc<dyn SandboxProvider> = self.sandbox.clone();
+            let deps = crate::tools::ToolDeps {
+                sandbox: sandbox_provider.clone(),
+                todo_ctx: self.todo_ctx_for_role(role),
+                task_ctx: self.task_ctx_for_role(role),
+                task_registry: self.clone(),
+                shells: Arc::new(crate::shell::LazyShell::new(
+                    sandbox_provider.clone(),
+                    self.context_config().max_bash_output_chars,
+                )),
+                bg: self.bg.clone(),
+                checkpoints: self.checkpoints.clone(),
+            };
             let builder =
-                crate::tools::add_builtin_tools(builder, self.context_config(), sandbox_provider);
+                crate::tools::add_builtin_tools(builder, self.context_config(), &deps);
             let builder = if !self.mcp.is_empty() {
                 let mut b = builder;
                 for (tools, sink) in self.mcp.all_tools_and_sinks() {
@@ -529,9 +704,11 @@ impl AgentRegistry {
     /// Gets the per-tool permission tiers for a role, for the autonomous loop's HITL (Human-in-the-Loop) gate per-call decisions
     /// （allow / ask / deny）。
     /// (allow / ask / deny).
+    #[allow(dead_code)]
     pub fn tool_perms(&self, role: Role) -> ToolPerms {
         let key = format!("{role:?}").to_lowercase();
         self.config
+            .agents
             .roles
             .get(&key)
             .map(|rc| rc.permissions.clone())
@@ -550,7 +727,48 @@ impl AgentRegistry {
     /// (the loop needs the raw `Agent`, not the `RoleAgent` wrapper).
     pub fn role_config(&self, role: Role) -> Option<&RoleConfig> {
         let key = format!("{role:?}").to_lowercase();
-        self.config.roles.get(&key)
+        self.config.agents.roles.get(&key)
+    }
+
+    /// 从内置角色配置构建 `AgentSpec`。
+    /// Builds an `AgentSpec` from a built-in role's config.
+    ///
+    /// 角色配置不存在时返回带默认值的 spec（与 `tool_perms()` 的降级行为一致）。
+    /// When the role config is absent, returns a spec with defaults
+    /// (consistent with `tool_perms()` fallback behavior).
+    pub fn agent_spec(&self, role: Role) -> AgentSpec {
+        let key = format!("{role:?}").to_lowercase();
+        let rc = self.config.agents.roles.get(&key);
+        AgentSpec {
+            name: key,
+            preamble_path: rc.map(|c| c.preamble.clone()).unwrap_or_default(),
+            permissions: rc.map(|c| c.permissions.clone()).unwrap_or_default(),
+            model: rc.map(|c| c.model.clone()),
+            max_turns: rc.and_then(|c| c.max_turns),
+            embedded_preamble: Some(crate::prompts::default_for(role)),
+        }
+    }
+
+    /// 从 `[agents.custom.<name>]` 构建 `AgentSpec`；未配置时返回 None。
+    /// Builds an `AgentSpec` from `[agents.custom.<name>]`; None if not configured.
+    pub fn custom_spec(&self, name: &str) -> Option<AgentSpec> {
+        let cc = self.config.agents.custom.get(name)?;
+        Some(AgentSpec {
+            name: name.to_string(),
+            preamble_path: cc.preamble.clone(),
+            permissions: cc.permissions.clone(),
+            model: cc.model.clone(),
+            max_turns: None,
+            embedded_preamble: None,
+        })
+    }
+
+    /// 返回已配置的所有自定义子代理名称（已排序，便于错误信息稳定）。
+    /// Returns all configured custom sub-agent names (sorted for stable error messages).
+    pub fn custom_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.config.agents.custom.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// 解析当前生效的模型：会话覆盖 → [agent].default_model → 各角色配置中的首选模型。
@@ -562,6 +780,7 @@ impl AgentRegistry {
                 return dm.clone();
             }
             self.config
+                .agents
                 .roles
                 .values()
                 .next()
@@ -1121,6 +1340,13 @@ pub struct Orchestrator {
     /// 跨消息对话历史：让 SDD 管线中各子 agent 能看到之前的对话。
     /// Cross-message conversation history: lets sub-agents in the SDD pipeline see prior turns.
     history: Arc<Mutex<Vec<Message>>>,
+    /// todo_write 工具的共享任务列表——同一 Orchestrator 的所有 Builder 实例共享。
+    /// Shared todo list for the todo_write tool — all Builder instances within one
+    /// Orchestrator share the same store.
+    todo_store: Arc<Mutex<Vec<crate::event::TodoItem>>>,
+    /// 文件检查点存储——会话级共享，/rewind 命令读取此存储回滚任务。
+    /// File checkpoint store — session-shared; the /rewind command reads this to rewind tasks.
+    checkpoints: Arc<crate::checkpoint::CheckpointStore>,
 }
 
 impl Orchestrator {
@@ -1144,11 +1370,14 @@ impl Orchestrator {
         } else {
             Sandbox::with_authorized_dirs(&authorized_dirs)
         };
+        let checkpoints = registry.checkpoints();
         Self {
             registry,
             sandbox,
             trust_sandbox: Arc::new(AtomicBool::new(trust)),
             history: Arc::new(Mutex::new(Vec::new())),
+            todo_store: Arc::new(Mutex::new(Vec::new())),
+            checkpoints,
         }
     }
 
@@ -1156,6 +1385,12 @@ impl Orchestrator {
     /// Returns a shared reference to the trust-mode flag, for TUI toggling.
     pub fn trust_sandbox(&self) -> Arc<AtomicBool> {
         self.trust_sandbox.clone()
+    }
+
+    /// 返回共享的文件检查点存储，供 /rewind 命令读取。
+    /// Returns the shared file checkpoint store, for the /rewind command to read.
+    pub fn checkpoints(&self) -> Arc<crate::checkpoint::CheckpointStore> {
+        self.checkpoints.clone()
     }
 
     /// 用 `--continue` 会话的对话历史替换当前历史，让新会话继承上一轮的上下文。
@@ -1172,6 +1407,28 @@ impl Orchestrator {
     }
 
     pub async fn handle(&self, message: &str, tx: &EventSender) -> anyhow::Result<String> {
+        // 开始一个新的任务：递增检查点计数器，使后续 EditFile/WriteFile 的
+        // record() 调用能记录到正确的任务 ID 下。
+        // Begin a new task: increment the checkpoint counter so subsequent
+        // EditFile/WriteFile record() calls land under the correct task ID.
+        self.checkpoints.begin_task();
+        // 把 todo_store + 当前 tx 注入 registry，使后续 build() / build_runner_agent()
+        // 构造的 TodoWrite 工具共享同一份 store 并能发出 TodoUpdate 事件。
+        // Inject the todo_store + current tx into the registry so that subsequent
+        // build() / build_runner_agent() calls construct TodoWrite tools that share
+        // the same store and can emit TodoUpdate events.
+        self.registry.set_todo_ctx(crate::tools::TodoContext {
+            store: self.todo_store.clone(),
+            tx: tx.clone(),
+        });
+        // 注入 task 工具（子代理扇出）上下文——与 todo_ctx 同一注入模式。
+        // Inject task tool (subagent fanout) context — same injection pattern as todo_ctx.
+        self.registry.set_task_ctx(crate::subagent::SubagentCtx {
+            sandbox: self.sandbox.clone(),
+            trust_sandbox: self.trust_sandbox.clone(),
+            tx: tx.clone(),
+            depth: self.registry.subagent_depth(),
+        });
         let history = self.history.lock().unwrap().clone();
         let intent = classify_intent(message, &history, &self.registry).await;
         match intent {
@@ -1884,6 +2141,143 @@ patches = [
         assert_eq!(
             perms.permission_for("mystery", &serde_json::json!({})),
             Permission::Ask
+        );
+    }
+
+    #[test]
+    fn permission_for_todo_write_is_allow() {
+        // todo_write 只改 UI 可见会话状态，无文件系统/系统副作用，同 read_file 安全类。
+        // todo_write only mutates UI-visible session state, no fs/system side effects,
+        // same safety class as read_file — must not trigger HITL popup.
+        let perms = perms_allow_readonly_deny_mutating();
+        let args = serde_json::json!({"todos": []});
+        assert_eq!(
+            perms.permission_for("todo_write", &args),
+            Permission::Allow,
+            "todo_write should be Allow (no fs/system side effects)"
+        );
+    }
+
+    #[test]
+    fn permission_for_task_is_allow() {
+        // task 是编排机制（扇出子代理），同 todo_write 安全类，静默放行。
+        // task is an orchestration mechanism (fanout subagents), same safety
+        // class as todo_write — must not trigger HITL popup.
+        let perms = perms_allow_readonly_deny_mutating();
+        let args = serde_json::json!({"tasks": []});
+        assert_eq!(
+            perms.permission_for("task", &args),
+            Permission::Allow,
+            "task should be Allow (orchestration mechanism, subagent perms govern)"
+        );
+    }
+
+    // ── task_ctx_for_role depth guard tests ──
+
+    fn test_registry() -> AgentRegistry {
+        use crate::config::Config;
+        let toml_str = r#"
+[agent]
+default_model = "test-model"
+max_turns = 10
+"#;
+        let cfg = Arc::new(
+            Config::from_str_with_profile(toml_str, None).expect("config parse"),
+        );
+        AgentRegistry::new(cfg, empty_mcp(), disabled_sandbox_provider())
+    }
+
+    #[test]
+    fn task_ctx_for_role_returns_none_for_investigator() {
+        let reg = test_registry();
+        assert!(
+            reg.task_ctx_for_role(Role::Investigator).is_none(),
+            "Investigator should never get task ctx"
+        );
+    }
+
+    #[test]
+    fn task_ctx_for_role_returns_none_for_planner() {
+        let reg = test_registry();
+        assert!(reg.task_ctx_for_role(Role::Planner).is_none());
+    }
+
+    #[test]
+    fn task_ctx_for_role_returns_none_for_auditor() {
+        let reg = test_registry();
+        assert!(reg.task_ctx_for_role(Role::Auditor).is_none());
+    }
+
+    #[test]
+    fn task_ctx_for_role_returns_none_when_no_ctx_set() {
+        let reg = test_registry();
+        // No set_task_ctx called → slot is None even for Builder/Orchestrator.
+        assert!(reg.task_ctx_for_role(Role::Builder).is_none());
+        assert!(reg.task_ctx_for_role(Role::Orchestrator).is_none());
+    }
+
+    #[test]
+    fn task_ctx_for_role_returns_some_for_builder_when_set() {
+        let reg = test_registry();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::event::AgentEvent>();
+        reg.set_task_ctx(crate::subagent::SubagentCtx {
+            sandbox: crate::sandbox::Sandbox::with_backend(
+                &[],
+                crate::sandbox::SandboxBackend::Off,
+            ),
+            trust_sandbox: Arc::new(AtomicBool::new(false)),
+            tx,
+            depth: reg.subagent_depth(),
+        });
+        assert!(
+            reg.task_ctx_for_role(Role::Builder).is_some(),
+            "Builder should get task ctx when set and depth==0"
+        );
+        assert!(
+            reg.task_ctx_for_role(Role::Orchestrator).is_some(),
+            "Orchestrator should get task ctx when set and depth==0"
+        );
+    }
+
+    #[test]
+    fn task_ctx_for_role_returns_none_when_depth_gt_zero() {
+        let reg = test_registry();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::event::AgentEvent>();
+        reg.set_task_ctx(crate::subagent::SubagentCtx {
+            sandbox: crate::sandbox::Sandbox::with_backend(
+                &[],
+                crate::sandbox::SandboxBackend::Off,
+            ),
+            trust_sandbox: Arc::new(AtomicBool::new(false)),
+            tx,
+            depth: reg.subagent_depth(),
+        });
+        // 深度 > 0 时返回 None（子代理不获得 task 工具）。
+        // When depth > 0, returns None (subagents do NOT get the task tool).
+        let _guard = crate::subagent::SubagentDepthGuard::new(reg.subagent_depth());
+        assert!(
+            reg.task_ctx_for_role(Role::Builder).is_none(),
+            "Builder should NOT get task ctx when depth > 0"
+        );
+        assert!(
+            reg.task_ctx_for_role(Role::Orchestrator).is_none(),
+            "Orchestrator should NOT get task ctx when depth > 0"
+        );
+        // Guard drops here → depth resets to 0.
+    }
+
+    #[test]
+    fn task_ctx_for_role_depth_guard_resets_on_drop() {
+        let reg = test_registry();
+        assert_eq!(reg.subagent_depth().load(Ordering::Relaxed), 0);
+        {
+            let _g = crate::subagent::SubagentDepthGuard::new(reg.subagent_depth());
+            assert_eq!(reg.subagent_depth().load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(
+            reg.subagent_depth().load(Ordering::Relaxed),
+            0,
+            "depth must reset to 0 after guard drops"
         );
     }
 
@@ -2677,5 +3071,173 @@ max_turns = 10
         let registry = AgentRegistry::new(cfg, empty_mcp(), disabled_sandbox_provider());
         let is_fast = registry.active_profile().as_deref() == Some("fast");
         assert!(!is_fast, "default profile must NOT be fast (audit enabled)");
+    }
+
+    // ── todo_write role gating tests ──
+
+    fn make_registry_with_todo_ctx() -> AgentRegistry {
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _g = env_guard("AGENT_PROFILE", None);
+        let toml_str = r#"
+[agent]
+default_model = "test-model"
+max_turns = 10
+"#;
+        let cfg = Arc::new(
+            crate::config::Config::from_str_with_profile(toml_str, None)
+                .expect("config parse should succeed"),
+        );
+        let registry = AgentRegistry::new(cfg, empty_mcp(), disabled_sandbox_provider());
+        let store = Arc::new(Mutex::new(Vec::new()));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let ctx = crate::tools::TodoContext { store, tx };
+        registry.set_todo_ctx(ctx);
+        registry
+    }
+
+    #[test]
+    fn todo_ctx_for_role_builder_returns_some_when_set() {
+        let registry = make_registry_with_todo_ctx();
+        assert!(
+            registry.todo_ctx_for_role(Role::Builder).is_some(),
+            "Builder role should get todo_write tool"
+        );
+        assert!(
+            registry.todo_ctx_for_role(Role::Orchestrator).is_some(),
+            "Orchestrator role should get todo_write tool"
+        );
+    }
+
+    #[test]
+    fn todo_ctx_for_role_readonly_roles_return_none() {
+        let registry = make_registry_with_todo_ctx();
+        assert!(
+            registry.todo_ctx_for_role(Role::Investigator).is_none(),
+            "Investigator must NOT get todo_write tool"
+        );
+        assert!(
+            registry.todo_ctx_for_role(Role::Planner).is_none(),
+            "Planner must NOT get todo_write tool"
+        );
+        assert!(
+            registry.todo_ctx_for_role(Role::Auditor).is_none(),
+            "Auditor must NOT get todo_write tool"
+        );
+    }
+
+    // ── bash_output / kill_shell permission arms ──
+
+    /// `bash_output` resolves to `run_bash_readonly` (session-state read).
+    /// `bash_output` 解析为 `run_bash_readonly`（会话状态读取）。
+    #[test]
+    fn permission_for_bash_output_returns_readonly() {
+        let perms = perms_allow_readonly_deny_mutating();
+        let args = serde_json::json!({"id": "bg-0"});
+        assert_eq!(
+            perms.permission_for("bash_output", &args),
+            Permission::Allow,
+            "bash_output should use run_bash_readonly tier"
+        );
+    }
+
+    /// `kill_shell` resolves to `run_bash_mutating` (terminates a process).
+    /// `kill_shell` 解析为 `run_bash_mutating`（终止进程）。
+    #[test]
+    fn permission_for_kill_shell_returns_mutating() {
+        let perms = perms_allow_readonly_deny_mutating();
+        let args = serde_json::json!({"id": "bg-0"});
+        assert_eq!(
+            perms.permission_for("kill_shell", &args),
+            Permission::Deny,
+            "kill_shell should use run_bash_mutating tier"
+        );
+    }
+
+    // ── AgentSpec + custom_spec tests ──
+
+    fn registry_with_roles() -> AgentRegistry {
+        use crate::config::Config;
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _g = env_guard("AGENT_PROFILE", None);
+        let toml_str = r#"
+[agent]
+default_model = "kimi-k3"
+max_turns = 50
+
+[agents.investigator]
+model = "kimi-k3"
+preamble = "prompts/investigator.md"
+permissions.read_file = "allow"
+permissions.run_bash_readonly = "allow"
+permissions.run_bash_mutating = "deny"
+permissions.edit_file = "deny"
+
+[agents.builder]
+model = "kimi-k3"
+preamble = "prompts/builder.md"
+max_turns = 100
+permissions.read_file = "allow"
+permissions.run_bash_mutating = "allow"
+permissions.edit_file = "allow"
+
+[agents.custom.researcher]
+preamble = "agents/researcher.md"
+model = "glm-latest"
+permissions.read_file = "allow"
+permissions.run_bash_readonly = "allow"
+permissions.edit_file = "deny"
+"#;
+        let cfg = Arc::new(
+            Config::from_str_with_profile(toml_str, None).expect("config parse"),
+        );
+        AgentRegistry::new(cfg, empty_mcp(), disabled_sandbox_provider())
+    }
+
+    #[test]
+    fn agent_spec_matches_role_config() {
+        let reg = registry_with_roles();
+        let spec = reg.agent_spec(Role::Builder);
+        let rc = reg.role_config(Role::Builder).expect("builder config");
+        assert_eq!(spec.name, "builder");
+        assert_eq!(spec.preamble_path, rc.preamble);
+        assert_eq!(spec.permissions, rc.permissions);
+        assert_eq!(spec.model.as_deref(), Some(rc.model.as_str()));
+        assert_eq!(spec.max_turns, rc.max_turns);
+        assert!(spec.embedded_preamble.is_some());
+    }
+
+    #[test]
+    fn agent_spec_investigator_matches_role_config() {
+        let reg = registry_with_roles();
+        let spec = reg.agent_spec(Role::Investigator);
+        let rc = reg.role_config(Role::Investigator).expect("investigator config");
+        assert_eq!(spec.name, "investigator");
+        assert_eq!(spec.preamble_path, rc.preamble);
+        assert_eq!(spec.permissions, rc.permissions);
+    }
+
+    #[test]
+    fn custom_spec_resolves_configured_name() {
+        let reg = registry_with_roles();
+        let spec = reg.custom_spec("researcher").expect("researcher configured");
+        assert_eq!(spec.name, "researcher");
+        assert_eq!(spec.preamble_path, "agents/researcher.md");
+        assert_eq!(spec.model.as_deref(), Some("glm-latest"));
+        assert_eq!(spec.permissions.read_file, Permission::Allow);
+        assert_eq!(spec.permissions.edit_file, Permission::Deny);
+        assert!(spec.embedded_preamble.is_none(), "custom has no embedded fallback");
+    }
+
+    #[test]
+    fn custom_spec_returns_none_for_unconfigured() {
+        let reg = registry_with_roles();
+        assert!(reg.custom_spec("nonexistent").is_none());
+    }
+
+    #[test]
+    fn custom_names_returns_sorted_list() {
+        let reg = registry_with_roles();
+        let names = reg.custom_names();
+        assert_eq!(names, vec!["researcher"]);
     }
 }

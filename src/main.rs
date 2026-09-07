@@ -1,6 +1,7 @@
 // 程序入口：日志初始化、上下文构建、TUI 启动。
 // Program entry point: logging initialization, context construction, TUI launch.
 mod agent_loop;
+mod checkpoint;
 mod cli;
 mod config;
 mod context;
@@ -21,7 +22,9 @@ mod sandbox;
 mod seam;
 mod session;
 mod session_log;
+mod shell;
 mod skills;
+mod subagent;
 mod tools;
 mod tools_ext;
 mod ui;
@@ -74,6 +77,21 @@ async fn main() -> Result<()> {
     // `--dump-config`: print the combined config tree (after profile overlay) to
     // stdout, then exit. A debug/introspection feature.
     let cli_args: Vec<String> = std::env::args().collect();
+
+    // 无头模式参数解析（-p/--print）。无 -p 时返回 Ok(None)，走 TUI 路径。
+    // 解析错误（缺值/未知格式）→ stderr + 退出码 2，在昂贵初始化前尽早失败。
+    // Headless arg parsing (-p/--print). Returns Ok(None) when -p is absent → TUI path.
+    // Parse errors (missing value / unknown format) → stderr + exit 2, failing fast
+    // before the expensive init.
+    let headless = match cli::headless::parse_headless_args(&cli_args) {
+        Ok(None) => None,
+        Ok(Some(h)) => Some(h),
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+    };
+
     if cli_args.iter().any(|a| a == "--dump-config") {
         let raw = std::fs::read_to_string("agent.toml")?;
         let dump = crate::cli::context::dump_config_to_string(&raw)?;
@@ -137,6 +155,31 @@ async fn main() -> Result<()> {
         session,
         model_history,
     });
+
+    // 无头模式派发：-p 存在时运行无头路径并退出，不进入 TUI。
+    // --continue + -p 允许组合：--continue 恢复上一次会话的上下文（seed_history），
+    // -p 在该上下文中无头执行任务。对脚本化"继续上次工作"的场景有用。
+    // Headless dispatch: when -p is present, run the headless path and exit (no TUI).
+    // --continue + -p is allowed: --continue resumes the previous session's context
+    // (seed_history), and -p runs the task headlessly in that context. Useful for
+    // scripted "continue prior work" scenarios.
+    if let Some(hargs) = headless {
+        let code = match cli::headless::run_headless(
+            ctx,
+            &hargs.prompt,
+            hargs.format,
+            hargs.auto_yes,
+        )
+        .await
+        {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("headless error: {e}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
 
     ui::tui::run_tui(ctx).await
 }

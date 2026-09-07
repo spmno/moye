@@ -122,6 +122,36 @@ permissions.write_file = "deny"
 permissions.web_fetch = "deny"
 permissions.web_search = "deny"
 
+# ── 自定义子代理 / Custom sub-agents ──────────────────────────────────────
+# 在 [agents.custom.<name>] 下声明自定义 agent，通过 task 工具的 agent 字段调用。
+# 内置名 explore / build 优先于自定义同名。
+# Declare custom agents under [agents.custom.<name>], called via the task
+# tool's agent field. Built-in names explore / build take precedence over
+# custom names with the same key.
+#
+# 字段 / Fields:
+#   preamble     = preamble 文件路径（相对项目根）。文件不存在时用空 preamble。
+#                  Preamble file path (relative to project root). Empty when missing.
+#   model        = 可选模型覆盖；省略时用会话/注册表默认模型。
+#                  Optional model override; omitted → session/registry default.
+#   permissions  = 按工具的权限分级（与角色配置格式相同，省略的字段用默认值）。
+#                  Per-tool permission tiers (same format as role configs;
+#                  omitted fields use defaults).
+#
+# 子代理隔离：不获得 task / todo_write 工具，拥有独立的空对话历史。
+# Sub-agent isolation: no task / todo_write tools, fresh empty history.
+#
+# [agents.custom.researcher]
+# preamble = "agents/researcher.md"
+# model = "glm-latest"
+# permissions.read_file = "allow"
+# permissions.run_bash_readonly = "allow"
+# permissions.run_bash_mutating = "deny"
+# permissions.edit_file = "deny"
+# permissions.write_file = "deny"
+# permissions.web_fetch = "allow"
+# permissions.web_search = "allow"
+
 [memory]
 # JSONL 记忆存储（v1），可扩展为 sqlite。
 dir = "memory"

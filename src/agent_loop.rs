@@ -886,11 +886,19 @@ fn decide_flow(perms: &ToolPerms, tool_name: &str, args: &str) -> ToolCallAction
 /// 所有用户可见输出通过 `tx` channel 发送给 TUI。
 /// All user-visible output is sent to the TUI via the `tx` channel.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_autonomous(
+/// 自主循环共享内核：内置角色和自定义子代理共用此函数。
+/// Shared autonomous-loop core: built-in roles and custom sub-agents share this function.
+///
+/// `run_autonomous(role)` 和 `run_autonomous_spec(spec)` 都委托至此。
+/// Both `run_autonomous(role)` and `run_autonomous_spec(spec)` delegate here.
+#[allow(clippy::too_many_arguments)]
+async fn run_autonomous_inner(
     registry: &AgentRegistry,
     sandbox: &Sandbox,
     trust_sandbox: Arc<AtomicBool>,
-    role: Role,
+    spec: &crate::registry::AgentSpec,
+    task_ctx: Option<crate::subagent::SubagentCtx>,
+    todo_ctx: Option<crate::tools::TodoContext>,
     goal: &str,
     tx: &EventSender,
     shared_history: Arc<Mutex<Vec<Message>>>,
@@ -904,7 +912,7 @@ pub async fn run_autonomous(
     // before the retry loop starts. They may set escape hatch or goal_override.
     let goal_owned: Option<String> = if let (Some(wf), Some(ps)) = (&shared_waterfall, &pre_step) {
         let event = WaterfallEvent::AgentPreStep {
-            role: format!("{role:?}").to_lowercase(),
+            role: spec.name.clone(),
             goal: goal.to_string(),
         };
         wf.emit(&event);
@@ -924,7 +932,7 @@ pub async fn run_autonomous(
     let captured_history = shared_history;
     let captured_turn: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let mut turns_used: usize = 0;
-    let total_max_turns = registry.max_turns_for_role(role);
+    let total_max_turns = spec.max_turns.unwrap_or_else(|| registry.max_turns());
 
     // SessionLog: append-only 旁路日志，与 ContextHook history capture 并存。
     // 追加失败不影响 model-visible 行为（仅 warn），SessionLog 是侧信道。
@@ -936,7 +944,7 @@ pub async fn run_autonomous(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        format!("{role:?}-{nanos}")
+        format!("{}-{nanos}", spec.name)
     };
     let mut session_log = crate::session_log::SessionLog::new(session_id, session_dir);
     if let Err(e) = session_log.append(crate::session_log::SessionEvent::UserMessage {
@@ -949,7 +957,8 @@ pub async fn run_autonomous(
         let max_turns_remaining = total_max_turns.saturating_sub(turns_used);
         if max_turns_remaining == 0 {
             return Err(anyhow::anyhow!(
-                "{role:?} \u{8f6e}\u{6b21}\u{5df2}\u{7528}\u{5c3d}\u{ff08}{turns_used}/{total_max_turns}\u{ff09}"
+                "{} \u{8f6e}\u{6b21}\u{5df2}\u{7528}\u{5c3d}\u{ff08}{turns_used}/{total_max_turns}\u{ff09}",
+                spec.name
             ));
         }
 
@@ -973,7 +982,7 @@ pub async fn run_autonomous(
             )
         };
 
-        let perms = registry.tool_perms(role);
+        let perms = spec.permissions.clone();
         let mut approval = ApprovalChain::new();
         approval.add(Box::new(DefaultApproval::new(perms)));
         let hitl_waiting = Arc::new(AtomicBool::new(false));
@@ -982,7 +991,7 @@ pub async fn run_autonomous(
         let waterfall = Arc::new(WaterfallRegistry::new());
         let hook = HitlHook::new(
             Arc::new(approval),
-            format!("{role:?}").to_lowercase(),
+            spec.name.clone(),
             hitl_waiting.clone(),
             tx.clone(),
             sandbox.clone(),
@@ -993,7 +1002,7 @@ pub async fn run_autonomous(
 
         let model = registry
             .session_model()
-            .or_else(|| registry.role_config(role).map(|c| c.model.clone()))
+            .or_else(|| spec.model.clone())
             .unwrap_or_else(|| registry.effective_model());
         let model_for_log = model.clone();
         let context_limit = crate::providers::context_limit_for_model(&model);
@@ -1010,7 +1019,12 @@ pub async fn run_autonomous(
         )
         .with_history_capture(captured_history.clone(), captured_turn.clone());
 
-        let agent = build_runner_agent(registry, role)?;
+        let agent = build_runner_agent_spec(
+            registry,
+            spec,
+            task_ctx.clone(),
+            todo_ctx.clone(),
+        )?;
         let prior_history = captured_history.lock().unwrap().clone();
         let mut runner = agent
             .runner(&prompt)
@@ -1068,7 +1082,7 @@ pub async fn run_autonomous(
                     error_debug = ?e,
                     attempt = attempt + 1,
                     max_retries = MAX_RETRIES,
-                    role = ?role,
+                    agent_name = %spec.name,
                     turns_used,
                     total_max_turns,
                     captured_history_len = hist_len,
@@ -1076,7 +1090,8 @@ pub async fn run_autonomous(
                     "SSE disconnect, retrying with preserved history"
                 );
                 let _ = tx.send(AgentEvent::Info(format!(
-                    "[重试 / Retry] {role:?} 第 {}/{} 次：SSE 连接中断。\n  · 已用轮数: {turns_used}/{total_max_turns}（剩余 {max_turns_remaining} 轮）\n  · 保留历史: {hist_len} 条消息\n  · 使用模型: {model_for_log}\n  · 错误摘要: {err_snippet}",
+                    "[重试 / Retry] {} 第 {}/{} 次：SSE 连接中断。\n  · 已用轮数: {turns_used}/{total_max_turns}（剩余 {max_turns_remaining} 轮）\n  · 保留历史: {hist_len} 条消息\n  · 使用模型: {model_for_log}\n  · 错误摘要: {err_snippet}",
+                    spec.name,
                     attempt + 1,
                     MAX_RETRIES
                 )));
@@ -1084,9 +1099,10 @@ pub async fn run_autonomous(
             }
             Err(e) => {
                 let err_snippet: String = e.to_string().chars().take(300).collect();
-                warn!(error = %e, error_debug = ?e, role = ?role, "stream error (non-retryable)");
+                warn!(error = %e, error_debug = ?e, agent_name = %spec.name, "stream error (non-retryable)");
                 let _ = tx.send(AgentEvent::Error(format!(
-                    "流错误（不可重试 / Non-retryable stream error）\n  · 角色: {role:?}\n  · 使用模型: {model_for_log}\n  · 已用轮数: {turns_used}/{total_max_turns}\n  · 错误详情: {err_snippet}"
+                    "流错误（不可重试 / Non-retryable stream error）\n  · 角色: {}\n  · 使用模型: {model_for_log}\n  · 已用轮数: {turns_used}/{total_max_turns}\n  · 错误详情: {err_snippet}",
+                    spec.name
                 )));
                 return Err(e);
             }
@@ -1094,10 +1110,76 @@ pub async fn run_autonomous(
     }
 
     Err(anyhow::anyhow!(
-        "{role:?} 重试 {MAX_RETRIES} 次后仍失败（SSE 连接反复中断）。\n  · 已用轮数: {turns_used}/{total_max_turns}\n  · 保留历史: {} 条消息\n建议检查网络或 API 稳定性后重试。\n\
-         [System] {role:?} failed after {MAX_RETRIES} retries (repeated SSE disconnects). Turns used: {turns_used}/{total_max_turns}. Check network/API stability and try again.",
-        captured_history.lock().unwrap().len()
+        "{} 重试 {MAX_RETRIES} 次后仍失败（SSE 连接反复中断）。\n  · 已用轮数: {turns_used}/{total_max_turns}\n  · 保留历史: {} 条消息\n建议检查网络或 API 稳定性后重试。\n\
+         [System] {agent_name} failed after {MAX_RETRIES} retries (repeated SSE disconnects). Turns used: {turns_used}/{total_max_turns}. Check network/API stability and try again.",
+        spec.name,
+        captured_history.lock().unwrap().len(),
+        agent_name = spec.name,
     ))
+}
+
+/// 自主循环入口（角色路径）：`role → agent_spec → run_autonomous_inner`。
+/// Autonomous loop entry (role path): `role → agent_spec → run_autonomous_inner`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_autonomous(
+    registry: &AgentRegistry,
+    sandbox: &Sandbox,
+    trust_sandbox: Arc<AtomicBool>,
+    role: Role,
+    goal: &str,
+    tx: &EventSender,
+    shared_history: Arc<Mutex<Vec<Message>>>,
+    shared_waterfall: Option<Arc<WaterfallRegistry>>,
+    pre_step: Option<Arc<PreStepState>>,
+) -> anyhow::Result<String> {
+    let spec = registry.agent_spec(role);
+    run_autonomous_inner(
+        registry,
+        sandbox,
+        trust_sandbox,
+        &spec,
+        registry.task_ctx_for_role(role),
+        registry.todo_ctx_for_role(role),
+        goal,
+        tx,
+        shared_history,
+        shared_waterfall,
+        pre_step,
+    )
+    .await
+}
+
+/// 自主循环入口（spec 路径）：自定义子代理通过 `run_autonomous_spec` 进入。
+/// Autonomous loop entry (spec path): custom sub-agents enter via `run_autonomous_spec`.
+///
+/// 子代理隔离：`task_ctx` / `todo_ctx` 均为 None（无 task 工具、无 todo_write）。
+/// Sub-agent isolation: `task_ctx` / `todo_ctx` are both None (no task tool, no todo_write).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_autonomous_spec(
+    registry: &AgentRegistry,
+    sandbox: &Sandbox,
+    trust_sandbox: Arc<AtomicBool>,
+    spec: crate::registry::AgentSpec,
+    goal: &str,
+    tx: &EventSender,
+    shared_history: Arc<Mutex<Vec<Message>>>,
+    shared_waterfall: Option<Arc<WaterfallRegistry>>,
+    pre_step: Option<Arc<PreStepState>>,
+) -> anyhow::Result<String> {
+    run_autonomous_inner(
+        registry,
+        sandbox,
+        trust_sandbox,
+        &spec,
+        None,
+        None,
+        goal,
+        tx,
+        shared_history,
+        shared_waterfall,
+        pre_step,
+    )
+    .await
 }
 
 /// 判断错误是否为 SSE 流式断连（可安全重试）。
@@ -1276,28 +1358,47 @@ pub async fn consume_stream<R>(
     Ok(output)
 }
 
-/// 为某角色构建"可运行"的 rig `Agent`（带工具），并遵循会话级模型覆盖。
-/// Builds a "runnable" rig `Agent` (with tools) for a role, respecting session-level model override.
-/// 与 `AgentRegistry::build` 类似，但返回原始 `Agent`，以便附加 runner 与 hook。
-/// Similar to `AgentRegistry::build`, but returns the raw `Agent` so runner and hooks can be attached.
-fn build_runner_agent(registry: &AgentRegistry, role: Role) -> anyhow::Result<Agent<OpenAiModel>> {
-    let rc = registry
-        .role_config(role)
-        .ok_or_else(|| anyhow::anyhow!("no config for role {role:?}"))?;
+/// 从 `AgentSpec` 构建"可运行"的 rig `Agent`（带工具）。
+/// Builds a "runnable" rig `Agent` (with tools) from an `AgentSpec`.
+///
+/// 泛化入口：内置角色和自定义子代理共用此函数。`task_ctx` / `todo_ctx`
+/// 由调用方传入——内置角色路径从 registry 按 role 获取，子代理路径传 None。
+///
+/// Generalized entry: built-in roles and custom sub-agents share this function.
+/// `task_ctx` / `todo_ctx` are passed by the caller — the Role-based path gets
+/// them from the registry per role; the subagent path passes None.
+fn build_runner_agent_spec(
+    registry: &AgentRegistry,
+    spec: &crate::registry::AgentSpec,
+    task_ctx: Option<crate::subagent::SubagentCtx>,
+    todo_ctx: Option<crate::tools::TodoContext>,
+) -> anyhow::Result<Agent<OpenAiModel>> {
     let client = registry.create_client()?;
-    let preamble = crate::prompts::load(role, &rc.preamble);
+    // preamble：文件优先；内置角色有内嵌回退，自定义子代理无。
+    // Preamble: file first; built-in roles have embedded fallback, custom don't.
+    let preamble = match std::fs::read_to_string(&spec.preamble_path) {
+        Ok(content) => content,
+        Err(e) => {
+            tracing::warn!(
+                path = %spec.preamble_path,
+                error = %e,
+                "preamble file not found, using embedded fallback if available"
+            );
+            spec.embedded_preamble
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        }
+    };
     let preamble = crate::registry::inject_skills_public(&preamble);
-    let model = registry.session_model().unwrap_or_else(|| rc.model.clone());
-    let max_turns = registry.max_turns_for_role(role);
-    info!("[runner] role={role:?} model={model} max_turns={max_turns}");
+    let model = registry
+        .session_model()
+        .or_else(|| spec.model.clone())
+        .unwrap_or_else(|| registry.effective_model());
+    let max_turns = spec.max_turns.unwrap_or_else(|| registry.max_turns());
+    info!("[runner] agent={} model={model} max_turns={max_turns}", spec.name);
     let params = crate::providers::provider_additional_params();
     let max_output = registry.context_config().max_output_tokens as u64;
     let reasoning = crate::providers::is_reasoning_model(&model);
-    // max_tokens 策略：推理模型始终跳过；非推理模型在 max_output_tokens=0 时跳过（用模型
-    // 默认输出预算），>0 时作为显式上限。rig 的 OpenAI 路径在 None 时省略该字段。
-    // 详见 is_reasoning_model 文档。
-    // max_tokens policy: reasoning models always skip; non-reasoning skip when
-    // max_output_tokens=0 (model default), >0 = explicit cap. rig's OpenAI path omits None.
     let effective_max_tokens: Option<u64> = if reasoning {
         None
     } else if max_output > 0 {
@@ -1314,11 +1415,21 @@ fn build_runner_agent(registry: &AgentRegistry, role: Role) -> anyhow::Result<Ag
         .agent(&model)
         .preamble(&preamble)
         .temperature(crate::providers::Provider::clamp_temperature(0.7));
-    // 沙箱以 trait 对象注入（todo 4 迁移，与 AgentRegistry::build 一致）。
-    // registry.sandbox() 已返回 Arc<dyn SandboxProvider>，无需再包一层 Arc。
     let sandbox_provider: Arc<dyn crate::seam::SandboxProvider> = registry.sandbox();
+    let deps = crate::tools::ToolDeps {
+        sandbox: sandbox_provider.clone(),
+        todo_ctx,
+        task_ctx,
+        task_registry: registry.clone(),
+        shells: Arc::new(crate::shell::LazyShell::new(
+            sandbox_provider.clone(),
+            registry.context_config().max_bash_output_chars,
+        )),
+        bg: registry.bg(),
+        checkpoints: registry.checkpoints(),
+    };
     let builder =
-        crate::tools::add_builtin_tools(builder, registry.context_config(), sandbox_provider)
+        crate::tools::add_builtin_tools(builder, registry.context_config(), &deps)
             .additional_params(params)
             .default_max_turns(max_turns);
     let agent = if let Some(v) = effective_max_tokens {

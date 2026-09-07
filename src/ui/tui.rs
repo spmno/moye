@@ -27,7 +27,7 @@ use tokio::time::interval;
 
 use crate::cli::context::AppContext;
 use crate::cli::repl::ReplCommand;
-use crate::event::{AgentEvent, EventReceiver, EventSender};
+use crate::event::{AgentEvent, EventReceiver, EventSender, TodoItem, TodoStatus};
 use crate::ui::clipboard;
 use crate::ui::selection::Selection;
 use crate::ui::selector::{SelectorItem, SelectorState};
@@ -391,6 +391,7 @@ const PALETTE_COMMANDS: &[(&str, &str, PaletteAction)] = &[
     ("/context", "查看当前上下文 / show current context", PaletteAction::Execute),
     ("/help", "显示帮助 / show help", PaletteAction::Execute),
     ("/trust", "切换沙箱信任模式 / toggle sandbox trust", PaletteAction::Execute),
+    ("/rewind", "回滚某次任务改动的文件 / rewind a task's file changes", PaletteAction::Execute),
     ("/quit", "退出程序 / quit", PaletteAction::Execute),
     // ── 带参数命令 → 植入输入框 / arg-taking commands → PlantInput ──
     ("/model", "切换模型 / switch model <slug>", PaletteAction::PlantInput),
@@ -586,6 +587,13 @@ struct TuiState {
     /// Command palette flag: when true, selector Enter routes to palette logic
     /// instead of the /models model-selection path.
     palette_active: bool,
+    /// 回滚检查点选择器激活标志：为 true 时选择器 Enter 走回滚路由。
+    /// Rewind selector flag: when true, selector Enter routes to rewind logic.
+    rewind_active: bool,
+    /// todo_write 工具的任务列表——由 TodoUpdate 事件更新，侧边栏渲染。
+    /// Todo list from the todo_write tool — updated by TodoUpdate events,
+    /// rendered in the sidebar.
+    todos: Vec<TodoItem>,
 }
 
 impl TuiState {
@@ -636,6 +644,8 @@ impl TuiState {
             input_history,
             input_scroll: 0,
             palette_active: false,
+            rewind_active: false,
+            todos: Vec::new(),
         }
     }
 
@@ -740,6 +750,13 @@ fn log_event(event: &AgentEvent) {
             new_tokens,
         } => {
             info!("[TUI] 上下文压缩: {old_tokens} → {new_tokens} tokens");
+        }
+        AgentEvent::TodoUpdate { todos } => {
+            let in_prog = todos
+                .iter()
+                .filter(|t| t.status == TodoStatus::InProgress)
+                .count();
+            info!("[TUI] todos updated: {} items ({in_prog} in progress)", todos.len());
         }
     }
 }
@@ -965,6 +982,12 @@ fn render_event(event: &AgentEvent, expand: bool) -> Vec<Line<'static>> {
                 ]
             }
         }
+        AgentEvent::TodoUpdate { .. } => {
+            // 侧边栏专用：不渲染到消息流（工具调用/结果行已在流中展示）。
+            // Sidebar-only: not rendered in the message stream (the tool call/result
+            // lines already show in-stream).
+            vec![]
+        }
         _ => vec![],
     }
 }
@@ -1022,6 +1045,13 @@ fn format_event_for_context(event: &AgentEvent) -> String {
         AgentEvent::AgentStarted => "[AgentStarted]".to_string(),
         AgentEvent::AgentFinished => "[AgentFinished]".to_string(),
         AgentEvent::HitlPrompt { .. } | AgentEvent::SuspendTui { .. } => String::new(),
+        AgentEvent::TodoUpdate { todos } => {
+            let in_prog = todos
+                .iter()
+                .filter(|t| t.status == TodoStatus::InProgress)
+                .count();
+            format!("[Todos] {} items, {in_prog} in progress", todos.len())
+        }
     }
 }
 
@@ -1211,6 +1241,7 @@ fn handle_key_event(
         {
             state.selector = None;
             state.palette_active = false;
+            state.rewind_active = false;
             return;
         }
         match key.code {
@@ -1226,6 +1257,29 @@ fn handle_key_event(
             }
             KeyCode::Enter => {
                 let selected = state.selector.as_ref().and_then(|s| s.selection());
+                // 回滚检查点选择器：选中后解析 task id，调用 rewind_task。
+                // Rewind selector: parse task id from selection, call rewind_task.
+                if state.rewind_active {
+                    if let Some(item) = selected {
+                        let task_id = item
+                            .data
+                            .as_deref()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        if task_id > 0 {
+                            let store = ctx.orchestrator.checkpoints();
+                            let outcomes = store.rewind_task(task_id);
+                            let n = outcomes.len();
+                            state.push_event(AgentEvent::Info(format!(
+                                "已回滚 task #{}：恢复 {} 个文件 / rewound: restored {} files",
+                                task_id, n, n
+                            )));
+                        }
+                    }
+                    state.selector = None;
+                    state.rewind_active = false;
+                    return;
+                }
                 // 命令面板：选中后按动作路由（Execute → handle_command；PlantInput → 植入输入框）。
                 // Command palette: route by action (Execute → handle_command; PlantInput →
                 // plant into input buffer).
@@ -1299,6 +1353,7 @@ fn handle_key_event(
                 }
                 state.selector = None;
                 state.palette_active = false;
+                state.rewind_active = false;
             }
             KeyCode::Backspace => {
                 if let Some(s) = &mut state.selector {
@@ -1894,6 +1949,50 @@ fn handle_command(
             let msg = ctx.cmd_add_skill(&name, &description);
             state.push_event(AgentEvent::Info(msg));
         }
+        ReplCommand::Rewind => {
+            let store = ctx.orchestrator.checkpoints();
+            let tasks = store.tasks_with_files();
+            if tasks.is_empty() {
+                state.push_event(AgentEvent::Info(
+                    "没有可回滚的检查点 / no checkpoints".into(),
+                ));
+            } else {
+                let items: Vec<SelectorItem> = tasks
+                    .iter()
+                    .map(|(id, n)| {
+                        let paths = store.task_paths(*id);
+                        let detail = paths.join(", ");
+                        // 截断过长的路径列表以适应显示。
+                        // Truncate overly long path lists for display.
+                        let detail = if detail.chars().count() > 80 {
+                            let end = detail
+                                .char_indices()
+                                .take(80)
+                                .last()
+                                .map(|(i, c)| i + c.len_utf8())
+                                .unwrap_or(80);
+                            format!("{}...", &detail[..end])
+                        } else {
+                            detail
+                        };
+                        SelectorItem {
+                            label: format!(
+                                "task #{}（{} 个文件 / files）",
+                                id, n
+                            ),
+                            detail,
+                            data: Some(id.to_string()),
+                        }
+                    })
+                    .collect();
+                state.selector = Some(SelectorState::new(
+                    "回滚检查点 / Rewind".into(),
+                    items,
+                    false,
+                ));
+                state.rewind_active = true;
+            }
+        }
         ReplCommand::InvalidUsage(msg) => {
             state.push_event(AgentEvent::Error(msg.to_string()));
         }
@@ -2387,6 +2486,12 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
             });
             state.reset_scroll();
         }
+        AgentEvent::TodoUpdate { todos } => {
+            // 侧边栏专用：仅更新 todos 字段，不推入消息历史、不重置滚动。
+            // Sidebar-only: just update the todos field; no message history push,
+            // no scroll reset (sidebar doesn't use the scroll mechanism).
+            state.todos = todos;
+        }
     }
 }
 
@@ -2853,6 +2958,45 @@ fn format_workdir(max_len: usize) -> String {
     format!("\u{2026}{tail}")
 }
 
+/// 纯函数：把 TodoItem 列表渲染为侧边栏行。空列表 → 空 vec。
+/// in_progress → `▶ content` (LightYellow)；pending → `○ content` (DarkGray)；
+/// completed → `✓ content` (Green)；超长内容在字符边界截断并追加 `…`。
+/// Pure function: render TodoItem list into sidebar lines. Empty list → empty vec.
+/// in_progress → `▶ content` (LightYellow); pending → `○ content` (DarkGray);
+/// completed → `✓ content` (Green); long content truncated at char boundary with `…`.
+fn todo_lines(todos: &[TodoItem], width: u16) -> Vec<Line<'static>> {
+    if todos.is_empty() {
+        return Vec::new();
+    }
+    let w = width as usize;
+    todos
+        .iter()
+        .map(|t| {
+            let (marker, style) = match t.status {
+                TodoStatus::InProgress => ("\u{25b6}", theme::status_thinking()),
+                TodoStatus::Pending => ("\u{25cb}", theme::info()),
+                TodoStatus::Completed => ("\u{2713}", theme::status_ready()),
+            };
+            let prefix = format!(" {marker} ");
+            let avail = w.saturating_sub(prefix.chars().count());
+            let content = if t.content.chars().count() > avail {
+                let take = avail.saturating_sub(1);
+                let end = t
+                    .content
+                    .char_indices()
+                    .take(take)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
+                format!("{}\u{2026}", &t.content[..end])
+            } else {
+                t.content.clone()
+            };
+            Line::from(Span::styled(format!("{prefix}{content}"), style))
+        })
+        .collect()
+}
+
 fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
     let block = Block::default()
         .borders(Borders::LEFT)
@@ -2928,6 +3072,15 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
     };
     lines.push(Line::styled(status_text, status_style));
     lines.push(Line::default());
+
+    if !state.todos.is_empty() {
+        lines.push(Line::styled("Todos", theme::status_dim()));
+        let content_w = area.width.saturating_sub(4);
+        for line in todo_lines(&state.todos, content_w) {
+            lines.push(line);
+        }
+        lines.push(Line::default());
+    }
 
     lines.push(Line::styled(
         format!("Tools ({})", state.tool_names.len()),
@@ -3769,7 +3922,7 @@ mod tests {
         let known_commands = [
             "/model", "/models", "/plan", "/evolve", "/evolve-code", "/add-tool",
             "/add-skill", "/skills", "/context", "/help", "/history", "/lessons",
-            "/quit", "/trust",
+            "/quit", "/rewind", "/trust",
         ];
         for cmd in known_commands {
             let found = PALETTE_COMMANDS.iter().any(|(c, _, _)| *c == cmd);
@@ -3887,6 +4040,122 @@ mod tests {
         assert!(
             result.is_none(),
             "unknown command should return None"
+        );
+    }
+
+    // ── todo_lines / handle_action TodoUpdate ──
+
+    #[test]
+    fn todo_lines_empty_returns_empty() {
+        assert!(todo_lines(&[], 30).is_empty());
+    }
+
+    #[test]
+    fn todo_lines_three_statuses_correct_markers_and_styles() {
+        use crate::event::{TodoItem, TodoStatus};
+        let todos = vec![
+            TodoItem {
+                id: "1".into(),
+                content: "active".into(),
+                status: TodoStatus::InProgress,
+            },
+            TodoItem {
+                id: "2".into(),
+                content: "waiting".into(),
+                status: TodoStatus::Pending,
+            },
+            TodoItem {
+                id: "3".into(),
+                content: "done".into(),
+                status: TodoStatus::Completed,
+            },
+        ];
+        let lines = todo_lines(&todos, 80);
+        assert_eq!(lines.len(), 3);
+
+        // in_progress: ▶ marker + LightYellow
+        let text0: String = lines[0].spans.iter().flat_map(|s| s.content.chars()).collect();
+        assert!(text0.contains('\u{25b6}'), "in_progress marker ▶: {text0}");
+        assert!(text0.contains("active"), "in_progress content: {text0}");
+        assert_eq!(
+            lines[0].spans[0].style.fg,
+            theme::status_thinking().fg,
+            "in_progress should be LightYellow"
+        );
+
+        // pending: ○ marker + DarkGray
+        let text1: String = lines[1].spans.iter().flat_map(|s| s.content.chars()).collect();
+        assert!(text1.contains('\u{25cb}'), "pending marker ○: {text1}");
+        assert_eq!(
+            lines[1].spans[0].style.fg,
+            theme::info().fg,
+            "pending should be DarkGray"
+        );
+
+        // completed: ✓ marker + Green
+        let text2: String = lines[2].spans.iter().flat_map(|s| s.content.chars()).collect();
+        assert!(text2.contains('\u{2713}'), "completed marker ✓: {text2}");
+        assert_eq!(
+            lines[2].spans[0].style.fg,
+            theme::status_ready().fg,
+            "completed should be Green"
+        );
+    }
+
+    #[test]
+    fn todo_lines_long_content_truncated_with_ellipsis() {
+        use crate::event::{TodoItem, TodoStatus};
+        let long: String = "a".repeat(50);
+        let todos = vec![TodoItem {
+            id: "1".into(),
+            content: long,
+            status: TodoStatus::Pending,
+        }];
+        let lines = todo_lines(&todos, 10);
+        assert_eq!(lines.len(), 1);
+        let text: String = lines[0].spans.iter().flat_map(|s| s.content.chars()).collect();
+        assert!(
+            text.contains('\u{2026}'),
+            "truncated content must end with …: {text}"
+        );
+        // Total line width should not exceed the given width.
+        assert!(
+            text.chars().count() <= 10,
+            "line must not exceed width 10: {} chars",
+            text.chars().count()
+        );
+    }
+
+    #[test]
+    fn handle_action_todo_update_stores_list() {
+        use crate::event::{TodoItem, TodoStatus};
+        let mut s = tui_state_for_test();
+        assert!(s.todos.is_empty(), "todos must start empty");
+        let todos = vec![
+            TodoItem {
+                id: "a".into(),
+                content: "first".into(),
+                status: TodoStatus::InProgress,
+            },
+            TodoItem {
+                id: "b".into(),
+                content: "second".into(),
+                status: TodoStatus::Pending,
+            },
+        ];
+        handle_action(
+            AgentEvent::TodoUpdate {
+                todos: todos.clone(),
+            },
+            &mut s,
+        );
+        assert_eq!(s.todos.len(), 2, "todos should be stored");
+        assert_eq!(s.todos[0].id, "a");
+        assert_eq!(s.todos[1].status, TodoStatus::Pending);
+        // Sidebar-only: should NOT have pushed to message history.
+        assert!(
+            s.messages.is_empty(),
+            "TodoUpdate must not enter message history"
         );
     }
 }

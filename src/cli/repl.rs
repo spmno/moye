@@ -53,6 +53,9 @@ pub enum ReplCommand {
     /// `/trust`: toggle sandbox trust mode (when enabled, out-of-sandbox access is
     /// auto-authorized without prompting the user).
     Trust,
+    /// `/rewind`：打开交互式检查点选择器，回滚某次任务改动的文件。
+    /// `/rewind`: open an interactive checkpoint picker to rewind a task's file changes.
+    Rewind,
     /// 非 `/` 开头的自然语言输入：作为任务目标交给 Orchestrator 执行。
     /// Natural-language input not starting with `/`: handed to the Orchestrator as a task goal.
     Goal(String),
@@ -130,6 +133,7 @@ impl ReplCommand {
             "/lessons" => Self::Lessons,
             "/quit" | "/q" | "/exit" => Self::Quit,
             "/trust" => Self::Trust,
+            "/rewind" | "/rw" => Self::Rewind,
             _ => Self::InvalidUsage("unknown command; type /help for usage"),
         }
     }
@@ -158,5 +162,11 @@ mod tests {
             ReplCommand::parse("帮我修复 bug"),
             ReplCommand::Goal(_)
         ));
+    }
+
+    #[test]
+    fn rewind_command_parses() {
+        assert!(matches!(ReplCommand::parse("/rewind"), ReplCommand::Rewind));
+        assert!(matches!(ReplCommand::parse("/rw"), ReplCommand::Rewind));
     }
 }

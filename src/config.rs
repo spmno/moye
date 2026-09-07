@@ -12,7 +12,7 @@
 
 use crate::context::ContextConfig;
 use crate::memory::MemoryConfig;
-use crate::registry::RoleConfig;
+use crate::registry::{RoleConfig, ToolPerms};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -34,7 +34,7 @@ pub struct Config {
     #[serde(default)]
     pub context: ContextConfig,
     #[serde(default, rename = "agents")]
-    pub roles: HashMap<String, RoleConfig>,
+    pub agents: AgentsConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
     #[serde(default)]
@@ -63,6 +63,57 @@ pub struct Config {
     /// Transport is selected by `command`+`args` (stdio) or `url` (HTTP/SSE).
     #[serde(default)]
     pub mcp: HashMap<String, McpServerConfig>,
+}
+
+/// `[agents]` 小节：内置角色配置 + 自定义子代理配置。
+/// The `[agents]` section: built-in role configs + custom sub-agent configs.
+///
+/// `roles` 通过 `#[serde(flatten)]` 捕获所有非保留键（如 `orchestrator`、
+/// `builder`），而 `custom` 显式捕获 `[agents.custom.<name>]` 子表。
+/// 向后兼容：无 `[agents.custom]` 段时 `custom` 为空 map，行为与旧配置一致。
+///
+/// `roles` captures all non-reserved keys (e.g. `orchestrator`, `builder`)
+/// via `#[serde(flatten)]`, while `custom` explicitly captures the
+/// `[agents.custom.<name>]` sub-table. Backward-compatible: when no
+/// `[agents.custom]` section is present, `custom` is an empty map and
+/// behavior matches the old config exactly.
+#[derive(Debug, Deserialize, Default)]
+pub struct AgentsConfig {
+    /// 内置角色配置（键为角色名，如 "orchestrator"/"builder"）。
+    /// Built-in role configs (keyed by role name, e.g. "orchestrator"/"builder").
+    #[serde(flatten)]
+    pub roles: HashMap<String, RoleConfig>,
+    /// 自定义子代理配置（`[agents.custom.<name>]` → 键为 name）。
+    /// Custom sub-agent configs (`[agents.custom.<name>]` → key is name).
+    #[serde(default)]
+    pub custom: HashMap<String, CustomAgentConfig>,
+}
+
+/// 自定义子代理配置：`[agents.custom.<name>]` 小节。
+/// Custom sub-agent config: the `[agents.custom.<name>]` section.
+///
+/// 镜像 RoleConfig 的字段，但 model 为可选（None 时用会话/注册表默认模型）。
+/// permissions 字段的 serde 默认值与 RoleConfig 一致——省略的权限字段继承
+/// ToolPerms 的默认值（read_file/run_bash_readonly 默认 Allow，
+/// 其余默认 Ask）。
+///
+/// Mirrors RoleConfig fields, but model is optional (None → session/registry
+/// default model). The permissions field's serde defaults match RoleConfig —
+/// omitted permission fields inherit ToolPerms defaults (read_file /
+/// run_bash_readonly default to Allow, the rest to Ask).
+#[derive(Debug, Deserialize, Clone)]
+pub struct CustomAgentConfig {
+    /// preamble 提示词文件路径（相对项目根目录）。
+    /// Preamble (prompt) file path, relative to the project root.
+    pub preamble: String,
+    /// 按工具的权限分级，serde 默认值与 RoleConfig 相同。
+    /// Per-tool permission tiers, serde defaults match RoleConfig.
+    #[serde(default)]
+    pub permissions: ToolPerms,
+    /// 模型；None 时用会话/注册表默认模型。
+    /// Model; None → session/registry default.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// 单个 MCP 服务器的配置。通过 `command`（stdio）或 `url`（HTTP/SSE）选择传输方式。
@@ -824,7 +875,7 @@ authorized_dirs = ["~/.config", "/tmp/moye"]
         assert_eq!(cfg.agent.default_model, "kimi-k3");
         assert_eq!(cfg.max_turns(), 10);
         assert_eq!(cfg.context.max_output_tokens, 2048);
-        assert!(cfg.roles.contains_key("builder"));
+        assert!(cfg.agents.roles.contains_key("builder"));
         assert_eq!(cfg.memory.dir, PathBuf::from("memory"));
         assert_eq!(cfg.memory.rules_file, "rules.json");
         assert_eq!(cfg.evolution.rule_escalation_threshold, 5);
@@ -837,7 +888,7 @@ authorized_dirs = ["~/.config", "/tmp/moye"]
     fn load_empty_config_defaults() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.max_turns(), 50);
-        assert!(cfg.roles.is_empty());
+        assert!(cfg.agents.roles.is_empty());
         assert_eq!(cfg.evolution.rule_escalation_threshold, 0);
         assert_eq!(cfg.context.max_output_tokens, 0);
         assert!(cfg.sandbox.authorized_dirs.is_empty());
@@ -959,26 +1010,26 @@ MOONSHOT_API_KEY = "global-moon"
         // provider 应有值（deepseek 或全局配置的值）。
         assert!(cfg.provider.provider.is_some());
         // 5 个角色都应存在。
-        assert!(cfg.roles.contains_key("orchestrator"));
-        assert!(cfg.roles.contains_key("investigator"));
-        assert!(cfg.roles.contains_key("planner"));
-        assert!(cfg.roles.contains_key("builder"));
-        assert!(cfg.roles.contains_key("auditor"));
+        assert!(cfg.agents.roles.contains_key("orchestrator"));
+        assert!(cfg.agents.roles.contains_key("investigator"));
+        assert!(cfg.agents.roles.contains_key("planner"));
+        assert!(cfg.agents.roles.contains_key("builder"));
+        assert!(cfg.agents.roles.contains_key("auditor"));
         // 模型应有值（来自全局配置或供应商默认）。
         // Model should be set (from global config or provider default).
         assert!(!cfg.agent.default_model.is_empty());
         assert_eq!(
-            cfg.roles.get("builder").unwrap().model,
+            cfg.agents.roles.get("builder").unwrap().model,
             cfg.agent.default_model
         );
         // builder 应有写权限。
         assert_eq!(
-            cfg.roles.get("builder").unwrap().permissions.write_file,
+            cfg.agents.roles.get("builder").unwrap().permissions.write_file,
             Permission::Allow
         );
         // auditor 应拒绝 web 访问。
         assert_eq!(
-            cfg.roles.get("auditor").unwrap().permissions.web_fetch,
+            cfg.agents.roles.get("auditor").unwrap().permissions.web_fetch,
             Permission::Deny
         );
         let _ = std::fs::remove_file(&tmp);
@@ -1104,7 +1155,7 @@ patches = [
 "#;
         let cfg = Config::from_str_with_profile(toml_str, Some("lockdown"))
             .expect("profile parse should succeed");
-        let builder = cfg.roles.get("builder").expect("builder role present");
+        let builder = cfg.agents.roles.get("builder").expect("builder role present");
         assert_eq!(builder.permissions.read_file, Permission::Deny);
         assert_eq!(builder.permissions.edit_file, Permission::Deny);
         assert_eq!(builder.permissions.run_bash_mutating, Permission::Deny);
@@ -1318,7 +1369,7 @@ patches = [
     fn profile_overlay_applies_agent_model_override() {
         // Given: [agents.builder].model = "base-model", profile patches it to "profile-model".
         // When: parsing with the profile selected.
-        // Then: cfg.roles["builder"].model == "profile-model".
+        // Then: cfg.agents.roles["builder"].model == "profile-model".
         let toml_str = r#"
 [agents.builder]
 model = "base-model"
@@ -1327,12 +1378,12 @@ preamble = "prompts/builder.md"
 [profile.model-swap]
 name = "model-swap"
 patches = [
-    { id = "agents.builder", config = { model = "profile-model", preamble = "prompts/builder.md", permissions = { read_file = "allow", run_bash_readonly = "allow", run_bash_mutating = "allow", edit_file = "allow", write_file = "allow", web_fetch = "allow", web_search = "allow" } } },
+  { id = "agents.builder", config = { model = "profile-model", preamble = "prompts/builder.md", permissions = { read_file = "allow", run_bash_readonly = "allow", run_bash_mutating = "allow", edit_file = "allow", write_file = "allow", web_fetch = "allow", web_search = "allow" } } },
 ]
 "#;
         let cfg = Config::from_str_with_profile(toml_str, Some("model-swap"))
             .expect("profile parse should succeed");
-        let builder = cfg.roles.get("builder").expect("builder role present");
+        let builder = cfg.agents.roles.get("builder").expect("builder role present");
         assert_eq!(builder.model, "profile-model");
     }
 
@@ -1484,5 +1535,117 @@ patches = [
             .expect("profile parse should succeed");
         assert_eq!(cfg.sandbox.mode, "landlock");
         assert!(cfg.verify.enabled);
+    }
+
+    // ── [agents.custom.*] 测试 / [agents.custom.*] tests ──
+
+    #[test]
+    fn custom_agent_parses_with_full_fields() {
+        let toml_str = r#"
+[agents.builder]
+model = "kimi-k3"
+preamble = "prompts/builder.md"
+permissions.read_file = "allow"
+
+[agents.custom.researcher]
+preamble = "agents/researcher.md"
+model = "kimi-k3"
+permissions.read_file = "allow"
+permissions.run_bash_readonly = "allow"
+permissions.run_bash_mutating = "deny"
+permissions.edit_file = "deny"
+permissions.write_file = "deny"
+permissions.web_fetch = "allow"
+permissions.web_search = "allow"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        // built-in role still present.
+        assert!(cfg.agents.roles.contains_key("builder"));
+        // custom agent parsed.
+        let r = cfg.agents.custom.get("researcher").expect("researcher present");
+        assert_eq!(r.preamble, "agents/researcher.md");
+        assert_eq!(r.model.as_deref(), Some("kimi-k3"));
+        assert_eq!(r.permissions.read_file, Permission::Allow);
+        assert_eq!(r.permissions.run_bash_mutating, Permission::Deny);
+        assert_eq!(r.permissions.web_fetch, Permission::Allow);
+    }
+
+    #[test]
+    fn custom_agent_omitted_permissions_get_defaults() {
+        let toml_str = r#"
+[agents.custom.minimal]
+preamble = "agents/minimal.md"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let r = cfg.agents.custom.get("minimal").expect("minimal present");
+        assert_eq!(r.preamble, "agents/minimal.md");
+        assert!(r.model.is_none());
+        // ToolPerms defaults: read_file/run_bash_readonly = Allow, rest = Ask.
+        assert_eq!(r.permissions.read_file, Permission::Allow);
+        assert_eq!(r.permissions.run_bash_readonly, Permission::Allow);
+        assert_eq!(r.permissions.run_bash_mutating, Permission::Ask);
+        assert_eq!(r.permissions.edit_file, Permission::Ask);
+        assert_eq!(r.permissions.write_file, Permission::Ask);
+        assert_eq!(r.permissions.web_fetch, Permission::Ask);
+        assert_eq!(r.permissions.web_search, Permission::Ask);
+    }
+
+    #[test]
+    fn custom_agent_absent_map_backward_compat() {
+        let toml_str = r#"
+[agents.builder]
+model = "kimi-k3"
+preamble = "prompts/builder.md"
+permissions.read_file = "allow"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.agents.custom.is_empty(), "no custom → empty map");
+        assert!(cfg.agents.roles.contains_key("builder"));
+    }
+
+    #[test]
+    fn custom_agent_empty_config_no_custom_map() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.agents.custom.is_empty());
+        assert!(cfg.agents.roles.is_empty());
+    }
+
+    #[test]
+    fn two_custom_agents_coexist() {
+        let toml_str = r#"
+[agents.custom.researcher]
+preamble = "agents/researcher.md"
+permissions.read_file = "allow"
+
+[agents.custom.reviewer]
+preamble = "agents/reviewer.md"
+model = "glm-latest"
+permissions.edit_file = "deny"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.agents.custom.len(), 2);
+        assert!(cfg.agents.custom.contains_key("researcher"));
+        assert!(cfg.agents.custom.contains_key("reviewer"));
+        assert_eq!(
+            cfg.agents.custom.get("reviewer").unwrap().model.as_deref(),
+            Some("glm-latest")
+        );
+    }
+
+    #[test]
+    fn custom_agent_does_not_leak_into_roles() {
+        let toml_str = r#"
+[agents.custom.researcher]
+preamble = "agents/researcher.md"
+
+[agents.builder]
+model = "kimi-k3"
+preamble = "prompts/builder.md"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.agents.roles.contains_key("custom"));
+        assert!(!cfg.agents.roles.contains_key("researcher"));
+        assert!(cfg.agents.roles.contains_key("builder"));
+        assert!(cfg.agents.custom.contains_key("researcher"));
     }
 }

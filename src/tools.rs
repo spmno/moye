@@ -16,7 +16,9 @@ use rig_core::tool::PortableTool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::event::{AgentEvent, EventSender, TodoItem, TodoStatus};
 use crate::seam::{FileSystemProvider, SandboxProvider, ShellExecutor};
+use crate::shell::{BackgroundRegistry, LazyShell};
 
 /// 3-stage waterfall 工具执行管线（todo 9）。
 /// 3-stage waterfall tool execution pipeline (todo 9).
@@ -274,7 +276,11 @@ fn not_found_error(content: &str, needle: &str, pair_label: Option<(usize, usize
 
 /// 对文件做精确文本替换的工具。
 /// Tool that performs exact text replacement in a file.
-struct EditFile;
+struct EditFile {
+    /// 文件检查点存储——在写入前快照文件原始内容。
+    /// File checkpoint store — snapshots original content before writing.
+    checkpoints: Arc<crate::checkpoint::CheckpointStore>,
+}
 
 /// 实现 `edit_file` 工具。
 ///
@@ -373,6 +379,11 @@ impl PortableTool for EditFile {
 
         let content = std::fs::read_to_string(&path).map_err(|e| ToolError(e.to_string()))?;
 
+        // 在写入前记录检查点（first-write-wins：同一任务内同一路径只记录首次）。
+        // Record checkpoint before writing (first-write-wins: same path in same task recorded once).
+        self.checkpoints
+            .record(self.checkpoints.current_task(), &path, Some(content.clone()));
+
         // ── Phase 1: 在内存中按序校验全部替换对 ──
         // pair N 可能 patch pair N-1 的输出，故校验须基于当前内存状态。
         // Phase 1: validate ALL pairs against the in-memory sequential state.
@@ -413,7 +424,9 @@ struct WriteFileArgs {
 
 /// 用给定内容创建或覆盖文件的工具。
 /// Tool that creates or overwrites a file with the given content.
-struct WriteFile;
+struct WriteFile {
+    checkpoints: Arc<crate::checkpoint::CheckpointStore>,
+}
 
 /// 实现 `write_file` 工具：用给定内容创建或覆盖一个文件。
 /// Implements the `write_file` tool: creates or overwrites a file with the given content.
@@ -449,16 +462,25 @@ impl PortableTool for WriteFile {
     /// Executes the tool: writes the file and returns a confirmation message.
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let path = crate::sandbox::expand_tilde(&args.path);
+        // 写入前读取当前内容（None=文件不存在），记录检查点。
+        // Read current content before writing (None=file absent), record checkpoint.
+        let prior = std::fs::read_to_string(&path).ok();
+        self.checkpoints
+            .record(self.checkpoints.current_task(), &path, prior);
         std::fs::write(&path, &args.content).map_err(|e| ToolError(e.to_string()))?;
         Ok(format!("wrote {}", args.path))
     }
 }
 
-/// `run_bash` 工具的输入参数：一条 shell 命令。
-/// Input args for the `run_bash` tool: a single shell command.
+/// `run_bash` 工具的输入参数：一条 shell 命令 + 可选后台标志。
+/// Input args for the `run_bash` tool: a shell command + optional background flag.
 #[derive(Deserialize)]
 struct BashArgs {
     command: String,
+    /// true=后台运行（长命令如 dev server / watch），返回 shell id。
+    /// true=run in background (long commands like dev server / watch), returns shell id.
+    #[serde(default)]
+    background: bool,
 }
 
 /// 在项目工作树内运行 shell 命令的工具。
@@ -467,6 +489,12 @@ struct RunBash {
     max_bash_output_chars: usize,
     sandbox: Arc<dyn SandboxProvider>,
     timeout_secs: u64,
+    /// Per-agent-run persistent shell (cwd/env survive across calls).
+    /// 每 agent-run 持久 shell（cwd/env 跨调用保留）。
+    shells: Arc<LazyShell>,
+    /// Shared background registry (shells outlive the turn).
+    /// 共享后台注册表（shell 寿命超过单轮）。
+    bg: Arc<BackgroundRegistry>,
 }
 
 /// 实现 `run_bash` 工具：运行 shell 命令并返回 stdout+stderr。
@@ -481,7 +509,7 @@ impl PortableTool for RunBash {
     /// Returns the LLM-facing tool description (Chinese).
     fn description(&self) -> String {
         format!(
-            "在项目工作树内运行一条 shell 命令，返回 stdout+stderr。输出截断到 {} 字符。",
+            "在项目工作树内运行一条 shell 命令，返回 stdout+stderr。同一 agent run 内 cd/export 等状态会持久化。输出截断到 {} 字符。设置 background=true 可在后台启动长命令（开发服务器/watch 模式），返回 shell id；用 bash_output 读取输出、kill_shell 停止。",
             self.max_bash_output_chars
         )
     }
@@ -491,50 +519,41 @@ impl PortableTool for RunBash {
     fn parameters(&self) -> serde_json::Value {
         json!({
             "type": "object",
-            "properties": { "command": { "type": "string", "description": "要运行的 shell 命令" } },
+            "properties": {
+                "command": { "type": "string", "description": "要运行的 shell 命令" },
+                "background": { "type": "boolean", "default": false, "description": "true=后台运行（长命令如 dev server / watch），返回 shell id" }
+            },
             "required": ["command"],
         })
     }
 
-    /// 执行工具：通过 `sh -c` 运行命令，收集退出码与输出，截断到 20000 字符。
-    /// Executes the tool: runs the command via `sh -c`, collecting exit code and output,
-    /// truncating combined stdout+stderr to 20000 chars.
+    /// 执行工具：前台通过持久 shell（LazyShell），后台通过 BackgroundRegistry。
+    /// Executes the tool: foreground via persistent shell (LazyShell), background via registry.
     ///
-    /// 用 tokio::process 而非 std::process：阻塞式 Command 会卡住整个 async runtime
-    /// （长命令期间 TUI 无法重绘、无法响应 Esc）。kill_on_drop 确保任务被 abort（Esc）
-    /// 时子进程一并被杀，而不是成为孤儿进程继续运行。
-    /// Uses tokio::process instead of std::process: a blocking Command stalls the whole
-    /// async runtime (no TUI redraw, no Esc response during long commands). kill_on_drop
-    /// ensures aborting the task (Esc) also kills the child instead of orphaning it.
+    /// 前台路径：替换原有的每调用 spawn，使用同一 agent run 内持久化的 shell
+    /// （cd/export 跨调用保留）。输出格式与原实现完全一致（stdout/stderr 分离、
+    /// 截断、退出码报告）。
+    /// 后台路径：启动分离的 `sh -c` 子进程，返回 shell id。
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let timeout = Duration::from_secs(self.timeout_secs);
-        let timeout_err = || ToolError(format!("command timed out after {}s", self.timeout_secs));
+        if args.background {
+            let id = self
+                .bg
+                .start(&args.command, self.sandbox.as_ref())
+                .map_err(|e| ToolError(e.to_string()))?;
+            return Ok(format!(
+                "started background shell {id} (bash_output to read, kill_shell to stop)"
+            ));
+        }
 
-        let out = if let Some(bwrap_argv) = self.sandbox.grant_args(&[], &[]) {
-            let mut cmd = tokio::process::Command::new(&bwrap_argv[0]);
-            for arg in &bwrap_argv[1..] {
-                cmd.arg(arg);
-            }
-            cmd.arg("--")
-                .arg("sh")
-                .arg("-c")
-                .arg(&args.command)
-                .kill_on_drop(true);
-            tokio::time::timeout(timeout, cmd.output())
-                .await
-                .map_err(|_| timeout_err())?
-                .map_err(|e| ToolError(e.to_string()))?
-        } else {
-            let mut cmd = tokio::process::Command::new("sh");
-            cmd.arg("-c").arg(&args.command).kill_on_drop(true);
-            tokio::time::timeout(timeout, cmd.output())
-                .await
-                .map_err(|_| timeout_err())?
-                .map_err(|e| ToolError(e.to_string()))?
-        };
-        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let code = out.status.code().unwrap_or(-1);
+        let timeout = Duration::from_secs(self.timeout_secs);
+        let (stdout, stderr, code) = self
+            .shells
+            .exec(&args.command, timeout)
+            .await
+            .map_err(ToolError)?;
+
+        let stdout = stdout.trim().to_string();
+        let stderr = stderr.trim().to_string();
         let combined = if code == 0 {
             if stderr.is_empty() {
                 stdout
@@ -557,6 +576,98 @@ impl PortableTool for RunBash {
             &combined,
             self.max_bash_output_chars,
         ))
+    }
+}
+
+// ─── bash_output / kill_shell 工具 ──────────────────────────────────────
+// ─── bash_output / kill_shell tools ──────────────────────────────────────
+
+/// `bash_output` 工具的输入参数：后台 shell id。
+/// Input args for the `bash_output` tool: a background shell id.
+#[derive(Deserialize)]
+struct BashOutputArgs {
+    id: String,
+}
+
+/// 读取后台 shell 累积输出与状态的工具。
+/// Tool that reads accumulated output + status of a background shell.
+struct BashOutput {
+    bg: Arc<BackgroundRegistry>,
+}
+
+impl PortableTool for BashOutput {
+    const NAME: &'static str = "bash_output";
+    type Error = ToolError;
+    type Args = BashOutputArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        "读取后台 shell 的累积输出与状态（running / exited(N)）".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "后台 shell id（bg-N）" }
+            },
+            "required": ["id"],
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        match self.bg.read(&args.id) {
+            Some((buffer, exit)) => {
+                let status = match exit {
+                    Some(code) => format!("exited({code})"),
+                    None => "running".to_string(),
+                };
+                Ok(format!("status: {status}\n{buffer}"))
+            }
+            None => Ok(format!("{} not found", args.id)),
+        }
+    }
+}
+
+/// `kill_shell` 工具的输入参数：后台 shell id。
+/// Input args for the `kill_shell` tool: a background shell id.
+#[derive(Deserialize)]
+struct KillShellArgs {
+    id: String,
+}
+
+/// 终止后台 shell 的工具（发送 SIGKILL）。
+/// Tool that terminates a background shell (sends SIGKILL).
+struct KillShell {
+    bg: Arc<BackgroundRegistry>,
+}
+
+impl PortableTool for KillShell {
+    const NAME: &'static str = "kill_shell";
+    type Error = ToolError;
+    type Args = KillShellArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        "终止后台 shell（发送 SIGKILL）".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "后台 shell id（bg-N）" }
+            },
+            "required": ["id"],
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if self.bg.kill(&args.id) {
+            Ok(format!("killed {}", args.id))
+        } else {
+            Ok(format!("{} not found or already exited", args.id))
+        }
     }
 }
 
@@ -1780,7 +1891,218 @@ pub fn tool_names() -> Vec<&'static str> {
         "run_file",
         "web_fetch",
         "web_search",
+        "todo_write",
+        "task",
+        "bash_output",
+        "kill_shell",
     ]
+}
+
+// ─── todo_write 工具 ────────────────────────────────────────────────────
+// ─── todo_write tool ────────────────────────────────────────────────────
+
+/// todo_write 工具的共享状态 + 事件发送端。
+/// Shared store + event sender for the todo_write tool.
+///
+/// 工具持有此结构的 clone，在 call 时更新 store 并通过 tx 发出 TodoUpdate 事件。
+/// 依赖方向：tool → event → TUI，永不 tool → TUI 直接调用。
+/// The tool holds a clone of this; on call it updates the store and emits a
+/// TodoUpdate event via tx. Dependency direction: tool → event → TUI, never
+/// tool → TUI directly.
+#[derive(Clone)]
+pub struct TodoContext {
+    /// 共享任务列表——同一 Orchestrator 的所有 TodoWrite 实例共享同一份。
+    /// Shared todo list — all TodoWrite instances within one Orchestrator share the same store.
+    pub store: Arc<Mutex<Vec<TodoItem>>>,
+    /// 事件发送端（mpsc::UnboundedSender<AgentEvent> 的 clone）。
+    /// Event sender (a clone of mpsc::UnboundedSender<AgentEvent>).
+    pub tx: EventSender,
+}
+
+/// `todo_write` 工具的输入参数：完整任务列表（每次调用整体替换）。
+/// Input args for the `todo_write` tool: the full todo list (replaced wholesale on each call).
+#[derive(Deserialize)]
+struct TodoWriteArgs {
+    todos: Vec<TodoItem>,
+}
+
+/// 用于规划和跟踪多步骤工作的任务列表工具。
+/// Tool for planning and tracking multi-step work with a todo list.
+///
+/// 每次调用整体替换共享列表，校验后发出 `AgentEvent::TodoUpdate`。
+/// Each call replaces the shared list wholesale; after validation it emits
+/// `AgentEvent::TodoUpdate`.
+struct TodoWrite {
+    ctx: TodoContext,
+}
+
+impl TodoWrite {
+    fn new(ctx: TodoContext) -> Self {
+        Self { ctx }
+    }
+}
+
+impl PortableTool for TodoWrite {
+    const NAME: &'static str = "todo_write";
+    type Error = ToolError;
+    type Args = TodoWriteArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        "用于规划和跟踪多步骤工作的任务列表工具。每次调用用完整列表整体替换之前的列表。\
+         任一时刻恰好一项为 in_progress；每完成一项立即标记 completed 再推进下一项。\
+         3 步及以上的任务请先用本工具建清单。"
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "description": "完整的任务列表（每次调用整体替换）",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string", "description": "任务唯一标识（非空）" },
+                            "content": { "type": "string", "description": "任务内容描述" },
+                            "status": { "type": "string", "enum": ["pending", "in_progress", "completed"], "description": "任务状态" }
+                        },
+                        "required": ["id", "content", "status"]
+                    }
+                }
+            },
+            "required": ["todos"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // 校验：非空 id、无重复 id、最多 1 项 in_progress。
+        // Validate: non-empty ids, no duplicate ids, at most 1 in_progress.
+        let mut ids = std::collections::HashSet::new();
+        let mut in_progress_count = 0;
+        for item in &args.todos {
+            if item.id.is_empty() {
+                return Err(ToolError("todo id must not be empty / id 不得为空".into()));
+            }
+            if !ids.insert(&item.id) {
+                return Err(ToolError(format!(
+                    "duplicate todo id: {} / 重复的 id: {}",
+                    item.id, item.id
+                )));
+            }
+            if item.status == TodoStatus::InProgress {
+                in_progress_count += 1;
+            }
+        }
+        if in_progress_count > 1 {
+            return Err(ToolError(format!(
+                "at most 1 in_progress item allowed, got {in_progress_count} / \
+                 最多 1 项 in_progress，实际 {in_progress_count} 项"
+            )));
+        }
+
+        // 原子替换共享列表 / atomically replace the shared list.
+        {
+            let mut store = self
+                .ctx
+                .store
+                .lock()
+                .map_err(|e| ToolError(format!("store lock failed: {e}")))?;
+            *store = args.todos.clone();
+        }
+
+        // 发出 TodoUpdate 事件——TUI 侧边栏消费此事件渲染列表。
+        // Emit TodoUpdate event — the TUI sidebar consumes this to render the list.
+        let _ = self.ctx.tx.send(AgentEvent::TodoUpdate {
+            todos: args.todos.clone(),
+        });
+
+        let n = args.todos.len();
+        Ok(format!(
+            "todos updated: {n} items ({in_progress_count} in progress)"
+        ))
+    }
+}
+
+// ─── task 工具（子代理并行扇出）────────────────────────────────────────
+// ─── task tool (parallel subagent fanout) ──────────────────────────────
+
+/// `task` 工具的输入参数：子任务列表 + 可选并发上限。
+/// Input args for the `task` tool: subtask list + optional concurrency cap.
+#[derive(Deserialize)]
+struct TaskToolArgs {
+    tasks: Vec<crate::subagent::SubTask>,
+    #[serde(default)]
+    max_concurrent: Option<usize>,
+}
+
+/// 并行扇出多个上下文隔离的子代理，聚合结果。
+/// Fans out multiple context-isolated subagents in parallel, aggregating results.
+///
+/// 持有 `SubagentCtx`（sandbox/trust/tx/depth）和 `AgentRegistry` 克隆，
+/// 调用 `fanout` → `run_subtask` → `run_autonomous`。
+/// Holds `SubagentCtx` (sandbox/trust/tx/depth) and an `AgentRegistry` clone;
+/// calls `fanout` → `run_subtask` → `run_autonomous`.
+struct TaskTool {
+    ctx: crate::subagent::SubagentCtx,
+    registry: crate::registry::AgentRegistry,
+}
+
+impl TaskTool {
+    fn new(ctx: crate::subagent::SubagentCtx, registry: crate::registry::AgentRegistry) -> Self {
+        Self { ctx, registry }
+    }
+}
+
+impl PortableTool for TaskTool {
+    const NAME: &'static str = "task";
+    type Error = ToolError;
+    type Args = TaskToolArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        "并行扇出多个上下文隔离的子代理执行子任务并聚合结果。每个子任务拥有独立的\
+         对话历史，不继承父历史。agent 模板：explore（只读调查）或 build（可编辑）。\
+         适用于独立子任务并行化——例如分别调查多个模块、并行实现互不依赖的组件。"
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "description": "子任务列表",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "description": { "type": "string", "description": "子任务简述（3-5 词）" },
+                            "prompt": { "type": "string", "description": "子任务完整提示词" },
+                            "agent": { "type": "string", "enum": ["explore", "build"], "description": "agent 模板（默认 explore）" }
+                        },
+                        "required": ["description", "prompt"]
+                    }
+                },
+                "max_concurrent": { "type": "integer", "description": "最大并发数（默认 4）" }
+            },
+            "required": ["tasks"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let max_concurrent = args.max_concurrent.unwrap_or(4);
+        let ctx = self.ctx.clone();
+        let registry = self.registry.clone();
+        Ok(crate::subagent::fanout(args.tasks, max_concurrent, move |task| {
+            let ctx = ctx.clone();
+            let registry = registry.clone();
+            async move { crate::subagent::run_subtask(registry, ctx, task).await }
+        })
+        .await)
+    }
 }
 
 /// 内置工具集合 + 动态工具（tools_ext）。
@@ -1794,15 +2116,22 @@ pub fn builtin_tools(
     sandbox: Arc<dyn SandboxProvider>,
 ) -> anyhow::Result<rig_agent::tool::ToolSet> {
     let mut tools = rig_agent::tool::ToolSet::default();
+    let shells = Arc::new(LazyShell::new(sandbox.clone(), config.max_bash_output_chars));
+    let bg = Arc::new(BackgroundRegistry::new(config.max_bash_output_chars));
+    let checkpoints = Arc::new(crate::checkpoint::CheckpointStore::new());
     tools.add_tool(ReadFile {
         max_read_lines: config.max_read_lines,
     });
-    tools.add_tool(EditFile);
-    tools.add_tool(WriteFile);
+    tools.add_tool(EditFile {
+        checkpoints: checkpoints.clone(),
+    });
+    tools.add_tool(WriteFile { checkpoints });
     tools.add_tool(RunBash {
         max_bash_output_chars: config.max_bash_output_chars,
         sandbox: sandbox.clone(),
         timeout_secs: 300,
+        shells,
+        bg: bg.clone(),
     });
     tools.add_tool(RunFile {
         max_output_chars: config.max_bash_output_chars,
@@ -1810,16 +2139,40 @@ pub fn builtin_tools(
     });
     tools.add_tool(WebFetch);
     tools.add_tool(WebSearch);
+    tools.add_tool(BashOutput { bg: bg.clone() });
+    tools.add_tool(KillShell { bg });
     tools.add_tools(crate::tools_ext::load_all());
     Ok(tools)
 }
 
-/// 将 6 个内置工具逐一注册到 builder 上（rig 0.41 的 `.tool()` 链式调用）。
-/// Registers the 6 built-in tools onto a builder one by one (rig 0.41's `.tool()` chain).
-/// `builtin_tools()` 返回 `ToolSet` 供侧边栏/列举使用；builder 不接受 `ToolSet`，
-/// `builtin_tools()` returns a `ToolSet` for sidebar/listing use; the builder does not accept
-/// 故在两处 builder 调用点使用此 helper 逐一注册。
-/// a `ToolSet`, so this helper registers them one by one at the two builder call sites.
+/// 工具依赖注入容器——把 sandbox / todo_ctx / shells / bg 打包为一个参数。
+/// Dependency injection container — bundles sandbox / todo_ctx / shells / bg into one param.
+///
+/// 每个 agent 获得自己的 `LazyShell`（per-agent-run 隔离），但共享
+/// Orchestrator 级别的 `BackgroundRegistry`（shell 寿命超过单轮）。
+/// Each agent gets its own `LazyShell` (per-agent-run isolation), but shares
+/// the Orchestrator-level `BackgroundRegistry` (shells outlive the turn).
+pub struct ToolDeps {
+    pub sandbox: Arc<dyn SandboxProvider>,
+    pub todo_ctx: Option<TodoContext>,
+    /// task 工具（子代理扇出）上下文——仅 Builder + Orchestrator（且深度为 0）时有值。
+    /// task tool (subagent fanout) context — only Some for Builder + Orchestrator
+    /// (and only when subagent depth is 0).
+    pub task_ctx: Option<crate::subagent::SubagentCtx>,
+    /// AgentRegistry 克隆，供 TaskTool 传给 run_subtask → run_autonomous。
+    /// 廉价克隆（所有字段为 Arc 共享），不形成引用环（registry 的 task_ctx 槽
+    /// 只存 SubagentCtx，不含 registry 本身）。
+    /// AgentRegistry clone for TaskTool to pass to run_subtask → run_autonomous.
+    /// Cheap clone (all fields Arc-shared); no reference cycle (the registry's
+    /// task_ctx slot stores SubagentCtx only, not the registry itself).
+    pub task_registry: crate::registry::AgentRegistry,
+    pub shells: Arc<LazyShell>,
+    pub bg: Arc<BackgroundRegistry>,
+    pub checkpoints: Arc<crate::checkpoint::CheckpointStore>,
+}
+
+/// 将内置工具逐一注册到 builder 上（rig 0.41 的 `.tool()` 链式调用）。
+/// Registers the built-in tools onto a builder one by one (rig 0.41's `.tool()` chain).
 ///
 /// 沙箱以 `Arc<dyn SandboxProvider>` trait 对象注入（todo 4 迁移）——使后端可在
 /// 配置层切换，build() 不再依赖具体 `SimpleSandbox` 类型。
@@ -1834,29 +2187,61 @@ pub fn builtin_tools(
 pub fn add_builtin_tools<M>(
     builder: rig_agent::agent::AgentBuilder<M, rig_agent::agent::NoToolConfig>,
     config: &crate::context::ContextConfig,
-    sandbox: Arc<dyn SandboxProvider>,
+    deps: &ToolDeps,
 ) -> rig_agent::agent::AgentBuilder<M, rig_agent::agent::WithBuilderTools>
 where
     M: rig_core::completion::CompletionModel,
 {
     use pipeline::TimeoutRetryTool;
-    builder
+    let builder = builder
         .tool(TimeoutRetryTool::passthrough(ReadFile {
             max_read_lines: config.max_read_lines,
         }))
-        .tool(TimeoutRetryTool::passthrough(EditFile))
-        .tool(TimeoutRetryTool::passthrough(WriteFile))
+        .tool(TimeoutRetryTool::passthrough(EditFile {
+            checkpoints: deps.checkpoints.clone(),
+        }))
+        .tool(TimeoutRetryTool::passthrough(WriteFile {
+            checkpoints: deps.checkpoints.clone(),
+        }))
         .tool(TimeoutRetryTool::passthrough(RunBash {
             max_bash_output_chars: config.max_bash_output_chars,
-            sandbox: sandbox.clone(),
+            sandbox: deps.sandbox.clone(),
             timeout_secs: 300,
+            shells: deps.shells.clone(),
+            bg: deps.bg.clone(),
         }))
         .tool(TimeoutRetryTool::passthrough(RunFile {
             max_output_chars: config.max_bash_output_chars,
-            sandbox: sandbox.clone(),
+            sandbox: deps.sandbox.clone(),
         }))
         .tool(TimeoutRetryTool::passthrough(WebFetch))
         .tool(TimeoutRetryTool::passthrough(WebSearch))
+        .tool(TimeoutRetryTool::passthrough(BashOutput {
+            bg: deps.bg.clone(),
+        }))
+        .tool(TimeoutRetryTool::passthrough(KillShell {
+            bg: deps.bg.clone(),
+        }));
+    // todo_write 仅在有共享 store + sender 时注册（Builder + Orchestrator 角色）。
+    // todo_write is only registered when a shared store + sender is available
+    // (Builder + Orchestrator roles).
+    // task 同理：仅在有 task_ctx 时注册（Builder + Orchestrator，且深度为 0）。
+    // task likewise: only registered when task_ctx is available
+    // (Builder + Orchestrator, and only when subagent depth is 0).
+    let builder = if let Some(todo_ctx) = &deps.todo_ctx {
+        builder.tool(TodoWrite::new(todo_ctx.clone()))
+    } else {
+        builder
+    };
+
+    if let Some(task_ctx) = &deps.task_ctx {
+        builder.tool(TimeoutRetryTool::passthrough(TaskTool::new(
+            task_ctx.clone(),
+            deps.task_registry.clone(),
+        )))
+    } else {
+        builder
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2187,7 +2572,9 @@ mod tests {
         std::fs::write(&path, file_content).unwrap();
         // old 4 行中有 3 行匹配（line 2 "let x = 2" vs "let x = 1" 不同）→ ratio = 0.75 ≥ 0.5
         let old = "fn foo() {\n    let x = 2;\n    bar(x);\n}\n";
-        let tool = EditFile;
+        let tool = EditFile {
+            checkpoints: Arc::new(crate::checkpoint::CheckpointStore::new()),
+        };
         let args = EditFileArgs {
             path: path.to_string_lossy().to_string(),
             old: Some(old.into()),
@@ -2210,7 +2597,9 @@ mod tests {
         let path = dir.join("test_edit_single.txt");
         std::fs::write(&path, "alpha beta beta gamma\n").unwrap();
         let raw_path = path.to_string_lossy().to_string();
-        let tool = EditFile;
+        let tool = EditFile {
+            checkpoints: Arc::new(crate::checkpoint::CheckpointStore::new()),
+        };
         let args = EditFileArgs {
             path: raw_path.clone(),
             old: Some("beta".into()),
@@ -2233,7 +2622,9 @@ mod tests {
         let path = dir.join("test_edit_multi_seq.txt");
         std::fs::write(&path, "AAA BBB CCC\n").unwrap();
         let raw_path = path.to_string_lossy().to_string();
-        let tool = EditFile;
+        let tool = EditFile {
+            checkpoints: Arc::new(crate::checkpoint::CheckpointStore::new()),
+        };
         let args = EditFileArgs {
             path: raw_path.clone(),
             old: None,
@@ -2269,7 +2660,9 @@ mod tests {
         let original = "alpha\nbeta\ngamma\n";
         std::fs::write(&path, original).unwrap();
         let raw_path = path.to_string_lossy().to_string();
-        let tool = EditFile;
+        let tool = EditFile {
+            checkpoints: Arc::new(crate::checkpoint::CheckpointStore::new()),
+        };
         let args = EditFileArgs {
             path: raw_path.clone(),
             old: None,
@@ -2304,7 +2697,9 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("test_edit_both_forms.txt");
         std::fs::write(&path, "hello\n").unwrap();
-        let tool = EditFile;
+        let tool = EditFile {
+            checkpoints: Arc::new(crate::checkpoint::CheckpointStore::new()),
+        };
         let args = EditFileArgs {
             path: path.to_string_lossy().to_string(),
             old: Some("hello".into()),
@@ -2329,7 +2724,9 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("test_edit_neither.txt");
         std::fs::write(&path, "hello\n").unwrap();
-        let tool = EditFile;
+        let tool = EditFile {
+            checkpoints: Arc::new(crate::checkpoint::CheckpointStore::new()),
+        };
         let args = EditFileArgs {
             path: path.to_string_lossy().to_string(),
             old: None,
@@ -2342,5 +2739,265 @@ mod tests {
             "should reject empty args"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// EditFile 应在写入前记录恰好一个检查点，保留原始内容。
+    /// EditFile should record exactly one checkpoint with the original content before writing.
+    #[tokio::test]
+    async fn edit_file_records_checkpoint_before_write() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_edit_checkpoint.txt");
+        let original = "alpha\n";
+        std::fs::write(&path, original).unwrap();
+
+        let store = Arc::new(crate::checkpoint::CheckpointStore::new());
+        let task = store.begin_task();
+        let tool = EditFile {
+            checkpoints: store.clone(),
+        };
+        let args = EditFileArgs {
+            path: path.to_string_lossy().to_string(),
+            old: Some("alpha".into()),
+            new: Some("ALPHA".into()),
+            edits: None,
+        };
+        let _ = tool.call(args).await.unwrap();
+
+        // Exactly one checkpoint for this task
+        let tasks = store.tasks_with_files();
+        assert_eq!(tasks, vec![(task, 1)]);
+
+        // Checkpoint before = original content
+        let paths = store.task_paths(task);
+        assert_eq!(paths.len(), 1);
+
+        // Rewind restores the original
+        let outcomes = store.rewind_task(task);
+        assert_eq!(outcomes.len(), 1);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, original);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// WriteFile 应在写入前记录检查点（新建文件 before=None）。
+    /// WriteFile should record a checkpoint before writing (new file → before=None).
+    #[tokio::test]
+    async fn write_file_records_checkpoint_for_new_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_write_checkpoint_new.txt");
+        std::fs::remove_file(&path).ok();
+
+        let store = Arc::new(crate::checkpoint::CheckpointStore::new());
+        let task = store.begin_task();
+        let tool = WriteFile {
+            checkpoints: store.clone(),
+        };
+        let args = WriteFileArgs {
+            path: path.to_string_lossy().to_string(),
+            content: "hello\n".into(),
+        };
+        let _ = tool.call(args).await.unwrap();
+
+        // One checkpoint, before=None (file didn't exist)
+        let tasks = store.tasks_with_files();
+        assert_eq!(tasks, vec![(task, 1)]);
+
+        // Rewind deletes the created file
+        let outcomes = store.rewind_task(task);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].1, crate::checkpoint::RewindOutcome::Deleted);
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    // ── todo_write tests ──
+
+    fn todo_ctx_for_test() -> (
+        Arc<Mutex<Vec<TodoItem>>>,
+        tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+        TodoContext,
+    ) {
+        let store = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let ctx = TodoContext {
+            store: store.clone(),
+            tx,
+        };
+        (store, rx, ctx)
+    }
+
+    #[tokio::test]
+    async fn todo_write_empty_id_rejected() {
+        let (_store, _rx, ctx) = todo_ctx_for_test();
+        let tool = TodoWrite::new(ctx);
+        let args = TodoWriteArgs {
+            todos: vec![TodoItem {
+                id: String::new(),
+                content: "x".into(),
+                status: TodoStatus::Pending,
+            }],
+        };
+        let err = tool.call(args).await.unwrap_err();
+        assert!(err.to_string().contains("empty"), "empty id rejected: {err}");
+    }
+
+    #[tokio::test]
+    async fn todo_write_duplicate_id_rejected() {
+        let (_store, _rx, ctx) = todo_ctx_for_test();
+        let tool = TodoWrite::new(ctx);
+        let args = TodoWriteArgs {
+            todos: vec![
+                TodoItem {
+                    id: "a".into(),
+                    content: "first".into(),
+                    status: TodoStatus::Pending,
+                },
+                TodoItem {
+                    id: "a".into(),
+                    content: "dup".into(),
+                    status: TodoStatus::Pending,
+                },
+            ],
+        };
+        let err = tool.call(args).await.unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "duplicate id rejected: {err}");
+    }
+
+    #[tokio::test]
+    async fn todo_write_two_in_progress_rejected() {
+        let (_store, _rx, ctx) = todo_ctx_for_test();
+        let tool = TodoWrite::new(ctx);
+        let args = TodoWriteArgs {
+            todos: vec![
+                TodoItem {
+                    id: "a".into(),
+                    content: "x".into(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    id: "b".into(),
+                    content: "y".into(),
+                    status: TodoStatus::InProgress,
+                },
+            ],
+        };
+        let err = tool.call(args).await.unwrap_err();
+        assert!(
+            err.to_string().contains("in_progress") || err.to_string().contains("in progress"),
+            "two in_progress rejected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn todo_write_valid_replaces_store_and_confirms() {
+        let (store, mut rx, ctx) = todo_ctx_for_test();
+        let tool = TodoWrite::new(ctx);
+        let args = TodoWriteArgs {
+            todos: vec![
+                TodoItem {
+                    id: "a".into(),
+                    content: "step 1".into(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    id: "b".into(),
+                    content: "step 2".into(),
+                    status: TodoStatus::Pending,
+                },
+            ],
+        };
+        let out = tool.call(args).await.unwrap();
+        assert!(
+            out.contains("todos updated") && out.contains("2 items") && out.contains("1 in progress"),
+            "confirmation string: {out}"
+        );
+        let stored = store.lock().unwrap().clone();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].id, "a");
+        assert_eq!(stored[1].status, TodoStatus::Pending);
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::TodoUpdate { todos } => assert_eq!(todos.len(), 2),
+            _ => panic!("expected TodoUpdate event"),
+        }
+    }
+
+    #[test]
+    fn todo_status_serde_roundtrip() {
+        let json = serde_json::to_string(&TodoStatus::InProgress).unwrap();
+        assert_eq!(json, "\"in_progress\"");
+        let back: TodoStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, TodoStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn todo_write_store_isolation_shared_arc() {
+        // 两个 TodoWrite 工具共享同一 Arc<Mutex<Vec<TodoItem>>>。
+        // Two TodoWrite tools sharing one Arc — writes from one are visible to the other.
+        let (store, _rx, ctx) = todo_ctx_for_test();
+        let tool1 = TodoWrite::new(ctx.clone());
+        let tool2 = TodoWrite::new(ctx.clone());
+        let args1 = TodoWriteArgs {
+            todos: vec![TodoItem {
+                id: "x".into(),
+                content: "from tool1".into(),
+                status: TodoStatus::Completed,
+            }],
+        };
+        tool1.call(args1).await.unwrap();
+        let stored = store.lock().unwrap().clone();
+        assert_eq!(stored.len(), 1, "store should have tool1's item");
+        assert_eq!(stored[0].id, "x");
+        let args2 = TodoWriteArgs {
+            todos: vec![
+                TodoItem {
+                    id: "y".into(),
+                    content: "from tool2".into(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    id: "z".into(),
+                    content: "also tool2".into(),
+                    status: TodoStatus::Pending,
+                },
+            ],
+        };
+        tool2.call(args2).await.unwrap();
+        let stored = store.lock().unwrap().clone();
+        assert_eq!(stored.len(), 2, "store should be replaced by tool2's list");
+        assert_eq!(stored[0].id, "y");
+        assert_eq!(stored[1].id, "z");
+    }
+
+    // ─── BashArgs / tool_names tests ────────────────────────────────────
+    // ─── BashArgs / tool_names tests ────────────────────────────────────
+
+    /// `BashArgs` without `background` field deserializes to `background: false`.
+    /// `BashArgs` 不含 `background` 字段时反序列化为 `background: false`。
+    #[test]
+    fn bash_args_background_defaults_false() {
+        let args: BashArgs = serde_json::from_str(r#"{"command": "ls"}"#).expect("parse");
+        assert!(!args.background, "background should default to false");
+    }
+
+    /// `BashArgs` with `background: true` deserializes correctly.
+    /// `BashArgs` 含 `background: true` 时正确反序列化。
+    #[test]
+    fn bash_args_background_true() {
+        let args: BashArgs =
+            serde_json::from_str(r#"{"command": "cargo watch", "background": true}"#).expect("parse");
+        assert!(args.background);
+        assert_eq!(args.command, "cargo watch");
+    }
+
+    /// `tool_names()` includes `bash_output` and `kill_shell`.
+    /// `tool_names()` 包含 `bash_output` 和 `kill_shell`。
+    #[test]
+    fn tool_names_includes_new_tools() {
+        let names = tool_names();
+        assert!(names.contains(&"bash_output"), "should contain bash_output");
+        assert!(names.contains(&"kill_shell"), "should contain kill_shell");
+        assert!(names.contains(&"run_bash"), "should still contain run_bash");
+        assert!(names.contains(&"task"), "should contain task");
     }
 }

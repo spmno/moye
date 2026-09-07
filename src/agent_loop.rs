@@ -678,9 +678,8 @@ fn format_tool_call_desc(tool_name: &str, args: &str) -> String {
         }
         "edit_file" => {
             let path = get_str("path").unwrap_or_default();
-            let old = get_str("old").unwrap_or_default();
-            let new = get_str("new").unwrap_or_default();
             // 对多行 old/new 做缩进并截断，使代码块在 TUI 中更易读
+            // Indent and cap multi-line old/new for TUI readability
             let fmt_block = |s: &str| -> String {
                 let lines: Vec<&str> = s.lines().collect();
                 if lines.is_empty() {
@@ -697,11 +696,39 @@ fn format_tool_call_desc(tool_name: &str, args: &str) -> String {
                 }
                 out
             };
-            format!(
-                "edit_file \u{2192} \u{7f16}\u{8f91}\u{6587}\u{4ef6}: {path}\n  \u{66ff}\u{6362}: {}\n  \u{66ff}\u{6362}\u{4e3a}: {}",
-                fmt_block(&old),
-                fmt_block(&new),
-            )
+            // 批量编辑形式检测：edits 数组 → 仅预览第一对
+            // 多编辑 diff 渲染为未来工作（见 parse_file_edit），此处仅文字预览。
+            // Detect multi-edit form: edits array → preview first pair only.
+            // Multi-edit diff rendering is future work (see parse_file_edit);
+            // here we only show a text preview of the first pair.
+            let edits_arr = parsed
+                .as_ref()
+                .and_then(|v| v.get("edits"))
+                .and_then(|v| v.as_array());
+            if let Some(arr) = edits_arr {
+                let n = arr.len();
+                let (old0, new0) = arr
+                    .first()
+                    .and_then(|p| {
+                        let o = p.get("old").and_then(|v| v.as_str()).unwrap_or("");
+                        let nw = p.get("new").and_then(|v| v.as_str()).unwrap_or("");
+                        Some((o, nw))
+                    })
+                    .unwrap_or(("", ""));
+                format!(
+                    "edit_file \u{2192} \u{7f16}\u{8f91}\u{6587}\u{4ef6}: {path}\u{ff08}{n} \u{5904}\u{66ff}\u{6362} / edits\u{ff09}\n  \u{66ff}\u{6362}: {}\n  \u{66ff}\u{6362}\u{4e3a}: {}",
+                    fmt_block(old0),
+                    fmt_block(new0),
+                )
+            } else {
+                let old = get_str("old").unwrap_or_default();
+                let new = get_str("new").unwrap_or_default();
+                format!(
+                    "edit_file \u{2192} \u{7f16}\u{8f91}\u{6587}\u{4ef6}: {path}\n  \u{66ff}\u{6362}: {}\n  \u{66ff}\u{6362}\u{4e3a}: {}",
+                    fmt_block(&old),
+                    fmt_block(&new),
+                )
+            }
         }
         "write_file" => {
             let path = get_str("path").unwrap_or_default();
@@ -739,15 +766,28 @@ fn format_tool_call_desc(tool_name: &str, args: &str) -> String {
 /// 仅当 `tool_name == "edit_file"` 且 JSON 含 `path`/`old`/`new` 键时返回 Some；
 /// 任何解析失败或缺失键 → None（退回纯文本 desc 渲染，绝不 panic）。
 ///
+/// 批量编辑形式（`edits` 数组）返回 None —— 多编辑 unified diff 渲染为未来工作，
+/// 退回纯文本 desc 渲染（`format_tool_call_desc` 已预览第一对）。
+///
 /// Parse the structured edit payload from tool-call args.
 /// Returns Some only when `tool_name == "edit_file"` and the JSON contains
 /// `path`/`old`/`new`; any parse failure or missing key → None (falls back
 /// to the plain-text desc rendering, never panics).
+///
+/// Multi-edit form (`edits` array) returns None — multi-edit unified diff
+/// rendering is future work; falls back to the plain-text desc rendering
+/// (`format_tool_call_desc` already previews the first pair).
 fn parse_file_edit(tool_name: &str, args: &str) -> Option<Box<FileEdit>> {
     if tool_name != "edit_file" {
         return None;
     }
     let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
+    // 批量编辑形式（edits 数组）不解析为 FileEdit —— 多编辑 diff 渲染为未来工作。
+    // Multi-edit form (edits array) does not parse into FileEdit —
+    // multi-edit diff rendering is future work.
+    if parsed.get("edits").is_some() {
+        return None;
+    }
     let get = |k: &str| {
         parsed.get(k).and_then(|v| v.as_str()).map(|s| s.to_string())
     };
@@ -1363,6 +1403,33 @@ mod tests {
             decide_flow(&perms(), "mystery", r#"{}"#),
             ToolCallAction::Skip(..)
         ));
+    }
+
+    // ── parse_file_edit 形式分发测试 ──
+    // ── parse_file_edit form-dispatch tests ──
+
+    /// 单次形式 `{path, old, new}` 应解析为 Some(FileEdit)。
+    /// Single form `{path, old, new}` should parse to Some(FileEdit).
+    #[test]
+    fn parse_file_edit_single_returns_some() {
+        let fe = parse_file_edit("edit_file", r#"{"path":"src/main.rs","old":"a","new":"b"}"#);
+        assert!(fe.is_some(), "single form should return Some");
+        let fe = fe.unwrap();
+        assert_eq!(fe.path, "src/main.rs");
+        assert_eq!(fe.old, "a");
+        assert_eq!(fe.new, "b");
+    }
+
+    /// 批量形式 `{path, edits: [...]}` 应返回 None（退回纯文本 desc 渲染）。
+    /// Multi form `{path, edits: [...]}` should return None
+    /// (falls back to plain-text desc rendering; multi-edit diff is future work).
+    #[test]
+    fn parse_file_edit_multi_returns_none() {
+        let args = r#"{"path":"src/main.rs","edits":[{"old":"a","new":"b"},{"old":"c","new":"d"}]}"#;
+        assert!(
+            parse_file_edit("edit_file", args).is_none(),
+            "multi form should return None (diff rendering is future work)"
+        );
     }
 
     #[test]

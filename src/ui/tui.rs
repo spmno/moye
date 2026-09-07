@@ -756,6 +756,7 @@ fn phase_label(role: &str) -> Option<(&'static str, &'static str)> {
         "investigator" => Some(("\u{1f50d}", "\u{8c03}\u{67e5}\u{4e2d} / Investigating")),
         "planner" => Some(("\u{1f4cb}", "\u{89c4}\u{5212}\u{4e2d} / Planning")),
         "builder" => Some(("\u{1f528}", "\u{6784}\u{5efa}\u{4e2d} / Building")),
+        "verify" => Some(("\u{1f9ea}", "\u{9a8c}\u{8bc1}\u{4e2d} / Verifying")),
         "auditor" => Some(("\u{2705}", "\u{5ba1}\u{8ba1}\u{4e2d} / Auditing")),
         _ => None,
     }
@@ -3123,7 +3124,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_label_maps_all_four_sdd_roles() {
+    fn phase_label_maps_all_five_sdd_roles() {
         assert_eq!(
             phase_label("investigator"),
             Some(("\u{1f50d}", "\u{8c03}\u{67e5}\u{4e2d} / Investigating"))
@@ -3135,6 +3136,10 @@ mod tests {
         assert_eq!(
             phase_label("builder"),
             Some(("\u{1f528}", "\u{6784}\u{5efa}\u{4e2d} / Building"))
+        );
+        assert_eq!(
+            phase_label("verify"),
+            Some(("\u{1f9ea}", "\u{9a8c}\u{8bc1}\u{4e2d} / Verifying"))
         );
         assert_eq!(
             phase_label("auditor"),

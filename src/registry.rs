@@ -849,6 +849,34 @@ pub fn sdd_retry_prompt(message: &str, plan: &str, built: &str, reason: &str) ->
     )
 }
 
+/// 构建验证门失败后的重试提示词（与 sdd_retry_prompt 同样的纯函数风格）。
+/// Builds the retry prompt after the verify gate fails (same pure-fn style as
+/// sdd_retry_prompt). Tested structurally.
+pub fn sdd_verify_retry_prompt(
+    message: &str,
+    plan: &str,
+    built: &str,
+    command: &str,
+    output_tail: &str,
+) -> String {
+    format!(
+        "之前的产出未通过验证门（构建/测试失败）/ \
+         Previous output failed the verification gate (build/test):\n\
+         失败命令 / Failed command:\n{command}\n\n\
+         输出尾部 / Output tail:\n{output_tail}\n\n\
+         原始任务 / Original task:\n{message}\n\n\
+         参考计划 / Reference plan:\n{plan}\n\n\
+         上次产出（需修正）/ Previous output (needs fixing):\n{built}\n\n\
+         请根据上述错误输出修正代码，注意：\n\
+         - 仔细阅读错误信息，定位并修复根本原因\n\
+         - 不要从头重做，只需修复导致验证失败的问题\n\
+         - 保持其他正确的部分不变\n\n\
+         [System] Fix the code so the failing command above passes. Read the \
+         error output carefully, find and fix the root cause, keep correct \
+         parts, only change what's broken."
+    )
+}
+
 /// 构建审计澄清响应。
 /// Builds the clarify response when the Auditor requests clarification.
 pub fn sdd_clarify_response(question: &str, built: &str) -> String {
@@ -995,6 +1023,9 @@ pub fn register_planner_listener(
 pub struct AuditState {
     pub built: Arc<Mutex<Option<String>>>,
     pub verdict: Arc<Mutex<Option<crate::reviewer::Verdict>>>,
+    /// 验证门备注：供后续任务注入审计材料（当前仅存储，不注入）。
+    /// Verify-gate note: stored for a later task to inject into audit materials.
+    pub verify_note: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for AuditState {
@@ -1008,6 +1039,7 @@ impl AuditState {
         Self {
             built: Arc::new(Mutex::new(None)),
             verdict: Arc::new(Mutex::new(None)),
+            verify_note: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -1041,8 +1073,25 @@ pub fn register_auditor_listener(
         let as_ = as_.clone();
         Box::pin(async move {
             let _ = tx.send(AgentEvent::PhaseStart { role: "auditor".to_string() });
+
+            // 收集实际改动材料（git diff + 新文件内容）。
+            // Collect actual change material (git diff + new file contents).
+            // spawn_blocking: std::process::Command is blocking, listener is async.
+            // 进程 cwd 即项目根目录（sandbox 设计），用 "." 而非硬编码路径。
+            // Process cwd is the project root (sandbox design); use "." not a hardcoded path.
+            let cwd = std::path::PathBuf::from(".");
+            let material = tokio::task::spawn_blocking(move || {
+                crate::reviewer::collect_change_material(&cwd, 8000)
+            })
+            .await
+            .ok()
+            .flatten();
+
+            // 读取验证门备注 / read verify-gate note (follows surrounding mutex idiom).
+            let note = as_.verify_note.lock().unwrap().clone();
+
             let gate = crate::reviewer::ReviewGate::new(reg);
-            match gate.review(&task, &built, &tx).await {
+            match gate.review(&task, &built, material.as_deref(), note.as_deref(), &tx).await {
                 Ok(verdict) => {
                     *as_.verdict.lock().unwrap() = Some(verdict);
                 }
@@ -1158,6 +1207,204 @@ impl Orchestrator {
         }
     }
 
+    /// 验证门：Builder 产出后运行构建/测试命令，失败则有界重试。
+    /// Verify gate: runs build/test commands after the Builder; on failure, a
+    /// bounded fix-and-reverify loop feeds the error to the Builder for retry.
+    ///
+    /// 返回 (产出, 验证备注, verified_ok)。
+    /// Returns (output, verify_note, verified_ok).
+    /// - verified_ok == true → 继续审计（或 fast 模式直接返回）。
+    ///   verified_ok == true → proceed to audit (or return in fast mode).
+    /// - verified_ok == false → 跳过审计，产出已带失败说明。
+    ///   verified_ok == false → skip audit; output is annotated with the failure.
+    async fn verify_with_retries(
+        &self,
+        message: &str,
+        plan: &str,
+        built: String,
+        tx: &EventSender,
+    ) -> anyhow::Result<(String, Option<String>, bool)> {
+        use crate::verify::{
+            detect_commands, next_gate_decision, run_single_command, GateDecision,
+            SingleOutcome, VerifyOutcome,
+        };
+        use std::time::{Duration, Instant};
+
+        let vcfg = &self.registry.config.verify;
+
+        // 验证禁用时直接放行。
+        // Pass through when verification is disabled.
+        if !vcfg.enabled {
+            let note = "验证已禁用 / verification disabled".to_string();
+            return Ok((built, Some(note), true));
+        }
+
+        // 获取命令列表：配置覆盖优先，否则自动检测。
+        // Get command list: config override takes priority, else auto-detect.
+        let cmds: Vec<String> = match &vcfg.commands {
+            Some(c) => c.clone(),
+            None => match detect_commands(
+                &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            ) {
+                Some(c) => c,
+                None => {
+                    let note =
+                        "未检测到验证命令 / no verify commands detected".to_string();
+                    return Ok((built, Some(note), true));
+                }
+            },
+        };
+
+        let cwd =
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let timeout = Duration::from_secs(vcfg.timeout_secs);
+        let max_retries = vcfg.max_retries;
+
+        let mut current = built;
+        let mut retries_done = 0u32;
+
+        loop {
+            let _ = tx.send(AgentEvent::PhaseStart {
+                role: "verify".to_string(),
+            });
+
+            // 逐条运行命令，每条附带耗时 Info 行。
+            // Run each command with a timing Info line.
+            let mut ran: Vec<String> = Vec::new();
+            let mut outcome: Option<VerifyOutcome> = None;
+
+            for cmd in &cmds {
+                let start = Instant::now();
+                let single = run_single_command(cmd, &cwd, timeout).await;
+                let dur = start.elapsed();
+                match single {
+                    SingleOutcome::Ok => {
+                        let _ = tx.send(AgentEvent::Info(format!(
+                            "✓ {} ({}s)",
+                            cmd,
+                            dur.as_secs()
+                        )));
+                        ran.push(cmd.clone());
+                    }
+                    SingleOutcome::Failed {
+                        command,
+                        output_tail,
+                        exit_code,
+                    } => {
+                        let _ = tx.send(AgentEvent::Info(format!(
+                            "✗ {} ({}s)",
+                            command,
+                            dur.as_secs()
+                        )));
+                        outcome = Some(VerifyOutcome::Failed {
+                            command,
+                            output_tail,
+                            exit_code,
+                        });
+                        break;
+                    }
+                    SingleOutcome::Unavailable { command } => {
+                        let _ = tx.send(AgentEvent::Info(format!(
+                            "⊘ {} unavailable ({}s)",
+                            command,
+                            dur.as_secs()
+                        )));
+                        outcome = Some(VerifyOutcome::Unavailable { command });
+                        break;
+                    }
+                }
+            }
+
+            let outcome = outcome.unwrap_or(VerifyOutcome::Passed { ran });
+            let retries_left = max_retries.saturating_sub(retries_done);
+
+            match next_gate_decision(&outcome, retries_left) {
+                GateDecision::Proceed => {
+                    let note = match &outcome {
+                        VerifyOutcome::Passed { ran } => {
+                            format!("验证通过 / verify passed ({} commands)", ran.len())
+                        }
+                        VerifyOutcome::Skipped { reason } => {
+                            format!("验证跳过 / verify skipped: {reason}")
+                        }
+                        VerifyOutcome::Unavailable { command } => {
+                            format!("命令不可用 / command unavailable: {command}")
+                        }
+                        VerifyOutcome::Failed { .. } => unreachable!(),
+                    };
+                    return Ok((current, Some(note), true));
+                }
+                GateDecision::Retry(_) => {
+                    retries_done += 1;
+                    let _ = tx.send(AgentEvent::Info(format!(
+                        "[verify] 验证失败，第 {retries_done} 次重试 / verification failed, retry #{retries_done}"
+                    )));
+                    let (command, output_tail) = match &outcome {
+                        VerifyOutcome::Failed {
+                            command,
+                            output_tail,
+                            ..
+                        } => (command.clone(), output_tail.clone()),
+                        _ => unreachable!(),
+                    };
+                    let retry_prompt = sdd_verify_retry_prompt(
+                        message,
+                        plan,
+                        &current,
+                        &command,
+                        &output_tail,
+                    );
+                    let _ =
+                        tx.send(AgentEvent::PhaseStart {
+                            role: "builder".to_string(),
+                        });
+                    current = crate::agent_loop::run_autonomous(
+                        &self.registry,
+                        &self.sandbox,
+                        self.trust_sandbox.clone(),
+                        Role::Builder,
+                        &retry_prompt,
+                        tx,
+                        self.history.clone(),
+                        None,
+                        None,
+                    )
+                    .await?;
+
+                    if is_degenerate_output(&current) {
+                        let _ = tx.send(AgentEvent::Error(format!(
+                            "[SDD] 验证重试产出无效 / verify retry produced degenerate output: {:?}",
+                            current.trim()
+                        )));
+                        return Ok((
+                            format!(
+                                "{current}\n\n[验证未通过 / verification failed: degenerate retry output]"
+                            ),
+                            Some("degenerate retry output".into()),
+                            false,
+                        ));
+                    }
+                }
+                GateDecision::GiveUp(reason) => {
+                    let command = match &outcome {
+                        VerifyOutcome::Failed { command, .. } => command.clone(),
+                        _ => String::new(),
+                    };
+                    let _ = tx.send(AgentEvent::Error(format!(
+                        "[SDD] 验证未通过，耗尽 {retries_done} 次重试 / verification failed after {retries_done} retries: {command}"
+                    )));
+                    return Ok((
+                        format!(
+                            "{current}\n\n[验证未通过 / verification failed after {retries_done} retries: {command}]"
+                        ),
+                        Some(reason),
+                        false,
+                    ));
+                }
+            }
+        }
+    }
+
     async fn run_sdd_pipeline(&self, message: &str, tx: &EventSender) -> anyhow::Result<String> {
         let is_fast = self.registry.active_profile().as_deref() == Some("fast");
 
@@ -1176,6 +1423,11 @@ impl Orchestrator {
                 None,
             )
             .await?;
+
+            // 验证门（fast 模式跳过审计，验证门是其唯一质量网）。
+            // Verification gate (fast mode skips audit; the gate is its only quality net).
+            let (built, _note, _verified_ok) =
+                self.verify_with_retries(message, "", built, tx).await?;
             return Ok(built);
         }
 
@@ -1227,6 +1479,18 @@ impl Orchestrator {
 
         let plan = pre_step.plan.lock().unwrap().clone().unwrap_or_default();
 
+        // 验证门：Builder 产出后、审计前，自动运行构建/测试命令。
+        // Verification gate: after Builder, before Auditor, auto-run build/test.
+        let (built, verify_note, verified_ok) =
+            self.verify_with_retries(message, &plan, built, tx).await?;
+        *audit_state.verify_note.lock().unwrap() = verify_note;
+
+        if !verified_ok {
+            // 验证未通过：跳过审计，直接返回带失败说明的产出。
+            // Verification failed: skip audit, return annotated output.
+            return Ok(built);
+        }
+
         // Dispatch AgentTurnStopping — the AuditorListener fires, reads `built`
         // from AuditState, runs ReviewGate::review(), stores the verdict.
         *audit_state.built.lock().unwrap() = Some(built.clone());
@@ -1276,6 +1540,18 @@ impl Orchestrator {
                         "任务未完成：审计驳回后重试仍没有产出有效内容。\n\
                          [System] Task incomplete: the retry after audit rejection produced no meaningful output."
                     ));
+                }
+
+                // 验证门（审计驳回重试后同样需通过验证）。
+                // Verification gate (audit-reject retry also passes through the gate).
+                let (rebuilt, verify_note, verified_ok) =
+                    self.verify_with_retries(message, &plan, rebuilt, tx).await?;
+                *audit_state.verify_note.lock().unwrap() = verify_note;
+
+                if !verified_ok {
+                    // 验证未通过：跳过二次审计，返回带失败说明的产出。
+                    // Verification failed: skip second audit, return annotated output.
+                    return Ok(rebuilt);
                 }
 
                 // 重试产出仍需通过审计，而非直接当作最终结果。
@@ -1855,6 +2131,46 @@ patches = [
         assert!(
             prompt.contains("[System]"),
             "must contain system instruction"
+        );
+    }
+
+    #[test]
+    fn sdd_verify_retry_prompt_contains_command_tail_and_task() {
+        // 结构性测试：验证重试提示词必须包含失败命令、输出尾部、原始任务、
+        // 参考计划、上次产出、系统指令。
+        // Structural test: the verify-retry prompt must contain the failed
+        // command, output tail, original task, reference plan, previous output,
+        // and system instruction.
+        let msg = "implement user auth";
+        let plan = "1. Add JWT\n2. Add middleware";
+        let built = "fn auth() { /* TODO */ }";
+        let command = "cargo build";
+        let output_tail = "error[E0308]: mismatched types";
+        let prompt = sdd_verify_retry_prompt(msg, plan, built, command, output_tail);
+        assert!(prompt.contains(command), "must contain failed command");
+        assert!(prompt.contains(output_tail), "must contain output tail");
+        assert!(prompt.contains(msg), "must contain original task");
+        assert!(prompt.contains(plan), "must contain reference plan");
+        assert!(prompt.contains(built), "must contain previous output");
+        assert!(
+            prompt.contains("[System]"),
+            "must contain system instruction"
+        );
+    }
+
+    #[test]
+    fn audit_state_set_and_take_verify_note() {
+        let as_ = AuditState::new();
+        assert!(
+            as_.verify_note.lock().unwrap().is_none(),
+            "verify_note starts as None"
+        );
+        *as_.verify_note.lock().unwrap() = Some("verify passed".to_string());
+        let taken = as_.verify_note.lock().unwrap().take();
+        assert_eq!(taken, Some("verify passed".to_string()));
+        assert!(
+            as_.verify_note.lock().unwrap().is_none(),
+            "take must clear verify_note"
         );
     }
 

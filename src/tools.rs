@@ -102,21 +102,196 @@ impl PortableTool for ReadFile {
     }
 }
 
-/// `edit_file` 工具的输入参数：路径 + 待替换文本 + 替换后文本。
-/// Input args for the `edit_file` tool: path + text to replace + replacement text.
+/// `edit_file` 工具的输入参数。
+///
+/// 支持两种互斥形式：
+/// - 单次替换：`{path, old, new}` —— 把文件中首次出现的 `old` 替换为 `new`。
+/// - 批量替换：`{path, edits: [{old, new}, ...]}` —— 按顺序原子应用全部对；
+///   任一对不匹配则不修改文件。
+///
+/// Input args for the `edit_file` tool.
+///
+/// Supports two mutually-exclusive forms:
+/// - Single: `{path, old, new}` — replaces the first occurrence of `old` with `new`.
+/// - Multi: `{path, edits: [{old, new}, ...]}` — applies all pairs atomically in order;
+///   if any pair is missing, nothing is written.
 #[derive(Deserialize)]
 struct EditFileArgs {
     path: String,
+    #[serde(default)]
+    old: Option<String>,
+    #[serde(default)]
+    new: Option<String>,
+    #[serde(default)]
+    edits: Option<Vec<EditPair>>,
+}
+
+/// 批量编辑中的一对替换：`{old, new}`。
+/// A single replacement pair in a multi-edit: `{old, new}`.
+#[derive(Deserialize)]
+struct EditPair {
     old: String,
     new: String,
+}
+
+/// 模糊匹配提示：当 `old` 精确匹配失败时，定位文件中最相似的位置。
+/// Fuzzy hint: when an exact `old` match fails, locates the closest region in the file.
+///
+/// 设计决策：仅提示，绝不自动应用模糊匹配 —— 静默近似替换可能插入错误代码，
+/// 由模型重新发起编辑。
+/// Design decision: hint only, NEVER auto-apply a fuzzy match — a silent near-match
+/// replacement can insert wrong code; the model re-issues the edit.
+#[derive(Debug)]
+struct ClosestMatch {
+    /// 起始行号（1-based）。
+    /// Start line (1-based).
+    start_line: usize,
+    /// 结束行号（1-based, 含）。
+    /// End line (1-based, inclusive).
+    end_line: usize,
+    /// 相似度 0.0–1.0。
+    /// Similarity 0.0–1.0.
+    similarity: f64,
+    /// 该位置的文件文本片段（已截断）。
+    /// The file text snippet at that location (truncated).
+    snippet: String,
+}
+
+/// 在 `file_content` 中滑动窗口寻找与 `needle` 最相似的文本段。
+/// Slides a window over `file_content` to find the region most similar to `needle`.
+///
+/// 窗口大小为 `needle.lines().count()` 及其 ±1 行变体；逐个用
+/// `similar::TextDiff::from_lines(window, needle).ratio()` 评分，取最高。
+/// 最高相似度 < 0.5 时返回 None（无有用信息可展示）。
+/// Window size is `needle.lines().count()` with ±1 line variants; each scored by
+/// `similar::TextDiff::from_lines(window, needle).ratio()`, keeping the best.
+/// Returns None when best similarity < 0.5 (nothing useful to show).
+fn closest_match(file_content: &str, needle: &str, snippet_max_lines: usize) -> Option<ClosestMatch> {
+    let file_lines: Vec<&str> = file_content.lines().collect();
+    if file_lines.is_empty() || needle.is_empty() {
+        return None;
+    }
+    let needle_lines: Vec<&str> = needle.lines().collect();
+    let needle_count = needle_lines.len().max(1);
+    let needle_text = needle_lines.join("\n");
+
+    // 尝试 needle_count 及其 ±1 行窗口大小 / try needle_count and ±1 line window sizes
+    let mut best: Option<(usize, usize, f32)> = None; // (start_idx, window_size, similarity)
+    for &window_size in &[needle_count.saturating_sub(1), needle_count, needle_count + 1] {
+        if window_size == 0 || window_size > file_lines.len() {
+            continue;
+        }
+        for start in 0..=(file_lines.len() - window_size) {
+            let window_text: String = file_lines[start..start + window_size].join("\n");
+            let ratio = similar::TextDiff::from_lines(&window_text, &needle_text).ratio();
+            if best.map_or(true, |(_, _, prev)| ratio > prev) {
+                best = Some((start, window_size, ratio));
+            }
+        }
+    }
+
+    let (start_idx, window_size, ratio) = best?;
+    if ratio < 0.5 {
+        return None;
+    }
+
+    let start_line = start_idx + 1; // 1-based
+    let end_line = start_idx + window_size; // 1-based inclusive
+
+    // 构建截断 snippet：先按行截断，再按字符截断到 ~800 字符。
+    // Build truncated snippet: cap lines first, then cap chars to ~800.
+    let end_idx = (start_idx + window_size).min(file_lines.len());
+    let raw_lines = &file_lines[start_idx..end_idx];
+    let mut snippet = if raw_lines.len() > snippet_max_lines {
+        let kept = &raw_lines[..snippet_max_lines];
+        format!(
+            "{}\n\u{2026}({} more lines)",
+            kept.join("\n"),
+            raw_lines.len() - snippet_max_lines
+        )
+    } else {
+        raw_lines.join("\n")
+    };
+    const MAX_SNIPPET_CHARS: usize = 800;
+    if snippet.chars().count() > MAX_SNIPPET_CHARS {
+        let end = snippet
+            .char_indices()
+            .take_while(|(i, _)| *i <= MAX_SNIPPET_CHARS)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(MAX_SNIPPET_CHARS);
+        snippet.truncate(end);
+        snippet.push('\u{2026}');
+    }
+
+    Some(ClosestMatch {
+        start_line,
+        end_line,
+        similarity: ratio as f64,
+        snippet,
+    })
+}
+
+/// 构建"未找到 old 文本"的错误信息，含最近似匹配的行号、相似度与片段。
+/// Builds the "old text not found" error message with closest-match line range,
+/// similarity percentage, and a snippet of the file text at that location.
+///
+/// `pair_label` 为 `Some((k, n))` 时在消息前缀添加 `edit pair {k} of {n}: `（批量编辑，
+/// k 为 1-based 索引）。单次替换形式传 None。
+/// When `pair_label` is `Some((k, n))`, prefixes the message with
+/// `edit pair {k} of {n}: ` (multi-edit, k is 1-based). Single-form passes None.
+fn not_found_error(content: &str, needle: &str, pair_label: Option<(usize, usize)>) -> ToolError {
+    let prefix = match pair_label {
+        Some((k, n)) => format!("edit pair {k} of {n}: "),
+        None => String::new(),
+    };
+    let body = match closest_match(content, needle, 15) {
+        Some(m) => {
+            let pct = (m.similarity * 100.0).round() as u8;
+            format!(
+                "old text not found in file. Closest match at lines {}-{} (similarity {}%):\n{}",
+                m.start_line, m.end_line, pct, m.snippet
+            )
+        }
+        None => "old text not found in file".to_string(),
+    };
+    let msg = format!("{prefix}{body}");
+    // 总消息长度控制在 ~1000 字符以内 / cap total message under ~1000 chars
+    const MAX_MSG_CHARS: usize = 1000;
+    let msg = if msg.chars().count() > MAX_MSG_CHARS {
+        let end = msg
+            .char_indices()
+            .take_while(|(i, _)| *i <= MAX_MSG_CHARS)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(MAX_MSG_CHARS);
+        format!("{}\u{2026}", &msg[..end])
+    } else {
+        msg
+    };
+    ToolError(msg)
 }
 
 /// 对文件做精确文本替换的工具。
 /// Tool that performs exact text replacement in a file.
 struct EditFile;
 
-/// 实现 `edit_file` 工具：把文件中第一次出现的 `old` 替换为 `new`。
-/// Implements the `edit_file` tool: replaces the first occurrence of `old` with `new`.
+/// 实现 `edit_file` 工具。
+///
+/// 单次形式 `{path, old, new}`：把文件中首次出现的 `old` 替换为 `new`，行为与旧版一致。
+/// 批量形式 `{path, edits: [{old, new}, ...]}`：两阶段应用——先在内存中按序校验全部
+/// 替换对（pair N 可能 patch pair N-1 的输出，故校验须基于当前内存状态），任一对不匹配
+/// 则不写盘并报错（错误含最近似匹配提示与失败对的 1-based 索引）；全部通过后写一次。
+///
+/// Implements the `edit_file` tool.
+///
+/// Single form `{path, old, new}`: replaces the first occurrence of `old` with `new`
+/// (byte-identical to legacy).
+/// Multi form `{path, edits: [{old, new}, ...]}`: two-phase apply — validate ALL pairs
+/// against the in-memory sequential state first (pair N may patch text produced by
+/// pair N-1, so validation simulates apply-then-check); if any pair is missing, write
+/// NOTHING and report the failing pair index (1-based) with its fuzzy hint; if all
+/// pass, write the final content once.
 impl PortableTool for EditFile {
     const NAME: &'static str = "edit_file";
     type Error = ToolError;
@@ -126,7 +301,12 @@ impl PortableTool for EditFile {
     /// 返回面向 LLM 的工具描述（中文）。
     /// Returns the LLM-facing tool description (Chinese).
     fn description(&self) -> String {
-        "把文件中第一次出现的 `old` 替换为 `new`。".to_string()
+        "\u{7cbe}\u{786e}\u{6587}\u{672c}\u{66ff}\u{6362}\u{5de5}\u{5177}\u{3002}\
+         \u{5355}\u{6b21}\u{66ff}\u{6362}\u{7528} {path, old, new}\u{ff08}\u{66ff}\u{6362}\u{9996}\u{6b21}\u{51fa}\u{73b0}\u{7684} old\u{ff09}\u{ff1b}\
+         \u{6279}\u{91cf}\u{66ff}\u{6362}\u{7528} {path, edits: [{old, new}, ...]}\u{ff08}\u{6309}\u{5e8}\u{539f}\u{5b50}\u{5e94}\u{7528}\u{ff0c}\
+         \u{5168}\u{90e8}\u{6821}\u{9a8c}\u{901a}\u{8fc7}\u{624d}\u{5199}\u{5165}\u{ff0c}\u{4efb}\u{4e00}\u{5bf9}\u{4e0d}\u{5339}\u{914d}\u{5219}\u{4e0d}\u{4fee}\u{6539}\u{6587}\u{4ef6}\u{ff09}\u{3002}\
+         old \u{4e0d}\u{5339}\u{914d}\u{65f6}\u{9519}\u{8bef}\u{542b}\u{6700}\u{8fd1}\u{4f3c}\u{5339}\u{914d}\u{7684}\u{884c}\u{53f7}\u{4e0e}\u{76f8}\u{4f3c}\u{5ea6}\u{ff0c}\u{4fbf}\u{4e8e}\u{4e00}\u{6b21}\u{6027}\u{4fee}\u{6b63}\u{3002}"
+            .to_string()
     }
 
     /// 返回 JSON Schema 形式的参数定义。
@@ -135,25 +315,91 @@ impl PortableTool for EditFile {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string" },
-                "old": { "type": "string", "description": "要被替换的精确文本" },
-                "new": { "type": "string", "description": "替换后的文本" }
+                "path": { "type": "string", "description": "\u{6587}\u{4ef6}\u{7684}\u{76f8}\u{5bf9}\u{8def}\u{5f84}" },
+                "old": { "type": "string", "description": "\u{5355}\u{6b21}\u{66ff}\u{6362}\u{ff1a}\u{8981}\u{88ab}\u{66ff}\u{6362}\u{7684}\u{7cbe}\u{786e}\u{6587}\u{672c}\u{ff08}\u{4e0e} new \u{914d}\u{5bf9}\u{4f7f}\u{7528}\u{ff09}" },
+                "new": { "type": "string", "description": "\u{5355}\u{6b21}\u{66ff}\u{6362}\u{ff1a}\u{66ff}\u{6362}\u{540e}\u{7684}\u{6587}\u{672c}\u{ff08}\u{4e0e} old \u{914d}\u{5bf9}\u{4f7f}\u{7528}\u{ff09}" },
+                "edits": {
+                    "type": "array",
+                    "description": "\u{6279}\u{91cf}\u{66ff}\u{6362}\u{ff1a}{old, new} \u{5bf9}\u{7684}\u{6570}\u{7ec4}\u{ff0c}\u{6309}\u{987a}\u{5e8}\u{539f}\u{5b50}\u{5e94}\u{7528}\u{ff08}\u{5168}\u{90e8}\u{6821}\u{9a8c}\u{901a}\u{8fc7}\u{624d}\u{5199}\u{5165}\u{ff09}",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old": { "type": "string", "description": "\u{8981}\u{88ab}\u{66ff}\u{6362}\u{7684}\u{7cbe}\u{786e}\u{6587}\u{672c}" },
+                            "new": { "type": "string", "description": "\u{66ff}\u{6362}\u{540e}\u{7684}\u{6587}\u{672c}" }
+                        },
+                        "required": ["old", "new"]
+                    }
+                }
             },
-            "required": ["path", "old", "new"],
+            "required": ["path"]
         })
     }
 
-    /// 执行工具：读取、替换、写回。`old` 不存在时返回错误。
-    /// Executes the tool: read, replace, write back. Returns an error if `old` is absent.
+    /// 执行工具：归一化参数形式，两阶段校验后写回。
+    /// Executes the tool: normalizes the form, two-phase validates, then writes back.
+    ///
+    /// 形式归一化：单次 `{old, new}` → 含一对的 vec；批量 `edits` → 直接取；
+    /// 两种形式同时出现或都没有 → 清晰错误。
+    /// Form normalization: single `{old, new}` → a one-pair vec; multi `edits` → as-is;
+    /// both present or neither → clear error.
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let path = crate::sandbox::expand_tilde(&args.path);
-        let content = std::fs::read_to_string(&path).map_err(|e| ToolError(e.to_string()))?;
-        if !content.contains(&args.old) {
-            return Err(ToolError("old text not found in file".into()));
+
+        // ── 形式归一化 / form normalization ──
+        let has_single = args.old.is_some() || args.new.is_some();
+        let has_multi = args.edits.is_some();
+        if has_single && has_multi {
+            return Err(ToolError(
+                "cannot specify both `edits` array and `old`/`new` fields; use one form".into(),
+            ));
         }
-        let updated = content.replacen(&args.old, &args.new, 1);
-        std::fs::write(&path, updated).map_err(|e| ToolError(e.to_string()))?;
-        Ok(format!("edited {}", args.path))
+        let is_multi = has_multi;
+        let pairs: Vec<(String, String)> = if let Some(edits) = args.edits {
+            edits.into_iter().map(|p| (p.old, p.new)).collect()
+        } else {
+            match (args.old, args.new) {
+                (Some(old), Some(new)) => vec![(old, new)],
+                _ => {
+                    return Err(ToolError(
+                        "must specify either `edits` array or both `old`+`new` fields".into(),
+                    ))
+                }
+            }
+        };
+        if pairs.is_empty() {
+            return Err(ToolError("`edits` array must not be empty".into()));
+        }
+        let n = pairs.len();
+
+        let content = std::fs::read_to_string(&path).map_err(|e| ToolError(e.to_string()))?;
+
+        // ── Phase 1: 在内存中按序校验全部替换对 ──
+        // pair N 可能 patch pair N-1 的输出，故校验须基于当前内存状态。
+        // Phase 1: validate ALL pairs against the in-memory sequential state.
+        // Pair N may patch text produced by pair N-1, so validation simulates
+        // apply-then-check against the running in-memory string.
+        let mut working = content;
+        for (i, (old, new)) in pairs.iter().enumerate() {
+            if !working.contains(old.as_str()) {
+                let label = if is_multi {
+                    Some((i + 1, n)) // 1-based for humans
+                } else {
+                    None
+                };
+                return Err(not_found_error(&working, old.as_str(), label));
+            }
+            working = working.replacen(old.as_str(), new.as_str(), 1);
+        }
+
+        // ── Phase 2: 全部校验通过 → 写一次 ──
+        // Phase 2: all pairs valid → write the final content once.
+        std::fs::write(&path, &working).map_err(|e| ToolError(e.to_string()))?;
+
+        if is_multi {
+            Ok(format!("edited {} ({} edits)", args.path, n))
+        } else {
+            Ok(format!("edited {}", args.path))
+        }
     }
 }
 
@@ -1894,6 +2140,207 @@ mod tests {
         // Since selected is empty and offset==0 is false, it goes to the truncation branch
         assert!(result.contains("截断") || result.is_empty());
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ── edit_file 模糊匹配与多编辑测试 ──
+    // ── edit_file fuzzy-match and multi-edit tests ──
+
+    /// 最近似匹配：off-by-one-space 的 near-miss 应被找到，相似度 ≥ 0.9，行号正确。
+    /// Closest match: an off-by-one-space near miss should be found with
+    /// similarity ≥ 0.9 and the correct line range.
+    #[test]
+    fn closest_match_off_by_one_space() {
+        // 文件 20 行，needle 11 行（前 11 行，第 6 行多一个空格）。
+        // ratio = 2*10/(11+11) ≈ 0.909 ≥ 0.9。
+        // 20-line file, 11-line needle (first 11 lines, line 6 has an extra space).
+        // ratio = 2*10/(11+11) ≈ 0.909 ≥ 0.9.
+        let file_lines: Vec<String> =
+            (0..20).map(|i| format!("line {i}: content here")).collect();
+        let file = file_lines.join("\n") + "\n";
+        let mut needle_lines = file_lines[..11].to_vec();
+        needle_lines[5] = "line 5:  content here".to_string();
+        let needle = needle_lines.join("\n");
+        let m = closest_match(&file, &needle, 15).expect("should find near match");
+        assert!(m.similarity >= 0.9, "similarity was {}", m.similarity);
+        assert_eq!(m.start_line, 1);
+        assert_eq!(m.end_line, 11);
+    }
+
+    /// 完全无关的文本应返回 None。
+    /// Completely unrelated text should return None.
+    #[test]
+    fn closest_match_unrelated_returns_none() {
+        let file = "fn foo() {\n    let x = 1;\n}\n";
+        let needle = "THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG 1234567890";
+        assert!(closest_match(file, needle, 15).is_none());
+    }
+
+    /// 错误信息应包含行号范围、相似度百分比和文件片段文本。
+    /// Error message should contain the line range, similarity percentage,
+    /// and the file text snippet at that location.
+    #[tokio::test]
+    async fn edit_file_error_contains_fuzzy_hint() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_edit_fuzzy_hint.txt");
+        let file_content = "fn foo() {\n    let x = 1;\n    bar(x);\n}\n";
+        std::fs::write(&path, file_content).unwrap();
+        // old 4 行中有 3 行匹配（line 2 "let x = 2" vs "let x = 1" 不同）→ ratio = 0.75 ≥ 0.5
+        let old = "fn foo() {\n    let x = 2;\n    bar(x);\n}\n";
+        let tool = EditFile;
+        let args = EditFileArgs {
+            path: path.to_string_lossy().to_string(),
+            old: Some(old.into()),
+            new: Some("replaced".into()),
+            edits: None,
+        };
+        let err = tool.call(args).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("lines 1-4"), "msg should contain line range: {msg}");
+        assert!(msg.contains("75%"), "msg should contain similarity pct: {msg}");
+        assert!(msg.contains("let x = 1"), "msg should contain snippet text: {msg}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 单次替换 happy path：行为与旧版字节一致（仅替换首次出现）。
+    /// Single-form happy path: byte-identical to legacy (first occurrence only).
+    #[tokio::test]
+    async fn edit_file_single_form_happy_path() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_edit_single.txt");
+        std::fs::write(&path, "alpha beta beta gamma\n").unwrap();
+        let raw_path = path.to_string_lossy().to_string();
+        let tool = EditFile;
+        let args = EditFileArgs {
+            path: raw_path.clone(),
+            old: Some("beta".into()),
+            new: Some("BETA".into()),
+            edits: None,
+        };
+        let result = tool.call(args).await.unwrap();
+        assert_eq!(result, format!("edited {raw_path}"));
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "alpha BETA beta gamma\n");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 批量编辑：3 对按序应用，pair 2 patch pair 1 的输出（证明内存顺序语义）。
+    /// Multi-edit: 3 pairs applied in order where pair 2 patches pair 1's output
+    /// (proves in-memory sequential semantics).
+    #[tokio::test]
+    async fn edit_file_multi_three_pairs_sequential() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_edit_multi_seq.txt");
+        std::fs::write(&path, "AAA BBB CCC\n").unwrap();
+        let raw_path = path.to_string_lossy().to_string();
+        let tool = EditFile;
+        let args = EditFileArgs {
+            path: raw_path.clone(),
+            old: None,
+            new: None,
+            edits: Some(vec![
+                EditPair {
+                    old: "AAA".into(),
+                    new: "XXX".into(),
+                },
+                EditPair {
+                    old: "XXX BBB".into(),
+                    new: "YYY ZZZ".into(),
+                },
+                EditPair {
+                    old: "CCC".into(),
+                    new: "DDD".into(),
+                },
+            ]),
+        };
+        let result = tool.call(args).await.unwrap();
+        assert_eq!(result, format!("edited {raw_path} (3 edits)"));
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "YYY ZZZ DDD\n");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 批量编辑：3 对中 pair 2 缺失 → 文件不变，错误含 pair 索引 2。
+    /// Multi-edit: pair 2 of 3 missing → file UNCHANGED on disk, error names pair index 2.
+    #[tokio::test]
+    async fn edit_file_multi_missing_pair_unchanged() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_edit_multi_missing.txt");
+        let original = "alpha\nbeta\ngamma\n";
+        std::fs::write(&path, original).unwrap();
+        let raw_path = path.to_string_lossy().to_string();
+        let tool = EditFile;
+        let args = EditFileArgs {
+            path: raw_path.clone(),
+            old: None,
+            new: None,
+            edits: Some(vec![
+                EditPair {
+                    old: "alpha".into(),
+                    new: "ALPHA".into(),
+                },
+                EditPair {
+                    old: "NONEXISTENT".into(),
+                    new: "X".into(),
+                },
+                EditPair {
+                    old: "gamma".into(),
+                    new: "GAMMA".into(),
+                },
+            ]),
+        };
+        let err = tool.call(args).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("pair 2"), "error should name pair index 2: {msg}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, original);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 两种形式同时出现 → 清晰错误。
+    /// Both forms present → clear error.
+    #[tokio::test]
+    async fn edit_file_both_forms_error() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_edit_both_forms.txt");
+        std::fs::write(&path, "hello\n").unwrap();
+        let tool = EditFile;
+        let args = EditFileArgs {
+            path: path.to_string_lossy().to_string(),
+            old: Some("hello".into()),
+            new: Some("world".into()),
+            edits: Some(vec![EditPair {
+                old: "hello".into(),
+                new: "world".into(),
+            }]),
+        };
+        let err = tool.call(args).await.unwrap_err();
+        assert!(
+            err.to_string().contains("cannot specify both"),
+            "should reject both forms"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 两种形式都没有 → 清晰错误。
+    /// Neither form present → clear error.
+    #[tokio::test]
+    async fn edit_file_neither_form_error() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_edit_neither.txt");
+        std::fs::write(&path, "hello\n").unwrap();
+        let tool = EditFile;
+        let args = EditFileArgs {
+            path: path.to_string_lossy().to_string(),
+            old: None,
+            new: None,
+            edits: None,
+        };
+        let err = tool.call(args).await.unwrap_err();
+        assert!(
+            err.to_string().contains("must specify"),
+            "should reject empty args"
+        );
         std::fs::remove_file(&path).ok();
     }
 }

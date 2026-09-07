@@ -39,6 +39,10 @@ pub struct Config {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub evolution: EvolutionSection,
+    /// 验证门配置：Builder 产出后、Auditor 评审前自动运行构建/测试命令。
+    /// Verify gate config: auto-run build/test after the Builder, before the Auditor.
+    #[serde(default)]
+    pub verify: VerifyConfig,
     /// 沙箱配置：预授权目录列表等。
     /// Sandbox config: pre-authorized directory list, etc.
     #[serde(default)]
@@ -372,6 +376,58 @@ pub struct AgentSection {
 #[derive(Debug, Deserialize, Default)]
 pub struct EvolutionSection {
     pub rule_escalation_threshold: usize,
+}
+
+/// `[verify]` 小节：验证门配置（Builder 产出后、Auditor 评审前自动运行构建/测试）。
+/// The `[verify]` section: verify gate config (auto-run build/test after the
+/// Builder, before the Auditor).
+///
+/// `enabled` 控制是否启用验证门（默认 true）。
+/// `enabled` controls whether the gate is active (default true).
+///
+/// `commands` 为可选覆盖列表；省略时按项目根的标记文件自动检测
+/// （Cargo.toml → cargo build/test, package.json → npm test, 等）。
+/// `commands` is an optional override; when omitted, auto-detected from the
+/// project root's marker files (Cargo.toml → cargo build/test, etc.).
+///
+/// `max_retries` 为失败后的最大重试次数（默认 2）。
+/// `max_retries` is the max retry count after failure (default 2).
+///
+/// `timeout_secs` 为每条命令的超时秒数（默认 600）。
+/// `timeout_secs` is the per-command timeout in seconds (default 600).
+#[derive(Debug, Deserialize)]
+pub struct VerifyConfig {
+    #[serde(default = "default_verify_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub commands: Option<Vec<String>>,
+    #[serde(default = "default_verify_max_retries")]
+    pub max_retries: u32,
+    #[serde(default = "default_verify_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_verify_enabled(),
+            commands: None,
+            max_retries: default_verify_max_retries(),
+            timeout_secs: default_verify_timeout_secs(),
+        }
+    }
+}
+
+fn default_verify_enabled() -> bool {
+    true
+}
+
+fn default_verify_max_retries() -> u32 {
+    2
+}
+
+fn default_verify_timeout_secs() -> u64 {
+    600
 }
 
 static CONFIG: OnceLock<Arc<Config>> = OnceLock::new();
@@ -1354,5 +1410,79 @@ patches = []
 "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.active_profile_name().as_deref(), Some("dev"));
+    }
+
+    // ── [verify] 小节测试 / [verify] section tests ──
+
+    #[test]
+    fn verify_defaults_when_section_absent() {
+        // Given: config with no [verify] section.
+        // When: parsing.
+        // Then: all defaults apply (enabled=true, commands=None, max_retries=2, timeout_secs=600).
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.verify.enabled);
+        assert!(cfg.verify.commands.is_none());
+        assert_eq!(cfg.verify.max_retries, 2);
+        assert_eq!(cfg.verify.timeout_secs, 600);
+    }
+
+    #[test]
+    fn verify_explicit_override() {
+        // Given: explicit [verify] section with all fields.
+        // When: parsing.
+        // Then: values match the config, not defaults.
+        let toml_str = r#"
+[verify]
+enabled = false
+commands = ["make check"]
+max_retries = 5
+timeout_secs = 120
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.verify.enabled);
+        assert_eq!(
+            cfg.verify.commands.as_deref(),
+            Some(["make check".to_string()].as_slice())
+        );
+        assert_eq!(cfg.verify.max_retries, 5);
+        assert_eq!(cfg.verify.timeout_secs, 120);
+    }
+
+    #[test]
+    fn verify_partial_override_keeps_defaults() {
+        // Given: [verify] with only enabled=false.
+        // When: parsing.
+        // Then: enabled is overridden, other fields keep defaults.
+        let cfg: Config = toml::from_str("[verify]\nenabled = false\n").unwrap();
+        assert!(!cfg.verify.enabled);
+        assert!(cfg.verify.commands.is_none());
+        assert_eq!(cfg.verify.max_retries, 2);
+        assert_eq!(cfg.verify.timeout_secs, 600);
+    }
+
+    #[test]
+    fn verify_section_does_not_break_profile_overlay() {
+        // Given: config with [verify] + a profile patching [sandbox].
+        // When: parsing with the profile.
+        // Then: profile patch applies; [verify] is untouched by the profile.
+        let toml_str = r#"
+[verify]
+enabled = true
+
+[sandbox]
+backend = "auto"
+mode = "auto"
+authorized_dirs = []
+
+[profile.dev]
+name = "dev"
+patches = [
+    { id = "sandbox", config = { backend = "auto", mode = "landlock", authorized_dirs = [] } },
+]
+"#;
+        let cfg = Config::from_str_with_profile(toml_str, Some("dev"))
+            .expect("profile parse should succeed");
+        assert_eq!(cfg.sandbox.mode, "landlock");
+        assert!(cfg.verify.enabled);
     }
 }

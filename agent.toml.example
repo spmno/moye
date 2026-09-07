@@ -158,3 +158,28 @@ rule_escalation_threshold = 3
 # 示例 / Example:
 # authorized_dirs = ["~/.config", "/tmp/moye", "../shared-libs"]
 authorized_dirs = []
+
+# ── 验证门 / Verify Gate ─────────────────────────────────────────────────
+# 在 Builder 产出后、Auditor 评审前自动运行构建/测试命令。
+# 失败时将错误输出回传给 Builder 重试（最多 max_retries 次），耗尽则跳过审计。
+# Auto-runs build/test commands after the Builder produces code and before the
+# Auditor reviews. On failure, feeds the error output back to the Builder for a
+# bounded retry loop (up to max_retries); when exhausted, the audit is skipped.
+[verify]
+# 是否启用验证门（默认 true）。
+# Enable the verify gate (default true).
+enabled = true
+# 可选：手动覆盖验证命令列表。省略时按项目根的标记文件自动检测：
+#   Cargo.toml → ["cargo build", "cargo test"]
+#   package.json → ["npm test --if-present"]
+#   pyproject.toml → ["pytest -q"]
+#   go.mod → ["go test ./..."]
+# Optional: override the verify command list. When omitted, auto-detected from
+# the project root's marker files (see above).
+# commands = ["cargo build", "cargo test"]
+# 失败后的最大重试次数（默认 2）。
+# Max retries after failure (default 2).
+max_retries = 2
+# 每条命令的超时秒数（默认 600）。
+# Per-command timeout in seconds (default 600).
+timeout_secs = 600

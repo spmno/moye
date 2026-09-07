@@ -25,6 +25,7 @@ mod skills;
 mod tools;
 mod tools_ext;
 mod ui;
+mod verify;
 
 use std::sync::{Arc, Mutex};
 

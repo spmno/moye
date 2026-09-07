@@ -31,7 +31,7 @@ use crate::event::{AgentEvent, EventReceiver, EventSender};
 use crate::ui::clipboard;
 use crate::ui::selection::Selection;
 use crate::ui::selector::{SelectorItem, SelectorState};
-use crate::ui::{markdown, theme};
+use crate::ui::{diff, markdown, theme};
 use tracing::{info, warn};
 
 const SPINNER_FRAMES: [&str; 10] = [
@@ -523,7 +523,7 @@ fn log_event(event: &AgentEvent) {
         AgentEvent::Agent(text) => {
             info!("[TUI] Agent 输出:\n{text}");
         }
-        AgentEvent::ToolCall { name, desc } => {
+        AgentEvent::ToolCall { name, desc, .. } => {
             info!("[TUI] 工具调用: {name} | {desc}");
         }
         AgentEvent::ToolResult { name, result, ok } => {
@@ -604,8 +604,22 @@ fn render_event(event: &AgentEvent) -> Vec<Line<'static>> {
             let rendered = markdown::render_markdown(text);
             rendered.into_iter().collect()
         }
-        AgentEvent::ToolCall { name, desc } => {
+        AgentEvent::ToolCall { name, desc, diff } => {
             let sty = theme::tool_call();
+            // 有结构化编辑载荷 → 渲染 unified diff（红删 / 绿增 / 暗灰上下文）；
+            // 无载荷 → 退回原纯文本 desc 渲染，行为与之前完全一致。
+            // With a structured edit payload → render a unified diff
+            // (red deletes / green inserts / dim context); without it →
+            // fall back to the original plain-text desc rendering, unchanged.
+            if let Some(edit) = diff {
+                let mut v: Vec<Line<'static>> = vec![Line::from(vec![
+                    Span::styled("\u{1f527} ", sty),
+                    Span::styled(format!("{name} \u{2192} \u{7f16}\u{8f91}\u{6587}\u{4ef6}: {}", edit.path), sty),
+                ])];
+                v.extend(diff::unified_diff_lines(edit));
+                v.push(Line::default());
+                return v;
+            }
             let mut v: Vec<Line<'static>> = vec![];
             // 按 \n 拆分为多行：ratatui 的 Line 不识别内嵌换行符，
             // 若把多行 desc 塞进单个 Span，所有内容会被压成一行，
@@ -713,8 +727,12 @@ fn format_event_for_context(event: &AgentEvent) -> String {
         AgentEvent::Agent(text) => {
             format!("[Agent] {}", truncate_ctx(text, 200))
         }
-        AgentEvent::ToolCall { name, desc } => {
-            format!("[ToolCall] {name}: {}", truncate_ctx(desc, 120))
+        AgentEvent::ToolCall { name, desc, diff } => {
+            if diff.is_some() {
+                format!("[ToolCall] {name} (diff)")
+            } else {
+                format!("[ToolCall] {name}: {}", truncate_ctx(desc, 120))
+            }
         }
         AgentEvent::ToolResult { name, result, ok } => {
             let icon = if *ok { "✓" } else { "✗" };
@@ -1588,8 +1606,8 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
         AgentEvent::ReasoningDelta(text) => {
             state.streaming_reasoning.push_str(&text);
         }
-        AgentEvent::ToolCall { name, desc } => {
-            state.push_event(AgentEvent::ToolCall { name, desc });
+        AgentEvent::ToolCall { name, desc, diff } => {
+            state.push_event(AgentEvent::ToolCall { name, desc, diff });
             state.reset_scroll();
         }
         AgentEvent::ToolResult { name, result, ok } => {
@@ -2391,5 +2409,39 @@ mod tests {
         assert_eq!(phase_label("unknown"), None);
         assert_eq!(phase_label(""), None);
         assert_eq!(phase_label("Orchestrator"), None);
+    }
+
+    // render_event 对带 diff 的 ToolCall 输出应含红色 span（删除）和绿色 span（插入）。
+    // render_event on a ToolCall WITH diff must contain a red span (delete)
+    // and a green span (insert) — proves wiring, not just the pure fn.
+    #[test]
+    fn render_event_toolcall_with_diff_has_red_and_green_spans() {
+        use crate::event::FileEdit;
+        let edit = Box::new(FileEdit {
+            path: "foo.rs".to_string(),
+            old: "old line\n".to_string(),
+            new: "new line\n".to_string(),
+        });
+        let event = AgentEvent::ToolCall {
+            name: "edit_file".to_string(),
+            desc: String::new(),
+            diff: Some(edit),
+        };
+        let lines = render_event(&event);
+        let has_red = lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.style.fg == theme::tool_result_err().fg)
+        });
+        let has_green = lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.style.fg == theme::tool_result_ok().fg)
+        });
+        assert!(has_red, "render_event with diff must have a red delete span");
+        assert!(
+            has_green,
+            "render_event with diff must have a green insert span"
+        );
     }
 }

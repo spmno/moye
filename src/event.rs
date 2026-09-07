@@ -15,6 +15,15 @@
 
 use tokio::sync::{mpsc, oneshot};
 
+/// edit_file 工具调用的结构化编辑载荷：渲染 unified diff 用。
+/// Structured edit payload for the edit_file tool call: used to render a unified diff.
+#[derive(Debug)]
+pub struct FileEdit {
+    pub path: String,
+    pub old: String,
+    pub new: String,
+}
+
 /// Agent 事件。领域层产生，表示层消费。
 /// Agent events. Produced by the domain layer, consumed by the presentation layer.
 ///
@@ -69,9 +78,16 @@ pub enum AgentEvent {
     /// Agent 某阶段的最终输出。
     /// Agent's final output for a given stage.
     Agent(String),
-    /// 工具调用通知。
-    /// Tool call notification.
-    ToolCall { name: String, desc: String },
+    /// 工具调用通知。`diff` 为 Some 时表示 edit_file 的结构化编辑载荷，
+    /// TUI 用它渲染 unified diff；None 时退回 desc 纯文本渲染。
+    /// Tool call notification. `diff` is Some when the call is an edit_file
+    /// with parsed args, used by the TUI to render a unified diff; None falls
+    /// back to the plain-text desc rendering.
+    ToolCall {
+        name: String,
+        desc: String,
+        diff: Option<Box<FileEdit>>,
+    },
     /// 工具结果通知。
     /// Tool result notification.
     ToolResult {

@@ -24,7 +24,7 @@ use crate::providers::CompletionModel as OpenAiModel;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
-use crate::event::{AgentEvent, EventSender};
+use crate::event::{AgentEvent, EventSender, FileEdit};
 use crate::events::{PreStepState, WaterfallAction, WaterfallEvent, WaterfallRegistry};
 use crate::registry::{AgentRegistry, ApprovalChain, DefaultApproval, Permission, Role, ToolPerms};
 use crate::sandbox::Sandbox;
@@ -735,6 +735,29 @@ fn format_tool_call_desc(tool_name: &str, args: &str) -> String {
     }
 }
 
+/// 从工具调用参数中解析 `edit_file` 的结构化编辑载荷。
+/// 仅当 `tool_name == "edit_file"` 且 JSON 含 `path`/`old`/`new` 键时返回 Some；
+/// 任何解析失败或缺失键 → None（退回纯文本 desc 渲染，绝不 panic）。
+///
+/// Parse the structured edit payload from tool-call args.
+/// Returns Some only when `tool_name == "edit_file"` and the JSON contains
+/// `path`/`old`/`new`; any parse failure or missing key → None (falls back
+/// to the plain-text desc rendering, never panics).
+fn parse_file_edit(tool_name: &str, args: &str) -> Option<Box<FileEdit>> {
+    if tool_name != "edit_file" {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
+    let get = |k: &str| {
+        parsed.get(k).and_then(|v| v.as_str()).map(|s| s.to_string())
+    };
+    Some(Box::new(FileEdit {
+        path: get("path")?,
+        old: get("old")?,
+        new: get("new")?,
+    }))
+}
+
 /// 格式化 token 用量摘要为字符串。
 /// Formats token usage summary into a string.
 fn format_usage(usage: &Usage) -> String {
@@ -1159,9 +1182,16 @@ pub async fn consume_stream<R>(
                         &tool_call.function.name,
                         &tool_call.function.arguments.to_string(),
                     );
+                    // edit_file 时尝试解析结构化载荷用于 unified diff 渲染；
+                    // 解析失败或非 edit_file → None，退回 desc 纯文本渲染。
+                    // For edit_file, try to parse structured args for unified
+                    // diff rendering; parse failure or non-edit_file → None,
+                    // falling back to the plain-text desc rendering.
+                    let diff = parse_file_edit(&tool_call.function.name, &tool_call.function.arguments.to_string());
                     let _ = tx.send(AgentEvent::ToolCall {
                         name: tool_call.function.name.clone(),
                         desc,
+                        diff,
                     });
                 }
                 _ => {}

@@ -22,6 +22,9 @@ shlex = "2"
 futures = "0.3"
 bytes = "1"
 ratatui = { version = "0.30", features = ["crossterm"] }
+# unified diff 渲染 edit_file 工具调用：纯 Rust，默认特性即可。
+# Unified diff rendering for edit_file tool calls: pure Rust, default features suffice.
+similar = "2"
 crossterm = { version = "0.29", features = ["event-stream"] }
 pulldown-cmark = "0.13"
 html2md-rs = "0.12"

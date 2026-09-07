@@ -1691,6 +1691,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shlex",
+ "similar",
  "syntect",
  "thiserror 2.0.20",
  "tokio",

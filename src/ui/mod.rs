@@ -2,6 +2,7 @@
 // UI module: TUI rendering, Markdown rendering, theme styles, selector component,
 // clipboard copy, text selection.
 pub mod clipboard;
+pub mod diff;
 pub mod markdown;
 pub mod selection;
 pub mod selector;

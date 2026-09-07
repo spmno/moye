@@ -41,12 +41,16 @@ const CONTEXT_RADIUS: usize = 2;
 /// Render an edit_file payload into a unified-diff list of `Line`s.
 ///
 /// Pure function, no side effects, independently testable. See module docs.
-pub fn unified_diff_lines(edit: &FileEdit) -> Vec<Line<'static>> {
+pub fn unified_diff_lines(edit: &FileEdit, expand: bool) -> Vec<Line<'static>> {
     // 空 diff（old == new）：输出单行标记，绝不返回空 Vec、绝不 panic。
     // Empty diff (old == new): emit a single marker line, never an empty Vec, never panic.
     if edit.old == edit.new {
         return vec![marker_line("  \u{ff08}\u{65e0}\u{53d8}\u{5316} / no changes\u{ff09}")];
     }
+
+    // 展开时取消行数上限（CONTEXT_RADIUS 折叠在两种模式下都生效）。
+    // When expanded, bypass the line cap (CONTEXT_RADIUS folding still applies in both modes).
+    let cap = if expand { usize::MAX } else { MAX_LINES };
 
     let diff = TextDiff::from_lines(&edit.old, &edit.new);
     let raw: Vec<(ChangeTag, String)> = diff
@@ -75,7 +79,7 @@ pub fn unified_diff_lines(edit: &FileEdit) -> Vec<Line<'static>> {
                 ChangeTag::Equal => content_line(" ", val, theme::info()),
             };
             out.push(line);
-            if out.len() >= MAX_LINES {
+            if out.len() >= cap {
                 let remaining = estimate_remaining(&raw, &keep, i + 1);
                 if remaining > 0 {
                     out.push(marker_line(&format!(
@@ -101,7 +105,7 @@ pub fn unified_diff_lines(edit: &FileEdit) -> Vec<Line<'static>> {
                 out.push(marker_line(&format!(
                     "  \u{22ef} ({skipped} \u{884c}\u{672a}\u{53d8} / unchanged)"
                 )));
-                if out.len() >= MAX_LINES {
+                if out.len() >= cap {
                     let remaining = estimate_remaining(&raw, &keep, j);
                     if remaining > 0 {
                         out.push(marker_line(&format!(
@@ -225,7 +229,7 @@ mod tests {
     #[test]
     fn delete_line_has_minus_prefix_and_red_fg() {
         let edit = make_edit("line one\n", "line two\n");
-        let lines = unified_diff_lines(&edit);
+        let lines = unified_diff_lines(&edit, false);
         let deletes: Vec<&Line> = lines
             .iter()
             .filter(|l| joined(l).starts_with("- "))
@@ -243,7 +247,7 @@ mod tests {
     #[test]
     fn insert_line_has_plus_prefix_and_green_fg() {
         let edit = make_edit("line one\n", "line two\n");
-        let lines = unified_diff_lines(&edit);
+        let lines = unified_diff_lines(&edit, false);
         let inserts: Vec<&Line> = lines
             .iter()
             .filter(|l| joined(l).starts_with("+ "))
@@ -261,7 +265,7 @@ mod tests {
     #[test]
     fn context_line_has_two_space_prefix_and_dim_fg() {
         let edit = make_edit("context\nold\ncontext\n", "context\nnew\ncontext\n");
-        let lines = unified_diff_lines(&edit);
+        let lines = unified_diff_lines(&edit, false);
         let contexts: Vec<&Line> = lines
             .iter()
             .filter(|l| joined(l).starts_with("  "))
@@ -291,7 +295,7 @@ mod tests {
         }
         new.push_str("CHANGED_bottom\n");
         let edit = make_edit(&old, &new);
-        let lines = unified_diff_lines(&edit);
+        let lines = unified_diff_lines(&edit, false);
         // 未折叠会有 ~2 删除 + 2 插入 + 20 上下文 = 24+ 行。
         // 折叠后上下文最多 2+2=4 行，加 2 删 + 2 插 + 1 标记 = ~9 行，远小于 24。
         assert!(
@@ -317,7 +321,7 @@ mod tests {
             old.push_str(&format!("line_{i}\n"));
         }
         let edit = make_edit(&old, "");
-        let lines = unified_diff_lines(&edit);
+        let lines = unified_diff_lines(&edit, false);
         assert!(
             lines.len() <= 61,
             "expected at most 60 content lines + 1 truncation marker = 61, got {}",
@@ -331,9 +335,46 @@ mod tests {
     }
 
     #[test]
+    fn diff_expanded_renders_all_lines_no_truncation_but_collapse_present() {
+        // 混合：变化 + 不变段 + 大段删除，展开后 >60 行、无截断标记、折叠标记仍在。
+        // Mixed: changes + unchanged run + large delete block; expanded → >60 lines,
+        // no truncation marker, collapse marker still present (CONTEXT_RADIUS applies
+        // in both modes).
+        let mut old = String::from("top\n");
+        for i in 0..20 {
+            old.push_str(&format!("same_{i}\n"));
+        }
+        old.push_str("mid\n");
+        for i in 0..60 {
+            old.push_str(&format!("del_{i}\n"));
+        }
+        let mut new = String::from("TOP\n");
+        for i in 0..20 {
+            new.push_str(&format!("same_{i}\n"));
+        }
+        new.push_str("MID\n");
+        let edit = make_edit(&old, &new);
+        let lines = unified_diff_lines(&edit, true);
+        assert!(
+            lines.len() > 60,
+            "expanded must render >60 lines, got {}",
+            lines.len()
+        );
+        let all: String = lines.iter().map(|l| joined(l)).collect::<Vec<_>>().join("");
+        assert!(
+            !all.contains("truncated"),
+            "no truncation marker in expanded mode, got: {all}"
+        );
+        assert!(
+            all.contains("\u{672a}\u{53d8}") || all.contains("unchanged"),
+            "collapse marker must still be present in expanded mode, got: {all}"
+        );
+    }
+
+    #[test]
     fn old_eq_new_emits_no_changes_line() {
         let edit = make_edit("same\ncontent\n", "same\ncontent\n");
-        let lines = unified_diff_lines(&edit);
+        let lines = unified_diff_lines(&edit, false);
         assert_eq!(lines.len(), 1, "expected exactly one line for no-changes");
         let text = joined(&lines[0]);
         assert!(
@@ -347,7 +388,7 @@ mod tests {
         // 空 old = 纯插入，所有行应为 + 前缀绿色。
         // Empty old = pure insertion; all lines must be + prefix green.
         let edit = make_edit("", "new content\nsecond line\n");
-        let lines = unified_diff_lines(&edit);
+        let lines = unified_diff_lines(&edit, false);
         assert!(!lines.is_empty(), "expected non-empty output for pure insertion");
         let inserts: Vec<&Line> = lines
             .iter()
@@ -364,7 +405,7 @@ mod tests {
         // 空 new = 纯删除，所有行应为 - 前缀红色。
         // Empty new = pure deletion; all lines must be - prefix red.
         let edit = make_edit("old content\nsecond line\n", "");
-        let lines = unified_diff_lines(&edit);
+        let lines = unified_diff_lines(&edit, false);
         assert!(!lines.is_empty(), "expected non-empty output for pure deletion");
         let deletes: Vec<&Line> = lines
             .iter()
@@ -379,7 +420,7 @@ mod tests {
     #[test]
     fn cjk_content_appears_verbatim() {
         let edit = make_edit("你好世界\n", "你好 Rust\n");
-        let lines = unified_diff_lines(&edit);
+        let lines = unified_diff_lines(&edit, false);
         let all_text: String = lines
             .iter()
             .map(|l| joined(l))
@@ -394,7 +435,7 @@ mod tests {
     #[test]
     fn content_lines_have_code_block_line_style() {
         let edit = make_edit("a\n", "b\n");
-        let lines = unified_diff_lines(&edit);
+        let lines = unified_diff_lines(&edit, false);
         let content_lines: Vec<&Line> = lines
             .iter()
             .filter(|l| {

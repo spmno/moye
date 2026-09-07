@@ -428,6 +428,10 @@ struct TuiState {
     /// Message Paragraph scroll (top lines skipped); written at draw time, read at
     /// mouse-event time for screen-row→logical-line mapping.
     msg_scroll: u16,
+    /// 是否展开截断的工具结果 / diff。Ctrl+E 切换；为 false 时保持 500 字符 / 15 行 / diff 60 行上限。
+    /// Whether truncated tool results / diffs are expanded. Toggled by Ctrl+E;
+    /// false keeps the 500-char / 15-line / diff 60-line caps.
+    expand_tool_results: bool,
 }
 
 impl TuiState {
@@ -466,6 +470,7 @@ impl TuiState {
             selection: None,
             msg_area: Rect::new(0, 0, 0, 0),
             msg_scroll: 0,
+            expand_tool_results: false,
         }
     }
 
@@ -478,7 +483,7 @@ impl TuiState {
     fn all_message_lines(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         for msg in &self.messages {
-            lines.extend(render_event(msg));
+            lines.extend(render_event(msg, self.expand_tool_results));
         }
         lines
     }
@@ -588,7 +593,55 @@ fn phase_label(role: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
-fn render_event(event: &AgentEvent) -> Vec<Line<'static>> {
+/// 工具结果截断上限：先按字符截断到 500（floor_char_boundary 防止拆分多字节
+/// 字符），再按行截断到 15 行。
+/// Tool result truncation limits: first char-truncate to 500 (floor_char_boundary
+/// avoids splitting multibyte chars), then line-truncate to 15 lines.
+const TOOL_RESULT_MAX_CHARS: usize = 500;
+const TOOL_RESULT_MAX_LINES: usize = 15;
+
+/// 纯函数：把工具结果字符串截断为显示行列表 + 隐藏行数。
+/// expand=true → 全量输出，返回 None（无提示）。
+/// expand=false → 500 字符 / 15 行上限（与改动前语义完全一致）；
+///   返回 Some(hidden) 当字符或行被截断时，hidden 为原始结果中未完整显示的行数。
+///
+/// Pure helper: truncate a tool result string into display lines + hidden line count.
+/// expand=true → full output, returns None (no hint).
+/// expand=false → 500-char / 15-line cap (byte-identical to prior behavior);
+///   returns Some(hidden) when chars or lines were truncated, where hidden is the
+///   count of original lines not fully shown.
+fn truncate_result_lines(result: &str, expand: bool) -> (Vec<String>, Option<usize>) {
+    let original_count = result.lines().count();
+    if expand {
+        return (result.lines().map(String::from).collect(), None);
+    }
+    let char_truncated = result.len() > TOOL_RESULT_MAX_CHARS;
+    let trunc = if char_truncated {
+        format!(
+            "{}\u{2026}",
+            &result[..result.floor_char_boundary(TOOL_RESULT_MAX_CHARS)]
+        )
+    } else {
+        result.to_string()
+    };
+    let all: Vec<&str> = trunc.lines().collect();
+    let displayed: Vec<String> = if all.len() > TOOL_RESULT_MAX_LINES {
+        all[..TOOL_RESULT_MAX_LINES]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        all.iter().map(|s| s.to_string()).collect()
+    };
+    let hidden = original_count.saturating_sub(displayed.len());
+    if char_truncated || hidden > 0 {
+        (displayed, Some(hidden))
+    } else {
+        (displayed, None)
+    }
+}
+
+fn render_event(event: &AgentEvent, expand: bool) -> Vec<Line<'static>> {
     match event {
         AgentEvent::User(text) => {
             let mut v = vec![Line::styled(format!("\u{276f} {text}"), theme::user_msg())];
@@ -616,7 +669,7 @@ fn render_event(event: &AgentEvent) -> Vec<Line<'static>> {
                     Span::styled("\u{1f527} ", sty),
                     Span::styled(format!("{name} \u{2192} \u{7f16}\u{8f91}\u{6587}\u{4ef6}: {}", edit.path), sty),
                 ])];
-                v.extend(diff::unified_diff_lines(edit));
+                v.extend(diff::unified_diff_lines(edit, expand));
                 v.push(Line::default());
                 return v;
             }
@@ -648,18 +701,22 @@ fn render_event(event: &AgentEvent) -> Vec<Line<'static>> {
             } else {
                 theme::tool_result_err()
             };
-            let trunc = if result.len() > 500 {
-                format!("{}\u{2026}", &result[..result.floor_char_boundary(500)])
-            } else {
-                result.clone()
-            };
             let mut v = vec![];
             v.push(Line::from(vec![Span::styled(
                 format!("{icon} {name}"),
                 sty,
             )]));
-            for line in trunc.lines().take(15) {
+            let (lines, hidden) = truncate_result_lines(result, expand);
+            for line in &lines {
                 v.push(Line::from(Span::raw(line.to_string())));
+            }
+            if let Some(n) = hidden {
+                v.push(Line::styled(
+                    format!(
+                        "  \u{22ef} (\u{5df2}\u{622a}\u{65ad} {n} \u{884c} \u{00b7} Ctrl+E \u{5c55}\u{5f00} / truncated \u{00b7} Ctrl+E to expand)"
+                    ),
+                    theme::info(),
+                ));
             }
             v.push(Line::default());
             v
@@ -1070,6 +1127,21 @@ fn handle_key_event(
             }
             KeyCode::Char('y') => {
                 copy_selection(state);
+                return;
+            }
+            KeyCode::Char('e') => {
+                state.expand_tool_results = !state.expand_tool_results;
+                if state.expand_tool_results {
+                    state.push_event(AgentEvent::Info(
+                        "\u{25b6} \u{622a}\u{65ad}\u{7ed3}\u{679c}\u{5df2}\u{5c55}\u{5f00} / truncated results expanded (Ctrl+E \u{6298}\u{53e0})"
+                            .into(),
+                    ));
+                } else {
+                    state.push_event(AgentEvent::Info(
+                        "\u{25c0} \u{622a}\u{65ad}\u{7ed3}\u{679c}\u{5df2}\u{6298}\u{53e0} / truncated results collapsed (Ctrl+E \u{5c55}\u{5f00})"
+                            .into(),
+                    ));
+                }
                 return;
             }
             _ => {}
@@ -2427,7 +2499,7 @@ mod tests {
             desc: String::new(),
             diff: Some(edit),
         };
-        let lines = render_event(&event);
+        let lines = render_event(&event, false);
         let has_red = lines.iter().any(|l| {
             l.spans
                 .iter()
@@ -2442,6 +2514,131 @@ mod tests {
         assert!(
             has_green,
             "render_event with diff must have a green insert span"
+        );
+    }
+
+    // ── truncate_result_lines / render_event ToolResult contracts ──
+
+    #[test]
+    fn tui_state_expand_defaults_false() {
+        let s = TuiState::new(
+            "provider".into(),
+            "model".into(),
+            10,
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert!(
+            !s.expand_tool_results,
+            "expand_tool_results must default to false"
+        );
+    }
+
+    #[test]
+    fn tool_result_under_limit_identical_both_modes() {
+        let result = "line one\nline two\nline three".to_string();
+        let ev = AgentEvent::ToolResult {
+            name: "read".into(),
+            result,
+            ok: true,
+        };
+        let collapsed = render_event(&ev, false);
+        let expanded = render_event(&ev, true);
+        assert_eq!(
+            collapsed, expanded,
+            "under-limit result must be byte-identical in both modes"
+        );
+        let has_hint = collapsed.iter().any(|l| {
+            let t: String = l.spans.iter().flat_map(|s| s.content.chars()).collect();
+            t.contains("Ctrl+E")
+        });
+        assert!(!has_hint, "no hint line for under-limit result");
+    }
+
+    #[test]
+    fn tool_result_over_limit_collapsed_has_hint_with_hidden_count() {
+        // 30 short lines (<500 chars, >15 lines) → line-level truncation, hidden=15.
+        let result: String = (0..30)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ev = AgentEvent::ToolResult {
+            name: "bash".into(),
+            result,
+            ok: true,
+        };
+        let lines = render_event(&ev, false);
+        let hints: Vec<String> = lines
+            .iter()
+            .filter_map(|l| {
+                let t: String = l.spans.iter().flat_map(|s| s.content.chars()).collect();
+                if t.contains("Ctrl+E") {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(hints.len(), 1, "exactly one hint line, got {}", hints.len());
+        assert!(
+            hints[0].chars().any(|c| c.is_ascii_digit()),
+            "hint must contain a hidden-count number, got: {}",
+            hints[0]
+        );
+    }
+
+    #[test]
+    fn tool_result_over_limit_expanded_full_no_hint() {
+        // Same fixture: 30 short lines. Expanded → all 30 lines, no hint.
+        let result: String = (0..30)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ev = AgentEvent::ToolResult {
+            name: "bash".into(),
+            result,
+            ok: true,
+        };
+        let lines = render_event(&ev, true);
+        let has_hint = lines.iter().any(|l| {
+            let t: String = l.spans.iter().flat_map(|s| s.content.chars()).collect();
+            t.contains("Ctrl+E")
+        });
+        assert!(!has_hint, "no hint line when expanded");
+        let all: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .flat_map(|s| s.content.chars())
+            .collect();
+        assert!(
+            all.contains("L0") && all.contains("L29"),
+            "expanded must contain first and last lines verbatim"
+        );
+    }
+
+    #[test]
+    fn tool_result_cjk_long_truncation_does_not_split_multibyte() {
+        // 200 CJK chars × 3 bytes = 600 bytes > 500; floor_char_boundary must not split.
+        let result: String = "\u{4f60}\u{597d}\u{4e16}\u{754c}".repeat(50);
+        let ev = AgentEvent::ToolResult {
+            name: "read".into(),
+            result,
+            ok: true,
+        };
+        let lines = render_event(&ev, false);
+        let all: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .flat_map(|s| s.content.chars())
+            .collect();
+        assert!(
+            !all.contains('\u{fffd}'),
+            "no replacement char from split multibyte"
+        );
+        assert!(
+            all.contains("\u{4f60}\u{597d}"),
+            "CJK content must appear verbatim, not corrupted"
         );
     }
 }

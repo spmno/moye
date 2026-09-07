@@ -25,6 +25,9 @@ ratatui = { version = "0.30", features = ["crossterm"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 pulldown-cmark = "0.13"
 html2md-rs = "0.12"
+# 代码块语法高亮：仅启用 default-fancy（纯 Rust fancy-regex 后端），不拉入 oniguruma C 库。
+# Syntax highlighting for code blocks: default-fancy only (pure-Rust fancy-regex), no oniguruma C lib.
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query", "gzip", "brotli", "deflate"] }
 dotenvy = "0.15.7"
 libc = "0.2"

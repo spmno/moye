@@ -88,6 +88,9 @@ pub enum AgentEvent {
     /// 信息性消息。
     /// Informational message.
     Info(String),
+    /// SDD 管线阶段开始——调查者/规划者/构建者/审计者。
+    /// SDD pipeline phase start — investigator/planner/builder/auditor.
+    PhaseStart { role: String },
     /// 上下文压缩完成——旧消息被摘要替代以适应 token 预算。
     /// Context compacted — old messages were summarized to fit within the token budget.
     ContextCompacted {

@@ -544,6 +544,9 @@ fn log_event(event: &AgentEvent) {
                 info!("[TUI] 信息: {text}");
             }
         }
+        AgentEvent::PhaseStart { role } => {
+            info!("[TUI] SDD \u{9636}\u{6bb5}: {role}");
+        }
         AgentEvent::AgentStarted => {
             info!("[TUI] === Agent 开始执行 ===");
         }
@@ -570,6 +573,20 @@ fn log_event(event: &AgentEvent) {
 
 // ===== Event rendering (replaces TuiMessage::to_lines) =====
 // ===== 事件渲染（替代 TuiMessage::to_lines） =====
+
+/// SDD 角色 ID → (图标, 双语标签) 的纯映射，用于 PhaseStart 分隔线。
+/// 未知角色返回 None，调用方用原始 role 字符串生成通用分隔线。
+/// Pure mapping from SDD role id → (icon, bilingual label) for PhaseStart dividers.
+/// Unknown roles return None; the caller falls back to a generic divider with the raw string.
+fn phase_label(role: &str) -> Option<(&'static str, &'static str)> {
+    match role {
+        "investigator" => Some(("\u{1f50d}", "\u{8c03}\u{67e5}\u{4e2d} / Investigating")),
+        "planner" => Some(("\u{1f4cb}", "\u{89c4}\u{5212}\u{4e2d} / Planning")),
+        "builder" => Some(("\u{1f528}", "\u{6784}\u{5efa}\u{4e2d} / Building")),
+        "auditor" => Some(("\u{2705}", "\u{5ba1}\u{8ba1}\u{4e2d} / Auditing")),
+        _ => None,
+    }
+}
 
 fn render_event(event: &AgentEvent) -> Vec<Line<'static>> {
     match event {
@@ -669,6 +686,16 @@ fn render_event(event: &AgentEvent) -> Vec<Line<'static>> {
                 v
             }
         }
+        AgentEvent::PhaseStart { role } => {
+            let sty = theme::usage();
+            let line = match phase_label(role) {
+                Some((icon, label)) => format!(
+                    "\u{2500}\u{2500}\u{2500} {icon} {label} \u{2500}\u{2500}\u{2500}"
+                ),
+                None => format!("\u{2500}\u{2500}\u{2500} {role} \u{2500}\u{2500}\u{2500}"),
+            };
+            vec![Line::styled(line, sty), Line::default()]
+        }
         _ => vec![],
     }
 }
@@ -705,6 +732,9 @@ fn format_event_for_context(event: &AgentEvent) -> String {
             } else {
                 format!("[Info] {}", truncate_ctx(text, 120))
             }
+        }
+        AgentEvent::PhaseStart { role } => {
+            format!("[Phase] {role}")
         }
         AgentEvent::ContextCompacted {
             old_tokens,
@@ -1594,6 +1624,10 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
             state.push_event(AgentEvent::Info(text));
             state.reset_scroll();
         }
+        AgentEvent::PhaseStart { role } => {
+            state.push_event(AgentEvent::PhaseStart { role });
+            state.reset_scroll();
+        }
         AgentEvent::HitlPrompt {
             tool,
             desc,
@@ -2330,5 +2364,32 @@ mod tests {
         s.insert_char('a');
         assert_eq!(s.buffer, "bac");
         assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn phase_label_maps_all_four_sdd_roles() {
+        assert_eq!(
+            phase_label("investigator"),
+            Some(("\u{1f50d}", "\u{8c03}\u{67e5}\u{4e2d} / Investigating"))
+        );
+        assert_eq!(
+            phase_label("planner"),
+            Some(("\u{1f4cb}", "\u{89c4}\u{5212}\u{4e2d} / Planning"))
+        );
+        assert_eq!(
+            phase_label("builder"),
+            Some(("\u{1f528}", "\u{6784}\u{5efa}\u{4e2d} / Building"))
+        );
+        assert_eq!(
+            phase_label("auditor"),
+            Some(("\u{2705}", "\u{5ba1}\u{8ba1}\u{4e2d} / Auditing"))
+        );
+    }
+
+    #[test]
+    fn phase_label_unknown_role_returns_none() {
+        assert_eq!(phase_label("unknown"), None);
+        assert_eq!(phase_label(""), None);
+        assert_eq!(phase_label("Orchestrator"), None);
     }
 }

@@ -900,6 +900,7 @@ pub fn register_investigator_listener(
         let hist = hist.clone();
         let ps = ps.clone();
         Box::pin(async move {
+            let _ = tx.send(AgentEvent::PhaseStart { role: "investigator".to_string() });
             let prompt = sdd_investigator_prompt(&goal);
             match crate::agent_loop::run_autonomous(
                 &reg,
@@ -963,6 +964,7 @@ pub fn register_planner_listener(
         let msg = msg.clone();
         let ps = ps.clone();
         Box::pin(async move {
+            let _ = tx.send(AgentEvent::PhaseStart { role: "planner".to_string() });
             let plan_prompt = sdd_plan_prompt(&msg, &investigation);
             let planner = match reg.build(Role::Planner) {
                 Ok(p) => p,
@@ -975,6 +977,7 @@ pub fn register_planner_listener(
                 Ok(plan) => {
                     *ps.plan.lock().unwrap() = Some(plan.clone());
                     *ps.goal_override.lock().unwrap() = Some(sdd_builder_prompt(&msg, &plan));
+                    let _ = tx.send(AgentEvent::PhaseStart { role: "builder".to_string() });
                 }
                 Err(e) => {
                     *ps.error.lock().unwrap() = Some(e.to_string());
@@ -1037,6 +1040,7 @@ pub fn register_auditor_listener(
         let task = task.clone();
         let as_ = as_.clone();
         Box::pin(async move {
+            let _ = tx.send(AgentEvent::PhaseStart { role: "auditor".to_string() });
             let gate = crate::reviewer::ReviewGate::new(reg);
             match gate.review(&task, &built, &tx).await {
                 Ok(verdict) => {
@@ -1246,6 +1250,7 @@ impl Orchestrator {
                     "[SDD] 审计驳回，带反馈重试一次 / Audit rejected, retrying with feedback:\n  · 驳回原因: {reason}"
                 )));
                 let retry = sdd_retry_prompt(message, &plan, &built, &reason);
+                let _ = tx.send(AgentEvent::PhaseStart { role: "builder".to_string() });
                 let rebuilt = crate::agent_loop::run_autonomous(
                     &self.registry,
                     &self.sandbox,

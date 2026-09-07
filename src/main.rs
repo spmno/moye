@@ -8,6 +8,7 @@ mod event;
 mod events;
 mod evolution;
 mod http_trace;
+mod input_history;
 mod mcp;
 mod memory;
 mod model_history;

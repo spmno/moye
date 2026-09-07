@@ -170,3 +170,20 @@ pub fn selector_input() -> Style {
         .fg(Color::LightYellow)
         .add_modifier(Modifier::BOLD)
 }
+
+// ===== 会话搜索高亮样式 =====
+// ===== In-conversation search highlight styles =====
+// 仅设 bg：通过 Style::patch 叠加时保留原 span 的 fg / modifier。
+// bg-only: when patched via Style::patch the original span fg / modifier is preserved.
+
+/// 当前匹配行高亮（黄色背景）。
+/// Current-match line highlight (yellow background).
+pub fn search_current() -> Style {
+    Style::new().bg(Color::Yellow)
+}
+
+/// 其它匹配行高亮（深灰背景）。
+/// Other-match line highlight (dark-gray background).
+pub fn search_match() -> Style {
+    Style::new().bg(Color::DarkGray)
+}

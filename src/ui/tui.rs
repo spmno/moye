@@ -183,6 +183,15 @@ impl InputState {
         self.cursor += s.len();
     }
 
+    /// 在光标处插入换行符（Alt+Enter / Ctrl+J）。缓冲区与光标逻辑已支持 `\n`
+    /// （paste 路径同样经 insert_str 写入），此处复用 insert_char 按字节推进。
+    /// Insert a newline at the cursor (Alt+Enter / Ctrl+J). The buffer/cursor
+    /// logic already handles `\n` (paste path also writes via insert_str);
+    /// reuse insert_char for byte-accurate advance.
+    fn insert_newline(&mut self) {
+        self.insert_char('\n');
+    }
+
     fn backspace(&mut self) {
         if self.cursor > 0 {
             let prev = self.buffer.floor_char_boundary(self.cursor - 1);
@@ -262,6 +271,135 @@ impl InputState {
         Some(typed)
     }
 }
+
+// ===== 会话搜索状态 =====
+// ===== In-conversation search state =====
+
+/// Ctrl+F 搜索模式状态。打开时输入框变为搜索提示，匹配在消息区高亮。
+/// query/cursor 复用 InputState 的字节级 CJK 安全逻辑（按 char 插入、
+/// floor_char_boundary 退格/左移），但不触碰常规输入缓冲。
+///
+/// matches 是"显示行"索引（与 draw_messages 渲染的软换行向量对齐），
+/// 仅在 dirty_key 变化时于 draw 时重算——这样索引与用户所见一致。
+/// current 是 matches 中的游标；Enter/Down→next、Up→prev（均环绕）。
+///
+/// Ctrl+F search-mode state. When open the input box becomes a search prompt
+/// and matches are highlighted in the message area. query/cursor reuse
+/// InputState's byte-level CJK-safe logic (insert by char, floor_char_boundary
+/// for backspace/left) but never touch the normal input buffer.
+///
+/// matches are display-line indices (aligned with the soft-wrapped vector
+/// draw_messages renders), recomputed at draw only when dirty_key changes —
+/// so indices match what the user sees. current is the cursor into matches;
+/// Enter/Down→next, Up→prev (both wrap around).
+struct SearchState {
+    query: String,
+    cursor: usize,
+    matches: Vec<usize>,
+    current: usize,
+    dirty_key: (usize, u16, String),
+}
+
+impl SearchState {
+    fn new() -> Self {
+        Self {
+            query: String::new(),
+            cursor: 0,
+            matches: Vec::new(),
+            current: 0,
+            // 不会与真实 key (messages.len(), width, query) 同时相等（除非退化
+            // 终端 + 空消息 + 空查询，此时重算也得空匹配，无害）。
+            // Won't match the real key except in a degenerate terminal with no
+            // messages and an empty query — where recompute also yields empty.
+            dirty_key: (0, 0, String::new()),
+        }
+    }
+
+    fn insert_char(&mut self, c: char) {
+        self.query.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+        self.invalidate();
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor > 0 {
+            let prev = self.query.floor_char_boundary(self.cursor - 1);
+            self.query.remove(prev);
+            self.cursor = prev;
+            self.invalidate();
+        }
+    }
+
+    fn cursor_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor = self.query.floor_char_boundary(self.cursor - 1);
+        }
+    }
+
+    fn cursor_right(&mut self) {
+        if self.cursor < self.query.len() {
+            let char_len = self.query[self.cursor..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(0);
+            self.cursor += char_len;
+        }
+    }
+
+    fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn cursor_end(&mut self) {
+        self.cursor = self.query.len();
+    }
+
+    /// 标记匹配脏（下次 draw 重算）。
+    /// Mark matches dirty (recompute at next draw).
+    fn invalidate(&mut self) {
+        self.dirty_key = (0, 0, String::new());
+    }
+}
+
+// ===== Command palette =====
+// ===== 命令面板 =====
+
+/// 命令面板条目选中后的动作类型。
+/// Action type when a command palette entry is selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteAction {
+    /// 直接执行（零参数命令）。
+    /// Execute immediately (zero-arg command).
+    Execute,
+    /// 植入输入框供用户补全参数。
+    /// Plant into the input box for the user to complete args.
+    PlantInput,
+}
+
+/// 命令面板的静态命令表：(命令, 双语描述, 动作)。
+/// Static command table for the palette: (command, bilingual desc, action).
+/// 每条命令字符串必须能被 ReplCommand::parse 识别——table_completeness 测试锁定此约束。
+/// Every command string must be recognized by ReplCommand::parse — the
+/// table_completeness test locks this constraint.
+const PALETTE_COMMANDS: &[(&str, &str, PaletteAction)] = &[
+    // ── 零参数命令 → 直接执行 / zero-arg commands → Execute ──
+    ("/models", "打开供应商/模型选择 / provider & model picker", PaletteAction::Execute),
+    ("/skills", "列出已注册技能 / list registered skills", PaletteAction::Execute),
+    ("/lessons", "查看经验教训 / show accumulated lessons", PaletteAction::Execute),
+    ("/evolve", "触发提示词进化 / trigger prompt evolution", PaletteAction::Execute),
+    ("/context", "查看当前上下文 / show current context", PaletteAction::Execute),
+    ("/help", "显示帮助 / show help", PaletteAction::Execute),
+    ("/trust", "切换沙箱信任模式 / toggle sandbox trust", PaletteAction::Execute),
+    ("/quit", "退出程序 / quit", PaletteAction::Execute),
+    // ── 带参数命令 → 植入输入框 / arg-taking commands → PlantInput ──
+    ("/model", "切换模型 / switch model <slug>", PaletteAction::PlantInput),
+    ("/history", "查看对话记录 / show history [n]", PaletteAction::PlantInput),
+    ("/plan", "查看或切换套餐 / show or switch plan", PaletteAction::PlantInput),
+    ("/evolve-code", "代码自修改 / code self-modify <file> <old> <new>", PaletteAction::PlantInput),
+    ("/add-tool", "生成新工具脚手架 / add tool <name> <desc>", PaletteAction::PlantInput),
+    ("/add-skill", "添加运行时技能 / add skill <name> <desc>", PaletteAction::PlantInput),
+];
 
 // ===== TUI state =====
 // ===== TUI 状态 =====
@@ -420,6 +558,10 @@ struct TuiState {
     /// 当前文本选区（鼠标拖拽产生）。
     /// Current text selection (produced by mouse drag).
     selection: Option<Selection>,
+    /// Ctrl+F 会话搜索模式。Some 时键盘进入搜索态，Esc 关闭。
+    /// Ctrl+F in-conversation search mode. When Some the keyboard enters
+    /// search mode; Esc closes it.
+    search: Option<SearchState>,
     /// 消息内容区 Rect：draw_messages 时写入（Block::inner 后），handle_mouse_event 命中测试时读。
     /// Message content Rect: written in draw_messages (after Block::inner), read in
     /// handle_mouse_event for hit-testing. Stores the actual content area, not the bordered area.
@@ -432,6 +574,18 @@ struct TuiState {
     /// Whether truncated tool results / diffs are expanded. Toggled by Ctrl+E;
     /// false keeps the 500-char / 15-line / diff 60-line caps.
     expand_tool_results: bool,
+    /// 跨会话持久化的输入历史。提交时 record+save，启动时 load 并灌入 InputState.history。
+    /// Cross-session persisted input history. record+save on submit; load at
+    /// startup and seed into InputState.history.
+    input_history: crate::input_history::InputHistory,
+    /// 输入区滚动偏移（内容超出窗口时，使光标行可见）。draw 时算，draw_input 时用。
+    /// Input area scroll offset (keeps cursor visible when content overflows).
+    /// Computed in draw, consumed in draw_input.
+    input_scroll: u16,
+    /// 命令面板激活标志：为 true 时选择器 Enter 走面板路由而非 /models 路由。
+    /// Command palette flag: when true, selector Enter routes to palette logic
+    /// instead of the /models model-selection path.
+    palette_active: bool,
 }
 
 impl TuiState {
@@ -443,9 +597,16 @@ impl TuiState {
         mcp_servers: Vec<crate::mcp::McpServerDisplay>,
         skill_names: Vec<String>,
     ) -> Self {
+        // 从磁盘加载持久化输入历史，灌入 InputState.history 供 Up/Down 浏览。
+        // Load persisted input history from disk, seed into InputState.history
+        // for Up/Down browsing. InputState.history is oldest→newest, matching
+        // the persisted order (history_up walks backwards from the end).
+        let input_history = crate::input_history::InputHistory::load();
+        let mut input = InputState::new();
+        input.history = input_history.entries.clone();
         Self {
             messages: Vec::new(),
-            input: InputState::new(),
+            input,
             streaming: String::new(),
             streaming_reasoning: String::new(),
             thinking: false,
@@ -468,9 +629,13 @@ impl TuiState {
             selector: None,
             switch_flow: None,
             selection: None,
+            search: None,
             msg_area: Rect::new(0, 0, 0, 0),
             msg_scroll: 0,
             expand_tool_results: false,
+            input_history,
+            input_scroll: 0,
+            palette_active: false,
         }
     }
 
@@ -567,6 +732,9 @@ fn log_event(event: &AgentEvent) {
             );
         }
         AgentEvent::TextDelta(_) | AgentEvent::ReasoningDelta(_) => {}
+        AgentEvent::Reasoning(text) => {
+            info!("[TUI] \u{601d}\u{8003}\u{8fc7}\u{7a0b}: {} \u{5b57}\u{7b26}", text.chars().count());
+        }
         AgentEvent::ContextCompacted {
             old_tokens,
             new_tokens,
@@ -767,6 +935,35 @@ fn render_event(event: &AgentEvent, expand: bool) -> Vec<Line<'static>> {
             };
             vec![Line::styled(line, sty), Line::default()]
         }
+        AgentEvent::Reasoning(text) => {
+            let line_count = text.lines().count();
+            if expand {
+                let mut v: Vec<Line<'static>> = vec![Line::styled(
+                    "\u{1f4ad} \u{601d}\u{8003}\u{8fc7}\u{7a0b} / Reasoning:",
+                    theme::info(),
+                )];
+                // 按 \n 拆分为多行：ratatui 的 Line 不识别内嵌换行符，
+                // 若把多行文本塞进单个 Line，所有内容会被压成一行。
+                // Split on \n into separate Lines: ratatui's Line does not
+                // honor embedded newlines, so a multi-line body in a single
+                // Line gets squashed into one visual row.
+                for line in text.split('\n') {
+                    v.push(Line::styled(line.to_string(), theme::streaming()));
+                }
+                v.push(Line::default());
+                v
+            } else {
+                vec![
+                    Line::styled(
+                        format!(
+                            "\u{1f4ad} \u{601d}\u{8003}\u{8fc7}\u{7a0b} ({line_count} \u{884c} \u{00b7} Ctrl+E \u{5c55}\u{5f00} / reasoning \u{00b7} Ctrl+E to expand)"
+                        ),
+                        theme::info(),
+                    ),
+                    Line::default(),
+                ]
+            }
+        }
         _ => vec![],
     }
 }
@@ -818,6 +1015,9 @@ fn format_event_for_context(event: &AgentEvent) -> String {
             format!("[ContextCompacted] {old_tokens} → {new_tokens} tokens")
         }
         AgentEvent::TextDelta(_) | AgentEvent::ReasoningDelta(_) => String::new(),
+        AgentEvent::Reasoning(text) => {
+            format!("[Reasoning] ({} chars)", text.chars().count())
+        }
         AgentEvent::AgentStarted => "[AgentStarted]".to_string(),
         AgentEvent::AgentFinished => "[AgentFinished]".to_string(),
         AgentEvent::HitlPrompt { .. } | AgentEvent::SuspendTui { .. } => String::new(),
@@ -877,7 +1077,7 @@ pub async fn run_tui(ctx: Arc<AppContext>) -> anyhow::Result<()> {
         state.provider, state.model
     )));
     state.push_event(AgentEvent::Info(
-        "Enter \u{53d1}\u{9001}\u{4efb}\u{52a1} | /help \u{5e2e}\u{52a9} | Esc \u{4e2d}\u{65ad}\u{4efb}\u{52a1} | Ctrl+C \u{9000}\u{51fa}".into(),
+        "Enter \u{53d1}\u{9001}\u{4efb}\u{52a1} | Alt+Enter \u{6362}\u{884c} | /help \u{5e2e}\u{52a9} | Esc \u{4e2d}\u{65ad}\u{4efb}\u{52a1} | Ctrl+C \u{9000}\u{51fa}".into(),
     ));
 
     let mut events = EventStream::new();
@@ -1009,6 +1209,7 @@ fn handle_key_event(
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
         {
             state.selector = None;
+            state.palette_active = false;
             return;
         }
         match key.code {
@@ -1024,6 +1225,20 @@ fn handle_key_event(
             }
             KeyCode::Enter => {
                 let selected = state.selector.as_ref().and_then(|s| s.selection());
+                // 命令面板：选中后按动作路由（Execute → handle_command；PlantInput → 植入输入框）。
+                // Command palette: route by action (Execute → handle_command; PlantInput →
+                // plant into input buffer).
+                if state.palette_active {
+                    if let Some(item) = selected {
+                        match apply_palette_selection(state, &item) {
+                            Some(PaletteExec::Execute(cmd)) => {
+                                handle_command(cmd, state, ctx, action_tx);
+                            }
+                            Some(PaletteExec::Planted) | None => {}
+                        }
+                    }
+                    return;
+                }
                 // 供应商级切换流：把选择结果交给流程状态机推进，不在此关闭选择器。
                 // Provider switch flow: hand the result to the flow state machine;
                 // it replaces the selector with the next stage (or closes it).
@@ -1082,6 +1297,7 @@ fn handle_key_event(
                     return;
                 }
                 state.selector = None;
+                state.palette_active = false;
             }
             KeyCode::Backspace => {
                 if let Some(s) = &mut state.selector {
@@ -1095,6 +1311,16 @@ fn handle_key_event(
             }
             _ => {}
         }
+        return;
+    }
+
+    // 搜索模式：键盘进入搜索态。置于选择器守卫之后、Esc 中断守卫之前——
+    // 使 Esc 关闭搜索而非中断任务；选择器与搜索不会共存（选择器打开时不进入搜索）。
+    // Search mode: keyboard input goes to the search state. Placed after the
+    // selector guard and before the Esc-thinking guard so Esc closes search
+    // instead of aborting the task; selector and search never co-exist (search
+    // is never entered while a selector is open).
+    if state.search.is_some() && apply_search_key(state, key) {
         return;
     }
 
@@ -1144,15 +1370,58 @@ fn handle_key_event(
                 }
                 return;
             }
+            KeyCode::Char('j') => {
+                // Ctrl+J 插入换行（与 Alt+Enter 等价）。
+                // Ctrl+J inserts a newline (equivalent to Alt+Enter).
+                state.input.insert_newline();
+                return;
+            }
+            KeyCode::Char('f') => {
+                // Ctrl+F 切换搜索模式：已搜索则关闭，否则以空查询开启。
+                // Ctrl+F toggles search: close if searching, otherwise open with empty query.
+                state.search = match state.search.take() {
+                    Some(_) => None,
+                    None => Some(SearchState::new()),
+                };
+                return;
+            }
+            KeyCode::Char('p') => {
+                open_palette(state);
+                return;
+            }
             _ => {}
         }
     }
 
+    // Alt+Enter 插入换行（须在普通 Enter 提交前拦截，否则会被 Enter 提交路径捕获）。
+    // Alt+Enter inserts a newline (must intercept before the plain Enter submit
+    // arm, otherwise it would be captured by the Enter submit path).
+    // 注意：Shift+Enter 未实现——终端无 kitty keyboard-protocol 时 Shift+Enter
+    // 与 Enter 不可区分，实现它会静默提交。详见报告。
+    // Note: Shift+Enter is NOT implemented — without the kitty keyboard protocol,
+    // Shift+Enter is indistinguishable from Enter and would silently submit.
+    // See the report for details.
+    if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::ALT) {
+        state.input.insert_newline();
+        return;
+    }
+
     match key.code {
         KeyCode::Enter => {
-            if !state.thinking
+            // 仅在修饰键为空（或仅 SHIFT）时提交；Alt+Enter 已在上方拦截为换行。
+            // Submit only when modifiers are empty (or SHIFT-only); Alt+Enter was
+            // intercepted above as a newline.
+            let shift_only =
+                key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+            if shift_only && !state.thinking
                 && let Some(input) = state.input.take_submitted()
             {
+                // 持久化输入历史（save-on-submit 是崩溃安全的；文件很小）。
+                // Persist input history (save-on-submit is crash-safe; tiny file).
+                state.input_history.record(input.clone());
+                if let Err(e) = state.input_history.save() {
+                    warn!("failed to save input history: {e}");
+                }
                 handle_command(input, state, ctx, action_tx);
             }
         }
@@ -1218,6 +1487,226 @@ fn copy_selection(state: &mut TuiState) {
                 "\u{2717} \u{590d}\u{5236}\u{5931}\u{8d25}\u{ff1a}\u{672a}\u{68c0}\u{6d4b}\u{5230}\u{53ef}\u{7528}\u{7684}\u{526a}\u{8d34}\u{677f}\u{3002}\u{8bf7}\u{5b89}\u{88c5} wl-clipboard / xclip / xsel \u{540e}\u{91cd}\u{8bd5}\u{ff08}\u{6216}\u{786e}\u{8ba4}\u{7ec8}\u{7aef}\u{652f}\u{6301} OSC52\u{ff09}\u{3002}".into(),
             ));
         }
+    }
+}
+
+// ===== 会话搜索纯函数 / in-conversation search pure functions =====
+// 纯函数：无副作用，便于单测；draw 与 key handler 共用。
+
+/// 返回行文本包含 query（大小写无关）的显示行索引。空 query → 空结果。
+/// CJK 安全：基于 String::to_lowercase + contains，绝不切片 mid-char。
+///
+/// Returns display-line indices whose concatenated span text contains query
+/// (case-insensitive). Empty query → empty result. CJK-safe: operates on
+/// full Strings via to_lowercase + contains, never slicing mid-char.
+fn find_matches(lines: &[Line<'static>], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let q = query.to_lowercase();
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let text: String = line.spans.iter().flat_map(|s| s.content.chars()).collect();
+            if text.to_lowercase().contains(&q) {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// 下一个匹配（环绕）。len==0 时返回 0（调用方应先判空）。
+/// Next match with wraparound. len==0 returns 0 (caller must guard).
+fn next_match(current: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        (current + 1) % len
+    }
+}
+
+/// 上一个匹配（环绕）。len==0 时返回 0。
+/// Previous match with wraparound. len==0 returns 0.
+fn prev_match(current: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        (current + len - 1) % len
+    }
+}
+
+/// 计算使显示行 idx 可见所需的 scroll_offset。镜像 draw_messages 算术：
+///   base = total.saturating_sub(height)
+///   scroll(Paragraph 跳过行) = base.saturating_sub(scroll_offset)
+/// 使 idx 置顶 → scroll=idx（clamp 到 base），换算 scroll_offset = base - scroll。
+///
+/// Compute the scroll_offset that brings display-line idx into view. Mirrors
+/// draw_messages arithmetic: base = total - height; scroll (Paragraph skip) =
+/// base - scroll_offset. Putting idx at the top → scroll=idx (clamped to
+/// base), converted back: scroll_offset = base - scroll.
+fn jump_target_scroll(idx: usize, total: usize, height: u16) -> u16 {
+    let height = height.max(1);
+    let total_u16 = total as u16;
+    let base = total_u16.saturating_sub(height);
+    // 目标 scroll（Paragraph 跳过行）= idx 置顶，但不超过 base（贴底）。
+    // Target scroll (Paragraph skip) = idx at top, clamped to base (bottom).
+    let target_scroll = (idx as u16).min(base);
+    base.saturating_sub(target_scroll)
+}
+
+/// 对匹配行叠加搜索高亮 bg（当前=Yellow，其它=DarkGray），保留原 span fg。
+/// 用 Style::patch：highlight 仅设 bg，patch 时 fg/modifier 保持不变。
+/// 未匹配行原样返回。
+///
+/// Overlay search-highlight bg on matched lines (current=Yellow, others=
+/// DarkGray), preserving the original span fg. Uses Style::patch: the
+/// highlight sets bg only, so fg/modifier survive patching. Non-matched
+/// lines are returned untouched.
+fn highlight_matches(
+    lines: Vec<Line<'static>>,
+    matches: &[usize],
+    current: Option<usize>,
+) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut line)| {
+            if matches.contains(&i) {
+                let highlight = if Some(i) == current {
+                    theme::search_current()
+                } else {
+                    theme::search_match()
+                };
+                for span in line.spans.iter_mut() {
+                    // patch 仅覆盖 bg（highlight 的 fg=None），原 fg/modifier 保留。
+                    // patch overwrites bg only (highlight fg=None); original
+                    // fg/modifier survive — honors the code_block line-style contract.
+                    span.style = span.style.patch(highlight);
+                }
+            }
+            line
+        })
+        .collect()
+}
+
+/// 搜索模式按键处理（从 handle_key_event 抽出以便单测）。
+/// 返回 true=已处理（搜索独占键盘），false=交给主链（仅 Ctrl+C/D 退出）。
+///
+/// Search-mode key handler (extracted from handle_key_event for unit testing).
+/// Returns true when handled (search owns the keyboard), false to delegate
+/// to the main chain (only Ctrl+C/D, so quitting still works).
+fn apply_search_key(state: &mut TuiState, key: KeyEvent) -> bool {
+    // Ctrl+C/D 交给主链退出（搜索不应拦截退出）。
+    // Ctrl+C/D delegates to the main chain to quit (search must not trap it).
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
+    {
+        return false;
+    }
+    // Esc / Ctrl+F 关闭搜索（无需操作 query，直接置 None）。
+    // Esc / Ctrl+F close search (no query manipulation; set None directly).
+    if key.code == KeyCode::Esc
+        || (key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        state.search = None;
+        return true;
+    }
+    let Some(search) = state.search.as_mut() else {
+        return false;
+    };
+    match key.code {
+        // 仅无 CONTROL 修饰的字符才插入（Ctrl+X 已在上方处理或交给主链）。
+        // Insert only chars without CONTROL (Ctrl+X handled above or delegated).
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            search.insert_char(c);
+            true
+        }
+        KeyCode::Backspace => {
+            search.backspace();
+            true
+        }
+        KeyCode::Left => {
+            search.cursor_left();
+            true
+        }
+        KeyCode::Right => {
+            search.cursor_right();
+            true
+        }
+        KeyCode::Home => {
+            search.cursor_home();
+            true
+        }
+        KeyCode::End => {
+            search.cursor_end();
+            true
+        }
+        KeyCode::Enter | KeyCode::Down => {
+            let len = search.matches.len();
+            if len > 0 {
+                search.current = next_match(search.current, len);
+            }
+            true
+        }
+        KeyCode::Up => {
+            let len = search.matches.len();
+            if len > 0 {
+                search.current = prev_match(search.current, len);
+            }
+            true
+        }
+        _ => true,
+    }
+}
+
+/// draw_messages 中调用：重算搜索匹配（对齐渲染用的软换行向量）、
+/// 确保当前匹配行可见（仅在离开可见区时滚动）、叠加高亮。
+/// 返回（可能已高亮的）显示行向量。
+///
+/// Called from draw_messages: recompute search matches (aligned with the
+/// soft-wrapped vector used for rendering), ensure the current match is
+/// visible (scroll only when outside the visible area), and overlay
+/// highlights. Returns the (possibly highlighted) display-line vector.
+fn apply_search_draw(
+    state: &mut TuiState,
+    display_lines: Vec<Line<'static>>,
+    total: u16,
+    base: u16,
+    inner: Rect,
+) -> Vec<Line<'static>> {
+    let Some(search) = state.search.as_mut() else {
+        return display_lines;
+    };
+    // 重算匹配：dirty_key = (messages.len(), inner.width, query)
+    let key = (state.messages.len(), inner.width, search.query.clone());
+    if search.dirty_key != key {
+        search.matches = find_matches(&display_lines, &search.query);
+        if search.current >= search.matches.len() {
+            search.current = 0;
+        }
+        search.dirty_key = key;
+    }
+    // 确保当前匹配行在可见区 [scroll_now, scroll_now+height) 内；
+    // 仅在离开时跳转（避免每次按键都跳动）。
+    // Keep the current match inside [scroll_now, scroll_now+height); jump
+    // only when it's outside (avoids jumping on every keystroke).
+    if !search.matches.is_empty() {
+        let idx = search.matches[search.current.min(search.matches.len() - 1)];
+        let scroll_now = base.saturating_sub(state.scroll_offset);
+        let idx16 = idx as u16;
+        if idx16 < scroll_now || idx16 >= scroll_now.saturating_add(inner.height) {
+            state.scroll_offset = jump_target_scroll(idx, total as usize, inner.height);
+            state.user_scrolled = true;
+        }
+    }
+    if search.matches.is_empty() {
+        display_lines
+    } else {
+        let cur = search.current.min(search.matches.len() - 1);
+        highlight_matches(display_lines, &search.matches, Some(cur))
     }
 }
 
@@ -1406,6 +1895,66 @@ fn handle_command(
         }
         ReplCommand::InvalidUsage(msg) => {
             state.push_event(AgentEvent::Error(msg.to_string()));
+        }
+    }
+}
+
+// ===== Command palette routing =====
+// ===== 命令面板路由 =====
+
+/// 命令面板选中后的执行结果。
+/// Execution result after a palette selection.
+enum PaletteExec {
+    /// 待执行的命令字符串（零参数命令），由调用方传给 handle_command。
+    /// Command string to execute (zero-arg); the caller passes it to handle_command.
+    Execute(String),
+    /// 已植入输入框，等待用户补全参数。
+    /// Planted into input; the user completes the args.
+    Planted,
+}
+
+/// 打开命令面板：用 PALETTE_COMMANDS 填充选择器，设置 palette_active 标志。
+/// Open the command palette: populate the selector with PALETTE_COMMANDS
+/// and set the palette_active flag.
+fn open_palette(state: &mut TuiState) {
+    let items: Vec<SelectorItem> = PALETTE_COMMANDS
+        .iter()
+        .map(|(cmd, desc, _)| SelectorItem {
+            label: cmd.to_string(),
+            detail: desc.to_string(),
+            data: Some(cmd.to_string()),
+        })
+        .collect();
+    state.selector = Some(SelectorState::new(
+        "命令 / Commands".into(),
+        items,
+        false,
+    ));
+    state.palette_active = true;
+}
+
+/// 应用命令面板选择：关闭选择器、清除 palette_active，按动作路由。
+/// 未找到匹配命令时返回 None（调用方应视为 no-op）。
+/// Apply a palette selection: close the selector, clear palette_active,
+/// route by the action. Returns None when the command is not found in
+/// PALETTE_COMMANDS (the caller treats it as a no-op).
+fn apply_palette_selection(
+    state: &mut TuiState,
+    item: &SelectorItem,
+) -> Option<PaletteExec> {
+    let cmd = item.data.as_deref().unwrap_or(&item.label);
+    let entry = PALETTE_COMMANDS.iter().find(|(c, _, _)| *c == cmd)?;
+    let cmd_str = entry.0.to_string();
+    let action = entry.2;
+    state.selector = None;
+    state.palette_active = false;
+    match action {
+        PaletteAction::Execute => Some(PaletteExec::Execute(cmd_str)),
+        PaletteAction::PlantInput => {
+            state.input.buffer.clear();
+            state.input.cursor = 0;
+            state.input.insert_str(&format!("{cmd_str} "));
+            Some(PaletteExec::Planted)
         }
     }
 }
@@ -1670,6 +2219,16 @@ fn persist_switch_to_env(
 // ===== Action handling =====
 // ===== 动作处理 =====
 
+/// 将累积的推理文本刷出为持久 Reasoning 事件。空缓冲区为 no-op。
+/// Pure helper: flush accumulated reasoning text into a persistent Reasoning
+/// event. No-op when the buffer is empty.
+fn flush_reasoning(state: &mut TuiState) {
+    if !state.streaming_reasoning.is_empty() {
+        let text = std::mem::take(&mut state.streaming_reasoning);
+        state.push_event(AgentEvent::Reasoning(text));
+    }
+}
+
 fn handle_action(event: AgentEvent, state: &mut TuiState) {
     match event {
         AgentEvent::TextDelta(text) => {
@@ -1694,6 +2253,12 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
             state.reset_scroll();
         }
         AgentEvent::Agent(text) => {
+            // Flush accumulated reasoning BEFORE the answer — reasoning must
+            // land before its answer in the message list. All ReasoningDeltas
+            // precede the final Agent event by stream construction, so the
+            // buffer is complete here.
+            // 先刷出累积推理，再推入答案——推理必须在答案之前。
+            flush_reasoning(state);
             // Streaming was a preview of this final output — discard it.
             // 流式文本是最终输出的预览——丢弃。
             state.streaming.clear();
@@ -1703,6 +2268,10 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
             state.reset_scroll();
         }
         AgentEvent::Error(text) => {
+            // Preserve reasoning before clearing — an errored turn's reasoning
+            // is exactly what you want to inspect.
+            // 保留推理再清空——出错回合的推理正是需要检查的内容。
+            flush_reasoning(state);
             state.push_event(AgentEvent::Error(text));
             state.task_handle = None;
             state.thinking = false;
@@ -1787,6 +2356,10 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
             state.current_turn = 0;
         }
         AgentEvent::AgentFinished => {
+            // Flush reasoning FIRST — covers the safety-net path where the
+            // final Agent event never arrived (e.g. aborted mid-stream).
+            // 先刷出推理——覆盖 Agent 事件未到达的安全兜底路径。
+            flush_reasoning(state);
             state.task_handle = None;
             // Safety net: flush any unflushed streaming.
             // 安全兜底：刷新未刷新的流式文本。
@@ -1802,7 +2375,7 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
         // they never arrive through the channel.
         // User 和 System 事件由 handle_command 直接 push——
         // 它们不经过 channel 传递。
-        AgentEvent::User(_) | AgentEvent::System(_) => {}
+        AgentEvent::User(_) | AgentEvent::System(_) | AgentEvent::Reasoning(_) => {}
         AgentEvent::ContextCompacted {
             old_tokens,
             new_tokens,
@@ -1825,7 +2398,10 @@ fn estimate_input_lines(buffer: &str, area_width: u16) -> u16 {
         return 1;
     }
     let mut total: usize = 0;
-    for (i, line) in buffer.lines().enumerate() {
+    // 使用 split('\n') 而非 lines()，以正确计数尾随换行产生的空行。
+    // Use split('\n') instead of lines() to correctly count the empty line
+    // produced by a trailing newline.
+    for (i, line) in buffer.split('\n').enumerate() {
         let avail = if i == 0 {
             inner_width.saturating_sub(2)
         } else {
@@ -1841,6 +2417,43 @@ fn estimate_input_lines(buffer: &str, area_width: u16) -> u16 {
     total as u16
 }
 
+/// 计算光标所在的显示行号（含显式换行与软换行），用于输入区滚动窗口定位。
+/// Compute the display line the cursor is on (including explicit newlines and
+/// soft-wrap), used for input area scroll-window positioning.
+fn cursor_display_line(buffer: &str, cursor: usize, inner_width: usize) -> u16 {
+    let mut x: usize = 0;
+    let mut y: u16 = 0;
+    for c in buffer[..cursor].chars() {
+        if c == '\n' {
+            y += 1;
+            x = 0;
+        } else {
+            let w = if c.is_ascii() { 1 } else { 2 };
+            if x + w > inner_width {
+                y += 1;
+                x = w;
+            } else {
+                x += w;
+            }
+        }
+    }
+    y
+}
+
+/// 计算输入区高度与滚动偏移：高度 = clamp(content_lines + 2, 3, max)；
+/// 内容超出窗口时，偏移使光标行始终落在可见区域内。
+/// Compute input area height and scroll offset: height = clamp(content_lines + 2, 3, max);
+/// when content overflows the window, the offset keeps the cursor line visible.
+fn input_window(total_lines: u16, cursor_line: u16, max: u16) -> (u16, u16) {
+    let height = (total_lines + 2).min(max).max(3);
+    if total_lines + 2 <= max {
+        return (height, 0);
+    }
+    let visible = height.saturating_sub(1); // 上边框占 1 行 / top border takes 1 row
+    let offset = cursor_line.saturating_sub(visible.saturating_sub(1));
+    (height, offset)
+}
+
 fn draw(f: &mut Frame, state: &mut TuiState) {
     let area = f.area();
 
@@ -1851,7 +2464,11 @@ fn draw(f: &mut Frame, state: &mut TuiState) {
 
     let display = state.input.display_text();
     let input_lines = estimate_input_lines(&display, h_chunks[0].width);
-    let input_height = (input_lines + 2).max(3).min(area.height / 2);
+    let inner_width = (h_chunks[0].width.saturating_sub(2)).max(1) as usize;
+    let cursor_line = cursor_display_line(&display, state.input.cursor, inner_width);
+    let (input_height, input_scroll) = input_window(input_lines, cursor_line, 10);
+    let input_height = input_height.min(area.height / 2);
+    state.input_scroll = input_scroll;
 
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1998,8 +2615,15 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
     // holds and the selection / highlight / scroll logic works unchanged.
     let display_lines = crate::ui::wrap::wrap_lines(&all_lines, inner.width);
     let total = display_lines.len() as u16;
-
     let base = total.saturating_sub(inner.height);
+
+    // 搜索：draw 时重算匹配（对齐上方软换行向量）、确保当前匹配可见、叠加高亮。
+    // 须在算 scroll 之前调用——跳转会改写 scroll_offset。
+    // Search: recompute matches at draw (aligned with the wrapped vector above),
+    // ensure the current match is visible, overlay highlights. Must run before
+    // computing scroll — a jump rewrites scroll_offset.
+    let display_lines = apply_search_draw(state, display_lines, total, base, inner);
+
     let scroll = base.saturating_sub(state.scroll_offset);
     state.msg_scroll = scroll;
 
@@ -2098,6 +2722,44 @@ fn draw_streaming(f: &mut Frame, area: Rect, state: &mut TuiState) {
 }
 
 fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
+    // 搜索模式：输入框显示搜索提示与匹配计数，不复用常规输入缓冲/历史。
+    // 搜索关闭后常规渲染字节不变。
+    // Search mode: the input box shows the search prompt and match count;
+    // the normal input buffer / history are not rendered. When search is
+    // None the rendering below is byte-identical to before.
+    if let Some(search) = state.search.as_ref() {
+        let total = search.matches.len();
+        let cur = if total == 0 { 0 } else { search.current.min(total - 1) };
+        let prompt = format!(
+            "\u{1f50d} \u{641c}\u{7d22} / Search: {}  ({}/{})",
+            search.query, cur, total
+        );
+        let input = Paragraph::new(prompt)
+            .style(theme::selector_input())
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(theme::border())
+                    .padding(Padding::horizontal(1)),
+            );
+        f.render_widget(input, area);
+
+        // 光标定位在 query 光标处（prefix + query[..cursor] 之后）。
+        // Position the cursor at the query cursor (after prefix + query[..cursor]).
+        let prefix = "\u{1f50d} \u{641c}\u{7d22} / Search: ";
+        let before = &search.query[..search.cursor];
+        let mut x: u16 = 0;
+        for c in prefix.chars().chain(before.chars()) {
+            let w = if c.is_ascii() { 1 } else { 2 };
+            x = x.saturating_add(w);
+        }
+        let inner_right = area.x.saturating_add(area.width).saturating_sub(1);
+        let cx = (area.x + 1 + x).min(inner_right);
+        let cy = area.y + 1;
+        f.set_cursor_position((cx, cy));
+        return;
+    }
+
     let prompt = if state.thinking {
         "\u{2026}".to_string()
     } else {
@@ -2107,6 +2769,7 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let input = Paragraph::new(prompt)
         .style(theme::input_prompt())
         .wrap(Wrap { trim: false })
+        .scroll((state.input_scroll, 0))
         .block(
             Block::default()
                 .borders(Borders::TOP)
@@ -2136,7 +2799,10 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
         }
         let cx = area.x + 1 + x as u16;
         let max_y = area.y + area.height.saturating_sub(1);
-        let cy = (area.y + 1 + y).min(max_y);
+        // 减去滚动偏移，使光标在可见区域内定位。
+        // Subtract scroll offset so the cursor positions within the visible area.
+        let visible_y = y.saturating_sub(state.input_scroll);
+        let cy = (area.y + 1 + visible_y).min(max_y);
         f.set_cursor_position((cx, cy));
     }
 }
@@ -2639,6 +3305,583 @@ mod tests {
         assert!(
             all.contains("\u{4f60}\u{597d}"),
             "CJK content must appear verbatim, not corrupted"
+        );
+    }
+
+    // ── insert_newline（多行输入）──
+
+    #[test]
+    fn insert_newline_inserts_at_cursor_mid_buffer() {
+        // 在 "ab" 的 a 与 b 之间插入换行：结果 "a\nb"，光标在 \n 之后。
+        // Insert \n between a and b in "ab": result "a\nb", cursor after \n.
+        let mut s = InputState::new();
+        s.insert_char('a');
+        s.insert_char('b');
+        s.cursor_left();
+        s.insert_newline();
+        assert_eq!(s.buffer, "a\nb");
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn insert_newline_cjk_safe() {
+        // CJK 字符间插入换行：3 字节 CJK + 1 字节 \n，光标按字节推进到 4。
+        // Insert \n between CJK chars: 3-byte CJK + 1-byte \n, cursor advances to 4.
+        let mut s = InputState::new();
+        s.insert_char('\u{4f60}'); // 你 (3 bytes)
+        s.insert_char('\u{597d}'); // 好 (3 bytes)
+        s.cursor_left(); // 光标回到 你 之后 / cursor after 你
+        s.insert_newline();
+        assert_eq!(s.buffer, "\u{4f60}\n\u{597d}");
+        assert_eq!(s.cursor, 4); // 3 (你) + 1 (\n)
+    }
+
+    // ── input_window（输入区高度与滚动偏移）──
+
+    #[test]
+    fn input_window_empty_height_3() {
+        // 空缓冲区：1 行（estimate_input_lines 返回 1），高度 3（含边框）。
+        // Empty buffer: 1 line (estimate_input_lines returns 1), height 3.
+        let (h, off) = input_window(1, 0, 10);
+        assert_eq!(h, 3);
+        assert_eq!(off, 0);
+    }
+
+    #[test]
+    fn input_window_two_lines_height_4() {
+        // 2 行内容 → 高度 4（2 + 2 边框/缓冲）。
+        // 2 lines of content → height 4 (2 + 2 border/buffer).
+        let (h, off) = input_window(2, 0, 10);
+        assert_eq!(h, 4);
+        assert_eq!(off, 0);
+    }
+
+    #[test]
+    fn input_window_overflow_caps_at_max_cursor_at_top() {
+        // 20 行内容 → 高度 10（钳制上限）；光标在第 0 行 → 偏移 0。
+        // 20 lines → height 10 (clamped to max); cursor at line 0 → offset 0.
+        let (h, off) = input_window(20, 0, 10);
+        assert_eq!(h, 10);
+        assert_eq!(off, 0);
+    }
+
+    #[test]
+    fn input_window_overflow_caps_at_max_cursor_at_bottom() {
+        // 20 行内容 → 高度 10；光标在第 19 行 → 偏移使光标行可见。
+        // 20 lines → height 10; cursor at line 19 → offset keeps cursor visible.
+        let (h, off) = input_window(20, 19, 10);
+        assert_eq!(h, 10);
+        assert!(off > 0, "offset must be non-zero when cursor beyond window");
+        // 光标行在可见窗口内 / cursor line within the visible window
+        assert!(off <= 19 && (19 - off) < 10, "cursor line must be visible");
+    }
+
+    // ── flush_reasoning / Reasoning 事件 ──
+    // ── flush_reasoning / Reasoning event ──
+
+    fn tui_state_for_test() -> TuiState {
+        TuiState::new(
+            "test".into(),
+            "test-model".into(),
+            10,
+            vec![],
+            vec![],
+            vec![],
+        )
+    }
+
+    #[test]
+    fn flush_reasoning_pushes_event_and_clears() {
+        let mut s = tui_state_for_test();
+        s.streaming_reasoning = "thinking...".to_string();
+        flush_reasoning(&mut s);
+        assert_eq!(s.messages.len(), 1, "exactly one event pushed");
+        match &s.messages[0] {
+            AgentEvent::Reasoning(text) => assert_eq!(text, "thinking..."),
+            _ => panic!("expected Reasoning event"),
+        }
+        assert!(
+            s.streaming_reasoning.is_empty(),
+            "buffer must be cleared after flush"
+        );
+    }
+
+    #[test]
+    fn flush_reasoning_noop_when_empty() {
+        let mut s = tui_state_for_test();
+        flush_reasoning(&mut s);
+        assert!(s.messages.is_empty(), "no event pushed when buffer empty");
+    }
+
+    #[test]
+    fn reasoning_lands_before_answer_in_message_list() {
+        let mut s = tui_state_for_test();
+        handle_action(AgentEvent::ReasoningDelta("think".to_string()), &mut s);
+        handle_action(AgentEvent::Agent("answer".to_string()), &mut s);
+        let len = s.messages.len();
+        assert!(len >= 2, "expected at least 2 messages, got {len}");
+        match &s.messages[len - 2] {
+            AgentEvent::Reasoning(t) => assert_eq!(t, "think"),
+            _ => panic!("expected Reasoning at len-2"),
+        }
+        match &s.messages[len - 1] {
+            AgentEvent::Agent(t) => assert_eq!(t, "answer"),
+            _ => panic!("expected Agent at len-1"),
+        }
+    }
+
+    #[test]
+    fn reasoning_preserved_on_error_path() {
+        let mut s = tui_state_for_test();
+        handle_action(
+            AgentEvent::ReasoningDelta("think before error".to_string()),
+            &mut s,
+        );
+        handle_action(AgentEvent::Error("boom".to_string()), &mut s);
+        let has_reasoning = s
+            .messages
+            .iter()
+            .any(|m| matches!(m, AgentEvent::Reasoning(_)));
+        assert!(
+            has_reasoning,
+            "reasoning must not be dropped on error path"
+        );
+    }
+
+    #[test]
+    fn render_reasoning_collapsed_one_hint_line_plus_blank() {
+        let ev = AgentEvent::Reasoning("secret body line\nsecond line".to_string());
+        let lines = render_event(&ev, false);
+        assert_eq!(
+            lines.len(),
+            2,
+            "collapsed: exactly header + blank, got {}",
+            lines.len()
+        );
+        let header: String = lines[0]
+            .spans
+            .iter()
+            .flat_map(|s| s.content.chars())
+            .collect();
+        assert!(
+            header.contains("Ctrl+E"),
+            "header must contain Ctrl+E hint"
+        );
+        assert!(
+            header.contains("\u{601d}\u{8003}\u{8fc7}\u{7a0b}"),
+            "header must contain 思考过程"
+        );
+        assert!(
+            !header.contains("secret body line"),
+            "collapsed must NOT show body text"
+        );
+        assert!(
+            lines[1].spans.is_empty(),
+            "trailing line must be blank"
+        );
+    }
+
+    #[test]
+    fn render_reasoning_expanded_shows_body_verbatim() {
+        let body = "\u{7b2c}\u{4e00}\u{884c}\nsecond line";
+        let ev = AgentEvent::Reasoning(body.to_string());
+        let lines = render_event(&ev, true);
+        let header: String = lines[0]
+            .spans
+            .iter()
+            .flat_map(|s| s.content.chars())
+            .collect();
+        assert!(
+            header.contains("\u{601d}\u{8003}\u{8fc7}\u{7a0b}"),
+            "expanded header must contain 思考过程"
+        );
+        let all: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .flat_map(|s| s.content.chars())
+            .collect();
+        assert!(
+            all.contains("\u{7b2c}\u{4e00}\u{884c}"),
+            "expanded must show CJK body verbatim"
+        );
+        assert!(
+            all.contains("second line"),
+            "expanded must show second line verbatim"
+        );
+    }
+
+    #[test]
+    fn agent_with_empty_reasoning_buffer_pushes_no_reasoning_event() {
+        let mut s = tui_state_for_test();
+        handle_action(AgentEvent::Agent("answer".to_string()), &mut s);
+        let has_reasoning = s
+            .messages
+            .iter()
+            .any(|m| matches!(m, AgentEvent::Reasoning(_)));
+        assert!(
+            !has_reasoning,
+            "no Reasoning event when buffer is empty"
+        );
+    }
+
+    // ===== 会话搜索测试 / in-conversation search tests =====
+
+    fn s_line(text: &str) -> Line<'static> {
+        Line::from(Span::raw(text.to_string()))
+    }
+
+    fn key_esc() -> KeyEvent {
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())
+    }
+    fn key_char(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty())
+    }
+    fn key_ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+    fn key_enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
+    }
+    fn key_down() -> KeyEvent {
+        KeyEvent::new(KeyCode::Down, KeyModifiers::empty())
+    }
+    fn key_up() -> KeyEvent {
+        KeyEvent::new(KeyCode::Up, KeyModifiers::empty())
+    }
+    fn key_backspace() -> KeyEvent {
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn find_matches_basic_substring() {
+        let lines = vec![s_line("hello world"), s_line("foo bar"), s_line("hello again")];
+        assert_eq!(find_matches(&lines, "hello"), vec![0, 2]);
+    }
+
+    #[test]
+    fn find_matches_case_insensitive() {
+        let lines = vec![s_line("Hello World"), s_line("HELLO there"), s_line("nope")];
+        assert_eq!(find_matches(&lines, "hello"), vec![0, 1]);
+    }
+
+    #[test]
+    fn find_matches_cjk_safe() {
+        let lines = vec![s_line("你好世界"), s_line("再见"), s_line("你好 again")];
+        assert_eq!(find_matches(&lines, "你好"), vec![0, 2]);
+    }
+
+    #[test]
+    fn find_matches_empty_query_is_empty() {
+        let lines = vec![s_line("hello"), s_line("world")];
+        assert!(find_matches(&lines, "").is_empty());
+    }
+
+    #[test]
+    fn next_match_wraps_forward() {
+        assert_eq!(next_match(0, 3), 1);
+        assert_eq!(next_match(1, 3), 2);
+        assert_eq!(next_match(2, 3), 0);
+    }
+
+    #[test]
+    fn prev_match_wraps_backward() {
+        assert_eq!(prev_match(0, 3), 2);
+        assert_eq!(prev_match(2, 3), 1);
+        assert_eq!(prev_match(1, 3), 0);
+    }
+
+    #[test]
+    fn jump_target_scroll_line_zero_vs_last() {
+        // total=50, height=20 → base=30
+        // line 0: scroll_offset=30 → draw scroll = base - offset = 0 (top line at top)
+        assert_eq!(jump_target_scroll(0, 50, 20), 30);
+        // last line (49): scroll_offset=0 → draw scroll = 30 (shows [30,50), 49 at bottom)
+        assert_eq!(jump_target_scroll(49, 50, 20), 0);
+    }
+
+    #[test]
+    fn jump_target_scroll_fits_without_scroll() {
+        // total ≤ height → base=0, no scroll anywhere
+        assert_eq!(jump_target_scroll(0, 10, 20), 0);
+        assert_eq!(jump_target_scroll(9, 10, 20), 0);
+    }
+
+    #[test]
+    fn highlight_matches_patches_only_matched_keeps_fg() {
+        use ratatui::style::{Color, Style};
+        let red = Style::new().fg(Color::Red);
+        let blue = Style::new().fg(Color::Blue);
+        let lines = vec![
+            Line::from(vec![Span::styled("aaa".to_string(), red)]),
+            Line::from(vec![Span::styled("bbb".to_string(), blue)]),
+            Line::from(vec![Span::raw("ccc".to_string())]),
+        ];
+        let out = highlight_matches(lines, &[0, 1], Some(0));
+        // 当前行（idx 0）：bg=Yellow，fg 仍为 Red
+        assert_eq!(out[0].spans[0].style.fg, Some(Color::Red));
+        assert_eq!(out[0].spans[0].style.bg, Some(Color::Yellow));
+        // 其它匹配行（idx 1）：bg=DarkGray，fg 仍为 Blue
+        assert_eq!(out[1].spans[0].style.fg, Some(Color::Blue));
+        assert_eq!(out[1].spans[0].style.bg, Some(Color::DarkGray));
+        // 未匹配行（idx 2）：原样，无 bg
+        assert_eq!(out[2].spans[0].style.fg, None);
+        assert_eq!(out[2].spans[0].style.bg, None);
+    }
+
+    #[test]
+    fn search_open_then_esc_closes() {
+        let mut s = tui_state_for_test();
+        s.search = Some(SearchState::new());
+        assert!(s.search.is_some());
+        apply_search_key(&mut s, key_esc());
+        assert!(s.search.is_none(), "Esc must close search mode");
+    }
+
+    #[test]
+    fn search_esc_does_not_touch_task_state() {
+        let mut s = tui_state_for_test();
+        s.thinking = true;
+        s.search = Some(SearchState::new());
+        apply_search_key(&mut s, key_esc());
+        assert!(s.search.is_none(), "search closed");
+        assert!(s.thinking, "Esc in search must NOT abort the running task");
+    }
+
+    #[test]
+    fn search_ctrl_f_toggles_closed() {
+        let mut s = tui_state_for_test();
+        s.search = Some(SearchState::new());
+        apply_search_key(&mut s, key_ctrl('f'));
+        assert!(s.search.is_none(), "Ctrl+F while searching must close it");
+    }
+
+    #[test]
+    fn search_ctrl_c_delegates_to_quit() {
+        let mut s = tui_state_for_test();
+        s.search = Some(SearchState::new());
+        // Ctrl+C 须交给主链退出，不被搜索吞掉
+        assert!(!apply_search_key(&mut s, key_ctrl('c')), "Ctrl+C must delegate to quit");
+        assert!(s.search.is_some(), "search still open until quit clears it");
+    }
+
+    #[test]
+    fn search_typing_populates_query_cjk_safe() {
+        let mut s = tui_state_for_test();
+        s.search = Some(SearchState::new());
+        apply_search_key(&mut s, key_char('a'));
+        apply_search_key(&mut s, key_char('\u{4f60}'));
+        let q = s.search.as_ref().unwrap().query.clone();
+        assert_eq!(q, "a\u{4f60}");
+        assert_eq!(s.search.as_ref().unwrap().cursor, 4);
+    }
+
+    #[test]
+    fn search_backspace_removes_full_cjk() {
+        let mut s = tui_state_for_test();
+        s.search = Some(SearchState::new());
+        apply_search_key(&mut s, key_char('\u{4f60}'));
+        apply_search_key(&mut s, key_char('\u{597d}'));
+        apply_search_key(&mut s, key_backspace());
+        assert_eq!(s.search.as_ref().unwrap().query, "\u{4f60}");
+        assert_eq!(s.search.as_ref().unwrap().cursor, 3);
+    }
+
+    #[test]
+    fn search_enter_down_up_wrap() {
+        let mut s = tui_state_for_test();
+        let mut st = SearchState::new();
+        st.matches = vec![0, 5, 10];
+        st.current = 0;
+        s.search = Some(st);
+        apply_search_key(&mut s, key_enter());
+        assert_eq!(s.search.as_ref().unwrap().current, 1);
+        apply_search_key(&mut s, key_down());
+        assert_eq!(s.search.as_ref().unwrap().current, 2);
+        apply_search_key(&mut s, key_enter()); // 2 → 0 wrap
+        assert_eq!(s.search.as_ref().unwrap().current, 0);
+        apply_search_key(&mut s, key_up()); // 0 → 2 wrap
+        assert_eq!(s.search.as_ref().unwrap().current, 2);
+    }
+
+    #[test]
+    fn search_no_matches_enter_is_noop() {
+        let mut s = tui_state_for_test();
+        s.search = Some(SearchState::new()); // empty matches
+        apply_search_key(&mut s, key_enter());
+        assert_eq!(s.search.as_ref().unwrap().current, 0);
+        assert!(s.search.as_ref().unwrap().matches.is_empty());
+    }
+
+    // ===== 命令面板测试 / Command palette tests =====
+
+    /// 表完整性：每条 PALETTE_COMMANDS 条目的命令字符串必须被 ReplCommand::parse 识别。
+    /// Execute 条目解析为具体变体（非 InvalidUsage）；PlantInput 条目解析为带可选参数
+    /// 的变体（None 参数）或已知命令的 InvalidUsage（usage: ...），而非 unknown command。
+    ///
+    /// Table completeness: every PALETTE_COMMANDS entry's command string must be
+    /// recognized by ReplCommand::parse. Execute entries parse to a concrete variant
+    /// (not InvalidUsage); PlantInput entries parse to a variant with optional args
+    /// (None args) or a known-command InvalidUsage (usage: ...), not "unknown command".
+    #[test]
+    fn palette_commands_all_parse_to_expected_variants() {
+        for (cmd, _, action) in PALETTE_COMMANDS {
+            let parsed = ReplCommand::parse(cmd);
+            match action {
+                PaletteAction::Execute => {
+                    assert!(
+                        !matches!(parsed, ReplCommand::InvalidUsage(_)),
+                        "Execute entry {cmd} must parse to a concrete variant, got InvalidUsage"
+                    );
+                    assert!(
+                        !matches!(parsed, ReplCommand::Goal(_)),
+                        "Execute entry {cmd} must not parse as Goal"
+                    );
+                }
+                PaletteAction::PlantInput => match parsed {
+                    ReplCommand::Model { slug: None } => {}
+                    ReplCommand::History { limit: None } => {}
+                    ReplCommand::Plan { plan: None } => {}
+                    ReplCommand::InvalidUsage(msg) => {
+                        assert!(
+                            !msg.contains("unknown command"),
+                            "PlantInput entry {cmd} parsed as unknown command: {msg}"
+                        );
+                    }
+                    _ => panic!("PlantInput entry {cmd} parsed as unexpected variant"),
+                },
+            }
+        }
+    }
+
+    /// 漂移守卫：ReplCommand 中每个斜杠命令变体都必须在 PALETTE_COMMANDS 中有对应条目。
+    /// 防止 repl.rs 新增命令后遗漏面板条目。
+    ///
+    /// Drift guard: every slash-command variant in ReplCommand must have a
+    /// corresponding entry in PALETTE_COMMANDS. Prevents the table from
+    /// going stale when repl.rs adds new commands.
+    #[test]
+    fn palette_commands_cover_all_slash_command_variants() {
+        let known_commands = [
+            "/model", "/models", "/plan", "/evolve", "/evolve-code", "/add-tool",
+            "/add-skill", "/skills", "/context", "/help", "/history", "/lessons",
+            "/quit", "/trust",
+        ];
+        for cmd in known_commands {
+            let found = PALETTE_COMMANDS.iter().any(|(c, _, _)| *c == cmd);
+            assert!(
+                found,
+                "slash command {cmd} not represented in PALETTE_COMMANDS"
+            );
+        }
+        let count = PALETTE_COMMANDS.len();
+        let unique: std::collections::HashSet<&str> =
+            PALETTE_COMMANDS.iter().map(|(c, _, _)| *c).collect();
+        assert_eq!(
+            count,
+            unique.len(),
+            "PALETTE_COMMANDS has duplicate entries"
+        );
+    }
+
+    /// PlantInput 行为：选中 /model 后输入缓冲区变为 "/model "（尾随空格），
+    /// 光标在末尾，选择器已关闭，palette_active 已清除。
+    ///
+    /// PlantInput behavior: selecting /model sets the input buffer to "/model "
+    /// (trailing space), cursor at end, selector cleared, palette_active cleared.
+    #[test]
+    fn palette_plant_input_sets_buffer_and_clears_selector() {
+        let mut s = tui_state_for_test();
+        let item = SelectorItem {
+            label: "/model".into(),
+            detail: "".into(),
+            data: Some("/model".into()),
+        };
+        let result = apply_palette_selection(&mut s, &item);
+        assert!(matches!(result, Some(PaletteExec::Planted)));
+        assert!(
+            s.selector.is_none(),
+            "selector must be cleared after planting"
+        );
+        assert!(
+            !s.palette_active,
+            "palette_active must be cleared after planting"
+        );
+        assert_eq!(
+            s.input.buffer, "/model ",
+            "input buffer must be '/model ' with trailing space"
+        );
+        assert_eq!(
+            s.input.cursor,
+            s.input.buffer.len(),
+            "cursor at end of buffer"
+        );
+    }
+
+    /// Execute 行为：选中 /skills 后返回 Execute("/skills")，选择器已关闭。
+    ///
+    /// Execute behavior: selecting /skills returns Execute("/skills"),
+    /// selector cleared.
+    #[test]
+    fn palette_execute_returns_command_and_clears_selector() {
+        let mut s = tui_state_for_test();
+        let item = SelectorItem {
+            label: "/skills".into(),
+            detail: "".into(),
+            data: Some("/skills".into()),
+        };
+        let result = apply_palette_selection(&mut s, &item);
+        match result {
+            Some(PaletteExec::Execute(cmd)) => assert_eq!(cmd, "/skills"),
+            _ => panic!("expected Execute for /skills"),
+        }
+        assert!(
+            s.selector.is_none(),
+            "selector must be cleared after Execute"
+        );
+        assert!(
+            !s.palette_active,
+            "palette_active must be cleared after Execute"
+        );
+    }
+
+    /// open_palette 后选择器非空，条目数等于 PALETTE_COMMANDS.len()。
+    ///
+    /// After open_palette, the selector is Some with exactly PALETTE_COMMANDS.len()
+    /// items and the palette_active flag is set.
+    #[test]
+    fn palette_open_populates_all_commands() {
+        let mut s = tui_state_for_test();
+        open_palette(&mut s);
+        assert!(s.palette_active, "palette_active must be set");
+        let sel = s
+            .selector
+            .as_ref()
+            .expect("selector must be Some after open_palette");
+        assert_eq!(sel.title(), "命令 / Commands");
+        assert_eq!(
+            sel.visible().len(),
+            PALETTE_COMMANDS.len(),
+            "visible items must equal PALETTE_COMMANDS length"
+        );
+    }
+
+    /// 未知命令返回 None，选择器与 palette_active 不变。
+    ///
+    /// Unknown command returns None; selector and palette_active stay unchanged.
+    #[test]
+    fn palette_selection_none_for_unknown_command() {
+        let mut s = tui_state_for_test();
+        s.selector = Some(SelectorState::new("t".into(), vec![], false));
+        s.palette_active = true;
+        let item = SelectorItem {
+            label: "/nonexistent".into(),
+            detail: "".into(),
+            data: Some("/nonexistent".into()),
+        };
+        let result = apply_palette_selection(&mut s, &item);
+        assert!(
+            result.is_none(),
+            "unknown command should return None"
         );
     }
 }

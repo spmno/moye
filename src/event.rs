@@ -78,6 +78,15 @@ pub enum AgentEvent {
     /// Agent 某阶段的最终输出。
     /// Agent's final output for a given stage.
     Agent(String),
+    /// LLM 推理过程（TUI 内部事件）——由 handle_action 中的 flush_reasoning
+    /// 直接推入消息历史，不经过 domain channel 传递（与 User / System 同例）。
+    /// 在最终答案到达时由累积的 ReasoningDelta 刷出，以折叠块形式展示在答案之前。
+    /// LLM reasoning trace (TUI-internal event) — pushed directly into message
+    /// history by flush_reasoning inside handle_action, never sent through the
+    /// domain channel (same precedent as User / System). Flushed from accumulated
+    /// ReasoningDelta when the final answer arrives, shown as a collapsed block
+    /// preceding the answer it produced.
+    Reasoning(String),
     /// 工具调用通知。`diff` 为 Some 时表示 edit_file 的结构化编辑载荷，
     /// TUI 用它渲染 unified diff；None 时退回 desc 纯文本渲染。
     /// Tool call notification. `diff` is Some when the call is an edit_file

@@ -115,10 +115,6 @@ pub fn system() -> Style {
     Style::new().fg(Color::Blue)
 }
 
-pub fn border() -> Style {
-    Style::new().fg(Color::DarkGray)
-}
-
 pub fn input_prompt() -> Style {
     Style::new()
         .fg(Color::LightCyan)

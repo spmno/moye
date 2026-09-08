@@ -2882,8 +2882,7 @@ fn draw_streaming(f: &mut Frame, area: Rect, state: &mut TuiState) {
         .style(theme::streaming())
         .block(
             Block::default()
-                .borders(Borders::TOP)
-                .border_style(theme::border())
+                .style(theme::bg_panel())
                 .padding(Padding::horizontal(1)),
         )
         .wrap(Wrap { trim: false });
@@ -2908,8 +2907,6 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
             .style(theme::selector_input())
             .block(
                 Block::default()
-                    .borders(Borders::TOP)
-                    .border_style(theme::border())
                     .style(theme::bg_panel())
                     .padding(Padding::horizontal(1)),
             );
@@ -2926,7 +2923,7 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
         }
         let inner_right = area.x.saturating_add(area.width).saturating_sub(1);
         let cx = (area.x + 1 + x).min(inner_right);
-        let cy = area.y + 1;
+        let cy = area.y;
         f.set_cursor_position((cx, cy));
         return;
     }
@@ -2943,8 +2940,6 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
         .scroll((state.input_scroll, 0))
         .block(
             Block::default()
-                .borders(Borders::TOP)
-                .border_style(theme::border())
                 .style(theme::bg_panel())
                 .padding(Padding::horizontal(1)),
         );
@@ -2974,7 +2969,7 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
         // 减去滚动偏移，使光标在可见区域内定位。
         // Subtract scroll offset so the cursor positions within the visible area.
         let visible_y = y.saturating_sub(state.input_scroll);
-        let cy = (area.y + 1 + visible_y).min(max_y);
+        let cy = (area.y + visible_y).min(max_y);
         f.set_cursor_position((cx, cy));
     }
 }

@@ -15,6 +15,24 @@
 
 use tokio::sync::{mpsc, oneshot};
 
+/// HITL 决策：用户对工具确认请求的响应。
+/// HITL decision: the user's response to a tool confirmation request.
+///
+/// - `Allow`  —— 允许本次执行（沙箱路径提示的"允许一次"）。
+/// - `Deny`   —— 拒绝执行。
+/// - `Always` —— 授权目录（仅沙箱路径提示）：本次会话不再询问，并持久化到 agent.toml。
+///
+/// - `Allow`  — approve this one execution (sandbox path prompt's "allow once").
+/// - `Deny`   — deny execution.
+/// - `Always` — authorize the directory (sandbox path prompt only): no more prompts
+///   this session, and the directory is persisted to agent.toml for future sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitlDecision {
+    Allow,
+    Deny,
+    Always,
+}
+
 /// edit_file 工具调用的结构化编辑载荷：渲染 unified diff 用。
 /// Structured edit payload for the edit_file tool call: used to render a unified diff.
 #[derive(Debug)]
@@ -76,10 +94,17 @@ pub enum AgentEvent {
     AgentFinished,
     /// HITL 确认请求——阻塞等待用户响应。
     /// HITL confirmation request — blocks until the user responds.
+    ///
+    /// `allow_always` 区分两种提示变体：沙箱外路径提示为 true（渲染 [a] 总是授权
+    /// 选项并允许 `HitlDecision::Always`）；审批层 Ask 提示为 false（仅 y/n）。
+    /// `allow_always` distinguishes two prompt variants: the sandbox out-of-path
+    /// prompt sets it to true (renders the [a] always-authorize option and permits
+    /// `HitlDecision::Always`); the approval-tier Ask prompt sets it to false (y/n only).
     HitlPrompt {
         tool: String,
         desc: String,
-        responder: oneshot::Sender<bool>,
+        responder: oneshot::Sender<HitlDecision>,
+        allow_always: bool,
     },
     /// 暂停 TUI 以运行交互式命令（如 sudo），完成后恢复 TUI 并返回输出。
     /// Suspend the TUI to run an interactive command (e.g., sudo), resume after completion

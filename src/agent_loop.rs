@@ -24,7 +24,7 @@ use crate::providers::CompletionModel as OpenAiModel;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
-use crate::event::{AgentEvent, EventSender, FileEdit};
+use crate::event::{AgentEvent, EventSender, FileEdit, HitlDecision};
 use crate::events::{PreStepState, WaterfallAction, WaterfallEvent, WaterfallRegistry};
 use crate::registry::{AgentRegistry, ApprovalChain, DefaultApproval, Permission, Role, ToolPerms};
 use crate::sandbox::Sandbox;
@@ -102,23 +102,21 @@ impl HitlHook {
 
     /// 向 TUI 发送 HITL 确认请求，等待用户按键。
     /// Sends a HITL confirmation request to the TUI, waits for user keypress.
-    async fn confirm(&self, tool_name: &str, desc: &str) -> bool {
-        // Use a guard so `waiting` is always reset — even if this future is
-        // dropped (cancelled) while awaiting the user's response.  Without
-        // this, a cancelled `confirm()` would leave `waiting = true` forever,
-        // causing `consume_stream` to skip the timeout on every subsequent
-        // iteration.
-        // 使用 guard 确保 `waiting` 总是被重置——即使此 future 在等待用户
-        // 响应时被丢弃（取消）。否则，被取消的 `confirm()` 会永远留下
-        // `waiting = true`，导致 `consume_stream` 在后续每次迭代中跳过超时。
+    ///
+    /// `allow_always` 为 true 时提示包含 [a] 总是授权选项（沙箱外路径提示）；
+    /// 为 false 时仅 y/n（审批层 Ask 提示）。
+    /// `allow_always` = true → prompt includes [a] always-authorize (sandbox path);
+    /// false → y/n only (approval-tier Ask).
+    async fn confirm(&self, tool_name: &str, desc: &str, allow_always: bool) -> HitlDecision {
         let _guard = WaitingGuard::new(self.waiting.clone());
         let (resp_tx, resp_rx) = oneshot::channel();
         let _ = self.tx.send(AgentEvent::HitlPrompt {
             tool: tool_name.to_string(),
             desc: desc.to_string(),
             responder: resp_tx,
+            allow_always,
         });
-        resp_rx.await.unwrap_or(false)
+        resp_rx.await.unwrap_or(HitlDecision::Deny)
     }
 
     async fn maybe_run_interactive(&self, tool_name: &str, args: &str) -> Option<ToolCallAction> {
@@ -159,6 +157,25 @@ impl WaitingGuard {
 impl Drop for WaitingGuard {
     fn drop(&mut self) {
         self.flag.store(false, Ordering::Relaxed);
+    }
+}
+
+/// 从 `SandboxError` 中提取要持久化的目录路径。
+/// 与 `sandbox.authorize_path` 一致：取路径的父目录。
+/// Extract the directory path to persist from a `SandboxError`.
+/// Mirrors `sandbox.authorize_path`: takes the parent directory of the path.
+fn extract_dir_from_sandbox_err(err: &crate::sandbox::SandboxError) -> String {
+    use crate::sandbox::SandboxError;
+    match err {
+        SandboxError::OutsideSandbox { path } => {
+            let expanded = crate::sandbox::expand_tilde(path);
+            let p = std::path::Path::new(&expanded);
+            if let Some(parent) = p.parent() {
+                parent.to_string_lossy().to_string()
+            } else {
+                expanded
+            }
+        }
     }
 }
 
@@ -241,22 +258,38 @@ impl AgentHook for HitlHook {
                      \u{ff08}\u{8f93}\u{5165} /trust \u{53ef}\u{5f00}\u{542f}\u{4fe1}\u{4efb}\u{6a21}\u{5f0f}\u{ff0c}\u{81ea}\u{52a8}\u{6388}\u{6743}\u{6c99}\u{7bb1}\u{5916}\u{8bbf}\u{95ee}\u{ff09}",
                     sandbox_err
                 );
-                if self.confirm(tool_name, &desc).await {
-                    // 用户授权——将涉及的目录加入授权列表
-                    // User authorized — add the involved directories to the authorized list
-                    self.sandbox.authorize_tool(tool_name, args);
-                    let _ = self.tx.send(AgentEvent::Info(format!(
-                        "  [\u{6c99}\u{7bb1}] \u{5df2}\u{6388}\u{6743}\u{8bbf}\u{95ee}: {sandbox_err}"
-                    )));
-                    // 授权后继续进入权限分级检查
-                    // After authorization, fall through to the permission tier check
-                } else {
-                    let _ = self.tx.send(AgentEvent::Info(
-                        "  [\u{6c99}\u{7bb1}] \u{8bbf}\u{95ee}\u{88ab}\u{62d2}\u{7edd}".into(),
-                    ));
-                    return ToolCallAction::Skip(format!(
-                        "\u{6c99}\u{7bb1}\u{62d2}\u{7edd}\u{8bbf}\u{95ee}: {sandbox_err}"
-                    ));
+                match self.confirm(tool_name, &desc, true).await {
+                    HitlDecision::Allow => {
+                        self.sandbox.authorize_tool(tool_name, args);
+                        let _ = self.tx.send(AgentEvent::Info(format!(
+                            "  [\u{6c99}\u{7bb1}] \u{5df2}\u{6388}\u{6743}\u{8bbf}\u{95ee}: {sandbox_err}"
+                        )));
+                    }
+                    HitlDecision::Always => {
+                        self.sandbox.authorize_tool(tool_name, args);
+                        let persist_dir = extract_dir_from_sandbox_err(&sandbox_err);
+                        match crate::config::persist_authorized_dir(&persist_dir) {
+                            Ok(()) => {
+                                let _ = self.tx.send(AgentEvent::Info(format!(
+                                    "  [\u{6c99}\u{7bb1}] \u{5df2}\u{6388}\u{6743}\u{5e76}\u{6301}\u{4e45}\u{5316}\u{76ee}\u{5f55}: {persist_dir}"
+                                )));
+                            }
+                            Err(e) => {
+                                warn!("Failed to persist authorized dir {persist_dir}: {e}");
+                                let _ = self.tx.send(AgentEvent::Info(format!(
+                                    "  [\u{6c99}\u{7bb1}] \u{5df2}\u{6388}\u{6743}\u{8bbf}\u{95ee}(\u{6301}\u{4e45}\u{5316}\u{5931}\u{8d25}): {persist_dir}"
+                                )));
+                            }
+                        }
+                    }
+                    HitlDecision::Deny => {
+                        let _ = self.tx.send(AgentEvent::Info(
+                            "  [\u{6c99}\u{7bb1}] \u{8bbf}\u{95ee}\u{88ab}\u{62d2}\u{7edd}".into(),
+                        ));
+                        return ToolCallAction::Skip(format!(
+                            "\u{6c99}\u{7bb1}\u{62d2}\u{7edd}\u{8bbf}\u{95ee}: {sandbox_err}"
+                        ));
+                    }
                 }
             }
         }
@@ -288,15 +321,19 @@ impl AgentHook for HitlHook {
             }
             ApprovalVerdict::Ask => {
                 let desc = format_tool_call_desc(tool_name, args);
-                if self.confirm(tool_name, &desc).await {
-                    if let Some(action) = self.maybe_run_interactive(tool_name, args).await {
-                        return action;
+                // Approval Ask is strictly y/n (allow_always = false). The [a]
+                // option is hidden, so Always is unreachable here — but keep
+                // the mapping total: Allow/Always → Run, Deny → Skip.
+                match self.confirm(tool_name, &desc, false).await {
+                    HitlDecision::Allow | HitlDecision::Always => {
+                        if let Some(action) = self.maybe_run_interactive(tool_name, args).await {
+                            return action;
+                        }
+                        ToolCallAction::Run
                     }
-                    ToolCallAction::Run
-                } else {
-                    ToolCallAction::Skip(format!(
+                    HitlDecision::Deny => ToolCallAction::Skip(format!(
                         "\u{7528}\u{6237}\u{62d2}\u{7edd}\u{4e86} `{tool_name}` \u{7684}\u{6267}\u{884c}"
-                    ))
+                    )),
                 }
             }
         }

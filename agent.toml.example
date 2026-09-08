@@ -182,8 +182,11 @@ rule_escalation_threshold = 3
 [sandbox]
 # 预授权目录列表：这些目录及其子目录可直接访问，无需弹窗确认。
 # 支持 ~ 展开（如 ~/.config）。
+# 在沙箱外路径 HITL 提示中按 [a] "总是授权" 会自动将目录追加到此列表。
 # Pre-authorized directory list: these directories and their subdirectories are
 # accessible without prompting. Supports ~ expansion (e.g. ~/.config).
+# Pressing [a] "always" in the sandbox out-of-path HITL prompt auto-appends
+# the directory here.
 #
 # 示例 / Example:
 # authorized_dirs = ["~/.config", "/tmp/moye", "../shared-libs"]

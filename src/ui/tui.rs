@@ -27,7 +27,7 @@ use tokio::time::interval;
 
 use crate::cli::context::AppContext;
 use crate::cli::repl::ReplCommand;
-use crate::event::{AgentEvent, EventReceiver, EventSender, TodoItem, TodoStatus};
+use crate::event::{AgentEvent, EventReceiver, EventSender, HitlDecision, TodoItem, TodoStatus};
 use crate::ui::clipboard;
 use crate::ui::selection::Selection;
 use crate::ui::selector::{SelectorItem, SelectorState};
@@ -146,7 +146,8 @@ impl Drop for TerminalGuard {
 struct HitlState {
     tool: String,
     desc: String,
-    responder: oneshot::Sender<bool>,
+    responder: oneshot::Sender<HitlDecision>,
+    allow_always: bool,
 }
 
 // ===== Input state (extracted from TuiState) =====
@@ -740,8 +741,7 @@ fn log_event(event: &AgentEvent) {
             info!(
                 "[TUI] \u{6682}\u{505c} TUI \u{8fd0}\u{884c}\u{4ea4}\u{4e92}\u{5f0f}\u{547d}\u{4ee4}: {command}"
             );
-        }
-        AgentEvent::TextDelta(_) | AgentEvent::ReasoningDelta(_) => {}
+        }        AgentEvent::TextDelta(_) | AgentEvent::ReasoningDelta(_) => {}
         AgentEvent::Reasoning(text) => {
             info!("[TUI] \u{601d}\u{8003}\u{8fc7}\u{7a0b}: {} \u{5b57}\u{7b26}", text.chars().count());
         }
@@ -1262,10 +1262,11 @@ fn handle_key_event(
     action_tx: &EventSender,
 ) {
     if state.hitl.is_some() {
+        let allow_always = state.hitl.as_ref().map_or(false, |h| h.allow_always);
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some(h) = state.hitl.take() {
-                    let _ = h.responder.send(true);
+                    let _ = h.responder.send(HitlDecision::Allow);
                     state.push_event(AgentEvent::Info(format!(
                         "\u{26a0} \u{5141}\u{8bb8}\u{6267}\u{884c} {}",
                         h.tool
@@ -1274,9 +1275,18 @@ fn handle_key_event(
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 if let Some(h) = state.hitl.take() {
-                    let _ = h.responder.send(false);
+                    let _ = h.responder.send(HitlDecision::Deny);
                     state.push_event(AgentEvent::Info(format!(
                         "\u{26a0} \u{62d2}\u{7edd}\u{6267}\u{884c} {}",
+                        h.tool
+                    )));
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') if allow_always => {
+                if let Some(h) = state.hitl.take() {
+                    let _ = h.responder.send(HitlDecision::Always);
+                    state.push_event(AgentEvent::Info(format!(
+                        "\u{26a0} \u{603b}\u{662f}\u{6388}\u{6743} {}",
                         h.tool
                     )));
                 }
@@ -1442,7 +1452,7 @@ fn handle_key_event(
         // (race condition: HitlPrompt event still in channel buffer).
         // 安全兜底：清除 abort 后可能到达的 HITL 提示（竞态：HitlPrompt 仍在 channel 缓冲区中）。
         if let Some(h) = state.hitl.take() {
-            let _ = h.responder.send(false);
+            let _ = h.responder.send(HitlDecision::Deny);
         }
         if let Some(handle) = state.task_handle.take() {
             handle.abort();
@@ -2446,18 +2456,18 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
             tool,
             desc,
             responder,
+            allow_always,
         } => {
-            // If the task was already aborted (thinking is false), auto-reject
-            // to avoid a dangling HITL overlay with no live task.
-            // 如果任务已被中断（thinking 为 false），自动拒绝，
-            // 避免出现没有活动任务的悬空 HITL 弹窗。
+            // Auto-reject if the task was already aborted (race: HitlPrompt
+            // still in channel buffer when thinking=false).
             if !state.thinking {
-                let _ = responder.send(false);
+                let _ = responder.send(HitlDecision::Deny);
             } else {
                 state.hitl = Some(HitlState {
                     tool,
                     desc,
                     responder,
+                    allow_always,
                 });
             }
         }
@@ -3259,24 +3269,34 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
     f.render_widget(sidebar, area);
 }
 
+fn hitl_hint(allow_always: bool) -> &'static str {
+    if allow_always {
+        "[y] \u{5141}\u{8bb8}\u{4e00}\u{6b21}  [n] \u{62d2}\u{7edd}  [a] \u{603b}\u{662f}\u{6388}\u{6743}"
+    } else {
+        "[y] \u{5141}\u{8bb8}  [n] \u{62d2}\u{7edd}"
+    }
+}
+
 fn draw_hitl_overlay(f: &mut Frame, state: &mut TuiState) {
     let area = f.area();
     let dw = 60u16.min(area.width.saturating_sub(4));
 
     let h = state.hitl.as_ref().unwrap();
     let content = format!(
-        "\u{26a0} \u{786e}\u{8ba4}\u{6267}\u{884c}\n\n{}\n\n[y] \u{5141}\u{8bb8}  [n] \u{62d2}\u{7edd}",
-        h.desc
+        "\u{26a0} \u{786e}\u{8ba4}\u{6267}\u{884c}\n\n{}\n\n{}",
+        h.desc,
+        hitl_hint(h.allow_always)
     );
 
-    // ── Dynamic dialog height ──
     // The old fixed height of 7 was too small: with borders (2) + padding (2)
     // only 3 content lines were visible, so the "[y] 允许  [n] 拒绝" prompt was
-    // clipped whenever the description occupied more than one line.  Calculate
+    // clipped whenever the description occupied more than one line. Calculate
     // the needed height from the content, accounting for wrapping and CJK width.
+    // The tri-state hint ("[y] 允许一次  [n] 拒绝  [a] 总是授权") is longer;
+    // dynamic height accommodates both variants.
     // 动态弹窗高度：旧固定值 7 太小——减去边框(2)+内边距(2)后仅 3 行可见，
-    // 描述超过一行时 "[y] 允许  [n] 拒绝" 提示被截断，用户看不到该按什么键。
-    let inner_width = (dw.saturating_sub(4)).max(1) as usize; // 2 borders + 2 padding
+    // 描述超过一行时提示被截断。动态高度同时适配双态和三态提示。
+    let inner_width = (dw.saturating_sub(4)).max(1) as usize;
     let est_lines: u16 = content
         .lines()
         .map(|line| {
@@ -4635,5 +4655,31 @@ mod tests {
             theme::search_current().bg,
             "continuation border copies the same style (consistent patching)"
         );
+    }
+
+    // ── HITL hint / HitlDecision tests ──
+
+    #[test]
+    fn hitl_hint_with_allow_always_shows_a_option() {
+        let hint = hitl_hint(true);
+        assert!(hint.contains("[a]"), "allow_always=true must show [a] option");
+        assert!(hint.contains("[y]"), "must show [y]");
+        assert!(hint.contains("[n]"), "must show [n]");
+    }
+
+    #[test]
+    fn hitl_hint_without_allow_always_hides_a_option() {
+        let hint = hitl_hint(false);
+        assert!(!hint.contains("[a]"), "allow_always=false must NOT show [a] option");
+        assert!(hint.contains("[y]"), "must show [y]");
+        assert!(hint.contains("[n]"), "must show [n]");
+    }
+
+    #[test]
+    fn hitl_decision_variants_distinct() {
+        use crate::event::HitlDecision;
+        assert_ne!(HitlDecision::Allow, HitlDecision::Deny);
+        assert_ne!(HitlDecision::Allow, HitlDecision::Always);
+        assert_ne!(HitlDecision::Deny, HitlDecision::Always);
     }
 }

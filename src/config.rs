@@ -815,6 +815,272 @@ pub fn config() -> Option<&'static Config> {
     CONFIG.get().map(|c| c.as_ref())
 }
 
+// ── persist_authorized_dir ─────────────────────────────────────────────────
+
+/// 将一个授权目录持久化到 `agent.toml` 的 `[sandbox].authorized_dirs` 数组。
+/// 持久化采用字符串级编辑——不通过 toml crate 重新序列化，保留文件中的注释和格式。
+///
+/// 此函数仅影响**未来会话**的配置加载；当前会话的授权已在 agent_loop 中通过
+/// `sandbox.authorize_tool` 完成。不热加载——运行中的配置不变。
+/// Persist an authorized directory to `agent.toml`'s `[sandbox].authorized_dirs`.
+/// Uses string-level editing — no toml re-serialization, preserving comments and
+/// formatting elsewhere in the file.
+///
+/// This only affects **future sessions**' config loading; the current session's
+/// authorization was already applied via `sandbox.authorize_tool` in agent_loop.
+/// No hot-reload — the running config is unchanged.
+pub fn persist_authorized_dir(dir: &str) -> anyhow::Result<()> {
+    persist_authorized_dir_to(dir, "agent.toml")
+}
+
+/// 可测试变体：写入显式路径的配置文件。
+/// Testable variant: writes to an explicit config file path.
+///
+/// 策略（按情况）：
+/// 1. 文件不存在 → 创建仅含 `[sandbox]\nauthorized_dirs = ["dir"]\n` 的最小文件
+///    （其余配置回退到全局 config/默认值）。
+/// 2. 有文件但无 `[sandbox]` 小节 → 在文件末尾追加 `\n[sandbox]\nauthorized_dirs = ["dir"]\n`。
+/// 3. `[sandbox]` 存在但无 `authorized_dirs` 键 → 在小节头部后插入 `authorized_dirs = ["dir"]`。
+/// 4. `authorized_dirs` 已存在 → 解析数组条目，按规范化路径去重；已存在则 no-op；
+///    否则将新目录追加到数组（单行形式）。多行数组会被折叠为合并后的单行数组。
+///
+/// Strategy (per case):
+/// 1. File missing → create minimal `[sandbox]\nauthorized_dirs = ["dir"]\n` (other
+///    config falls back to global/defaults).
+/// 2. File exists, no `[sandbox]` section → append `\n[sandbox]\nauthorized_dirs = ["dir"]\n`.
+/// 3. `[sandbox]` exists, no `authorized_dirs` key → insert after the section header.
+/// 4. `authorized_dirs` exists → parse entries, dedup by canonical path; no-op if
+///    already present; otherwise append. Multi-line arrays are collapsed to single-line.
+fn persist_authorized_dir_to(dir: &str, config_path: &str) -> anyhow::Result<()> {
+    let quoted = format!("\"{}\"", escape_toml_string(dir));
+
+    if !std::path::Path::new(config_path).exists() {
+        let content = format!("[sandbox]\nauthorized_dirs = [{quoted}]\n");
+        std::fs::write(config_path, content)?;
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(config_path)?;
+    let lines: Vec<&str> = content.lines().collect();
+
+    let sandbox_start = find_section_start(&lines, "sandbox");
+    let sandbox_end = sandbox_start.map(|s| section_end(&lines, s)).unwrap_or(0);
+
+    match sandbox_start {
+        Some(start) => {
+            let end = sandbox_end;
+            let auth_line_rel = (start + 1..end).find(|&i| {
+                let t = lines[i].trim();
+                t.starts_with("authorized_dirs") && t.contains('=')
+            });
+
+            match auth_line_rel {
+                Some(auth_idx) => {
+                    let existing = parse_array_entries_on_line(&lines, auth_idx, end);
+                    let canon_input = canonicalize_dir(dir);
+                    let already_present = existing.iter().any(|e| {
+                        canonicalize_dir(e) == canon_input
+                    });
+                    if already_present {
+                        std::fs::write(config_path, content)?;
+                        return Ok(());
+                    }
+
+                    let mut merged: Vec<String> = existing.iter().map(|s| s.to_string()).collect();
+                    merged.push(dir.to_string());
+                    let new_line = build_authorized_dirs_line(&merged);
+
+                    let mut out = String::with_capacity(content.len() + 64);
+                    let multi_end = array_end_line(&lines, auth_idx, end);
+                    for (i, l) in lines.iter().enumerate() {
+                        if i == auth_idx {
+                            out.push_str(&new_line);
+                        } else if i > auth_idx && i <= multi_end {
+                            // Skip multi-line array continuation lines (collapsed to single line).
+                        } else {
+                            out.push_str(l);
+                            out.push('\n');
+                        }
+                    }
+                    std::fs::write(config_path, out)?;
+                }
+                None => {
+                    let mut out = String::with_capacity(content.len() + 64);
+                    for (i, l) in lines.iter().enumerate() {
+                        out.push_str(l);
+                        out.push('\n');
+                        if i == start {
+                            out.push_str(&format!("authorized_dirs = [{quoted}]\n"));
+                        }
+                    }
+                    std::fs::write(config_path, out)?;
+                }
+            }
+        }
+        None => {
+            let mut out = String::with_capacity(content.len() + 64);
+            out.push_str(&content);
+            if !content.is_empty() && !content.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&format!("\n[sandbox]\nauthorized_dirs = [{quoted}]\n"));
+            std::fs::write(config_path, out)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// 在行数组中查找指定小节头（如 `"sandbox"` → 匹配 `[sandbox]`）的行号。
+/// 不匹配 `[agents.sandbox]` 等带点前缀的小节。
+/// Find the line index of an exact `[section_name]` header (e.g. `"sandbox"` →
+/// `[sandbox]`). Does NOT match dotted prefixes like `[agents.sandbox]`.
+fn find_section_start(lines: &[&str], section: &str) -> Option<usize> {
+    let target = format!("[{section}]");
+    lines.iter().position(|l| l.trim() == target)
+}
+
+/// 返回小节的结束行号（exclusive）：下一个以 `[` 开头的行或文件末尾。
+/// Return the exclusive end line index of a section: the next `[` header or EOF.
+fn section_end(lines: &[&str], start: usize) -> usize {
+    let start = start + 1;
+    let mut i = start;
+    while i < lines.len() {
+        if lines[i].trim().starts_with('[') {
+            return i;
+        }
+        i += 1;
+    }
+    lines.len()
+}
+
+/// 解析 `authorized_dirs = [...]` 行中的数组条目。
+/// 如果数组跨越多行，从 `auth_idx` 扫描到 `]` 或 `section_end`，收集所有引号字符串。
+/// Parse the array entries from an `authorized_dirs = [...]` assignment.
+/// If the array spans multiple lines, scan from `auth_idx` until `]` or
+/// `section_end`, collecting all quoted strings.
+fn parse_array_entries_on_line(lines: &[&str], auth_idx: usize, section_end: usize) -> Vec<String> {
+    let mut raw = String::new();
+    for i in auth_idx..section_end {
+        raw.push_str(lines[i]);
+        if lines[i].contains(']') {
+            break;
+        }
+        raw.push('\n');
+    }
+    parse_toml_string_array(&raw)
+}
+
+/// 从包含 `authorized_dirs = [...]` 的原始文本中提取引号内的字符串条目。
+/// Extract quoted string entries from raw text containing `authorized_dirs = [...]`.
+fn parse_toml_string_array(raw: &str) -> Vec<String> {
+    let bracket_start = match raw.find('[') {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    let bracket_end = match raw[bracket_start..].find(']') {
+        Some(i) => bracket_start + i,
+        None => return Vec::new(),
+    };
+    let inside = &raw[bracket_start + 1..bracket_end];
+    inside
+        .split(',')
+        .filter_map(|token| {
+            let token = token.trim();
+            if token.is_empty() {
+                return None;
+            }
+            let unquoted = token
+                .strip_prefix('"')
+                .and_then(|t| t.strip_suffix('"'))
+                .unwrap_or(token);
+            Some(unescape_toml_string(unquoted))
+        })
+        .collect()
+}
+
+/// 构建单行 `authorized_dirs = [...]` 赋值行。
+/// Build a single-line `authorized_dirs = [...]` assignment line.
+fn build_authorized_dirs_line(dirs: &[String]) -> String {
+    let entries: Vec<String> = dirs
+        .iter()
+        .map(|d| format!("\"{}\"", escape_toml_string(d)))
+        .collect();
+    format!("authorized_dirs = [{}]", entries.join(", "))
+}
+
+/// 如果 `authorized_dirs` 是多行数组，返回最后一行的索引（含 `]` 的行）；
+/// 单行数组返回 `auth_idx` 本身。
+/// If `authorized_dirs` is a multi-line array, return the index of the line
+/// containing `]`; single-line arrays return `auth_idx` itself.
+fn array_end_line(lines: &[&str], auth_idx: usize, section_end: usize) -> usize {
+    if lines[auth_idx].contains(']') {
+        return auth_idx;
+    }
+    for i in auth_idx + 1..section_end {
+        if lines[i].contains(']') {
+            return i;
+        }
+    }
+    auth_idx
+}
+
+/// 规范化目录路径用于去重比较（与 sandbox.rs 的 canonicalize 逻辑一致）。
+/// Canonicalize a directory path for dedup comparison (matches sandbox.rs logic).
+fn canonicalize_dir(dir: &str) -> String {
+    let expanded = crate::sandbox::expand_tilde(dir);
+    let path = std::path::Path::new(&expanded);
+    if path.is_absolute() {
+        match path.canonicalize() {
+            Ok(canon) => canon.to_string_lossy().to_string(),
+            Err(_) => expanded,
+        }
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => {
+                let abs = cwd.join(path);
+                match abs.canonicalize() {
+                    Ok(canon) => canon.to_string_lossy().to_string(),
+                    Err(_) => abs.to_string_lossy().to_string(),
+                }
+            }
+            Err(_) => expanded,
+        }
+    }
+}
+
+/// 转义 TOML 基本字符串中的特殊字符（`"` 和 `\`）。
+/// Escape special chars in a TOML basic string (`"` and `\`).
+fn escape_toml_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// 反转义 TOML 基本字符串中的转义序列。
+/// Unescape TOML basic string escape sequences.
+fn unescape_toml_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1768,5 +2034,150 @@ permissions.read_file = "allow"
             builder.permissions.command_rules.is_empty(),
             "serde(skip) → command_rules always empty when deserialized from role TOML"
         );
+    }
+
+    // ── persist_authorized_dir 测试 / persist_authorized_dir tests ──
+
+    fn temp_config_path(name: &str) -> String {
+        let path = std::env::temp_dir().join(format!("moye-test-persist-{name}.toml"));
+        let _ = std::fs::remove_file(&path);
+        path.to_string_lossy().to_string()
+    }
+
+    fn make_temp_dir(name: &str) -> String {
+        let path = std::env::temp_dir().join(format!("moye-test-authdir-{name}"));
+        let _ = std::fs::create_dir_all(&path);
+        path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn persist_missing_file_creates_minimal() {
+        let path = temp_config_path("missing");
+        let dir = make_temp_dir("missing-file");
+        persist_authorized_dir_to(&dir, &path).expect("persist should succeed");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[sandbox]"), "must contain [sandbox] section");
+        assert!(
+            raw.contains(&dir),
+            "must contain the dir: {raw}"
+        );
+        let cfg: Config = toml::from_str(&raw).expect("written file must parse");
+        assert!(
+            cfg.sandbox.authorized_dirs.iter().any(|d| d == &dir),
+            "sandbox.authorized_dirs must contain the dir"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_file_with_other_sections_no_sandbox() {
+        let path = temp_config_path("no-sandbox");
+        let dir = make_temp_dir("no-sandbox");
+        std::fs::write(
+            &path,
+            "[provider]\nprovider = \"deepseek\"\n\n[agent]\ndefault_model = \"kimi-k3\"\n",
+        )
+        .unwrap();
+        persist_authorized_dir_to(&dir, &path).expect("persist should succeed");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[provider]"), "existing sections preserved");
+        assert!(raw.contains("[sandbox]"), "[sandbox] appended");
+        assert!(raw.contains(&dir), "dir present");
+        let cfg: Config = toml::from_str(&raw).expect("file must still parse");
+        assert!(cfg.sandbox.authorized_dirs.iter().any(|d| d == &dir));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_sandbox_exists_no_authorized_dirs_key() {
+        let path = temp_config_path("no-key");
+        let dir = make_temp_dir("no-key");
+        std::fs::write(
+            &path,
+            "[sandbox]\nbackend = \"auto\"\nmode = \"landlock\"\n",
+        )
+        .unwrap();
+        persist_authorized_dir_to(&dir, &path).expect("persist should succeed");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("backend = \"auto\""), "existing keys preserved");
+        assert!(
+            raw.contains("authorized_dirs"),
+            "authorized_dirs key added"
+        );
+        assert!(raw.contains(&dir), "dir present");
+        let cfg: Config = toml::from_str(&raw).expect("file must parse");
+        assert!(cfg.sandbox.authorized_dirs.iter().any(|d| d == &dir));
+        assert_eq!(cfg.sandbox.backend, "auto");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_single_line_array_appends_and_dedupes() {
+        let path = temp_config_path("single-line");
+        let dir1 = make_temp_dir("single-1");
+        let dir2 = make_temp_dir("single-2");
+        let initial = format!(
+            "[sandbox]\nbackend = \"auto\"\nauthorized_dirs = [\"{dir1}\"]\n"
+        );
+        std::fs::write(&path, &initial).unwrap();
+
+        persist_authorized_dir_to(&dir2, &path).expect("first persist");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(&dir1), "existing dir preserved");
+        assert!(raw.contains(&dir2), "new dir appended");
+        let cfg: Config = toml::from_str(&raw).expect("file must parse");
+        assert_eq!(cfg.sandbox.authorized_dirs.len(), 2);
+
+        persist_authorized_dir_to(&dir2, &path).expect("second persist (dedup)");
+        let raw2 = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw, raw2, "second call with same dir must be no-op");
+        let cfg2: Config = toml::from_str(&raw2).expect("file must parse");
+        assert_eq!(
+            cfg2.sandbox.authorized_dirs.len(),
+            2,
+            "no duplicate entry added"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn persist_roundtrip_config_loader_contains_dir() {
+        let path = temp_config_path("roundtrip");
+        let dir = make_temp_dir("roundtrip");
+        std::fs::write(
+            &path,
+            "[sandbox]\nbackend = \"bwrap\"\nmode = \"auto\"\n",
+        )
+        .unwrap();
+        persist_authorized_dir_to(&dir, &path).expect("persist");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let cfg: Config = toml::from_str(&raw).expect("must parse via config loader");
+        assert!(
+            cfg.sandbox.authorized_dirs.iter().any(|d| d == &dir),
+            "sandbox.authorized_dirs must contain the persisted dir"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_preserves_comments_elsewhere() {
+        let path = temp_config_path("comments");
+        let dir = make_temp_dir("comments");
+        let initial = "[provider]\nprovider = \"deepseek\"\n# important comment\n\n[sandbox]\nbackend = \"auto\"\n";
+        std::fs::write(&path, initial).unwrap();
+        persist_authorized_dir_to(&dir, &path).expect("persist");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("# important comment"),
+            "comment elsewhere must be byte-present after persist"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

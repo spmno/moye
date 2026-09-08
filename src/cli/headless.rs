@@ -20,7 +20,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::cli::context::AppContext;
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, HitlDecision};
 
 // ── OutputFormat ──────────────────────────────────────────────────────────
 
@@ -125,9 +125,9 @@ pub enum Sink {
     /// 打印到 stderr（工具调用/结果、阶段、错误）。
     /// Print to stderr (tool calls/results, phases, errors).
     Stderr(String),
-    /// 响应 HITL 提示（发送 true=批准 / false=拒绝）。
-    /// Respond to a HITL prompt (true=approve / false=deny).
-    RespondHitl(bool),
+    /// 响应 HITL 提示（发送 Allow=批准 / Deny=拒绝）。
+    /// Respond to a HITL prompt (Allow=approve / Deny=deny).
+    RespondHitl(HitlDecision),
     /// 任务完成，停止消费。
     /// Task finished, stop consuming.
     Finish,
@@ -173,12 +173,18 @@ pub fn route_event(event: &AgentEvent, format: OutputFormat, auto_yes: bool) -> 
             }
         }
 
-        // HITL 提示——管道在 responder 响应前阻塞。返回 RespondHitl(auto_yes)，
-        // 异步循环负责实际发送响应；拒绝时打印 stderr 提示。
-        // HITL prompt — the pipeline blocks until the responder fires. Returns
-        // RespondHitl(auto_yes); the async loop sends the response and prints a
-        // stderr note when denying.
-        AgentEvent::HitlPrompt { .. } => Sink::RespondHitl(auto_yes),
+        // HITL 提示——管道在 responder 响应前阻塞。--yes 映射为 Allow（非 Always：
+        // 无头模式不持久化授权目录），否则 Deny。
+        // HITL prompt — the pipeline blocks until the responder fires. --yes maps
+        // to Allow (not Always: headless mode does not persist authorized dirs);
+        // otherwise Deny.
+        AgentEvent::HitlPrompt { .. } => {
+            if auto_yes {
+                Sink::RespondHitl(HitlDecision::Allow)
+            } else {
+                Sink::RespondHitl(HitlDecision::Deny)
+            }
+        }
 
         AgentEvent::Error(text) => {
             if format == OutputFormat::Text {
@@ -297,14 +303,13 @@ pub async fn run_headless(
             Sink::Stderr(s) => {
                 eprintln!("{s}");
             }
-            Sink::RespondHitl(approve) => {
-                // 每个 HitlPrompt 必须收到恰好一次响应，否则管道死锁。
-                // Every HitlPrompt MUST receive exactly one response, or the pipeline deadlocks.
+            Sink::RespondHitl(decision) => {
+                // Every HitlPrompt MUST receive exactly one response or the pipeline deadlocks.
                 if let AgentEvent::HitlPrompt { tool, responder, .. } = event {
-                    if !approve {
+                    if decision == HitlDecision::Deny {
                         eprintln!("[hitl] auto-denied: {tool} (use --yes to approve)");
                     }
-                    let _ = responder.send(approve);
+                    let _ = responder.send(decision);
                 }
             }
             Sink::Finish => break,
@@ -590,31 +595,32 @@ mod tests {
     // ── route_event: HitlPrompt ─────────────────────────────────────────────
 
     #[test]
-    fn route_hitl_prompt_auto_yes_true_responds_true() {
+    fn route_hitl_prompt_auto_yes_true_responds_allow() {
         // Given: a HitlPrompt event and auto_yes=true.
         // When: route_event.
-        // Then: Sink::RespondHitl(true) — the async loop sends the approval.
+        // Then: Sink::RespondHitl(Allow) — the async loop sends the approval.
         let (tx, _rx) = oneshot::channel();
         let event = AgentEvent::HitlPrompt {
             tool: "run_bash".to_string(),
             desc: "rm -rf /tmp".to_string(),
             responder: tx,
+            allow_always: false,
         };
         assert_eq!(
             route_event(&event, OutputFormat::Text, true),
-            Sink::RespondHitl(true)
+            Sink::RespondHitl(HitlDecision::Allow)
         );
         assert_eq!(
             route_event(&event, OutputFormat::Json, true),
-            Sink::RespondHitl(true)
+            Sink::RespondHitl(HitlDecision::Allow)
         );
     }
 
     #[test]
-    fn route_hitl_prompt_auto_yes_false_responds_false() {
+    fn route_hitl_prompt_auto_yes_false_responds_deny() {
         // Given: a HitlPrompt event and auto_yes=false.
         // When: route_event.
-        // Then: Sink::RespondHitl(false) — the async loop sends the denial and
+        // Then: Sink::RespondHitl(Deny) — the async loop sends the denial and
         //   prints a stderr note. The routing decision is the same for text and json
         //   (HITL must always be answered regardless of output format).
         let (tx, _rx) = oneshot::channel();
@@ -622,14 +628,15 @@ mod tests {
             tool: "edit_file".to_string(),
             desc: "modifying src/main.rs".to_string(),
             responder: tx,
+            allow_always: false,
         };
         assert_eq!(
             route_event(&event, OutputFormat::Text, false),
-            Sink::RespondHitl(false)
+            Sink::RespondHitl(HitlDecision::Deny)
         );
         assert_eq!(
             route_event(&event, OutputFormat::Json, false),
-            Sink::RespondHitl(false)
+            Sink::RespondHitl(HitlDecision::Deny)
         );
     }
 

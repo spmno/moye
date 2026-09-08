@@ -6,7 +6,7 @@
 use std::sync::OnceLock;
 
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
@@ -53,7 +53,7 @@ pub fn render_markdown(text: &str) -> Text<'static> {
             }
             Event::Start(Tag::BlockQuote(_)) => {
                 style_stack.push(current_style);
-                current_style = current_style.patch(theme::info());
+                current_style = current_style.patch(theme::meta_info());
             }
             Event::Start(Tag::Emphasis) => {
                 style_stack.push(current_style);
@@ -163,7 +163,7 @@ pub fn render_markdown(text: &str) -> Text<'static> {
 ///
 /// - 语法集/主题集通过 `OnceLock` 全局只加载一次（纯 Rust `fancy-regex` 后端）。
 /// - 未知语言回退到 `find_syntax_plain_text()`，绝不 panic。
-/// - 仅取每个 token 的**前景色**映射为 `Color::Rgb`；绝不设背景色（避免与终端背景冲突）。
+/// - 仅取每个 token 的**前景色**映射为 RGB；绝不设背景色（避免与终端背景冲突）。
 /// - 每个输出行仍以 `theme::code_block()` 作为**行级样式**——这是 `wrap.rs:is_code_line`
 ///   识别代码行、给予硬断+缩进保留换行的契约，per-span RGB 样式叠加其上，颜色仍生效。
 /// - 保留两空格左缩进（首 span 为 `Span::raw("  ")`）。
@@ -173,7 +173,7 @@ pub fn render_markdown(text: &str) -> Text<'static> {
 ///
 /// - Syntax/theme sets load once via `OnceLock` (pure-Rust `fancy-regex` backend).
 /// - Unknown languages fall back to `find_syntax_plain_text()`, never panic.
-/// - Only each token's **foreground** is mapped to `Color::Rgb`; never sets a
+/// - Only each token's **foreground** is mapped to an RGB value; never sets a
 ///   background (would clash with the user's terminal background).
 /// - Each output line still carries `theme::code_block()` as its **line-level style** —
 ///   this is the contract `wrap.rs:is_code_line` uses to detect code lines and give them
@@ -209,7 +209,7 @@ fn highlight_code_block(code: &str, lang: &str) -> Vec<Line<'static>> {
                     if t.is_empty() {
                         continue;
                     }
-                    let color = Color::Rgb(syn_st.foreground.r, syn_st.foreground.g, syn_st.foreground.b);
+                    let color = theme::syntax_color(syn_st.foreground.r, syn_st.foreground.g, syn_st.foreground.b);
                     let mut span_style = Style::new().fg(color);
                     // 字体加粗映射（可选但琐碎）：syntect BOLD → ratatui BOLD。
                     // Map bold if trivial: syntect BOLD → ratatui BOLD.
@@ -328,7 +328,7 @@ mod tests {
         for l in &lines {
             assert_eq!(l.style, theme::code_block());
             for s in &l.spans {
-                if let Some(Color::Rgb(..)) = s.style.fg {
+                if theme::is_rgb_fg(s.style) {
                     panic!(
                         "no-tag block must stay monochrome (no RGB), found fg: {:?}",
                         s.style.fg

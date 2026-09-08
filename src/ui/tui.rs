@@ -894,7 +894,7 @@ fn render_event(event: &AgentEvent, expand: bool) -> Vec<Line<'static>> {
         AgentEvent::User(text) => {
             let content: Vec<Line<'static>> = text
                 .split('\n')
-                .map(|line| Line::styled(line.to_string(), theme::msg_text()))
+                .map(|line| Line::styled(line.to_string(), theme::message_content()))
                 .collect();
             let mut v = bordered(content, theme::border_user());
             v.push(Line::default());
@@ -969,7 +969,7 @@ fn render_event(event: &AgentEvent, expand: bool) -> Vec<Line<'static>> {
                     format!(
                         "  \u{22ef} (\u{5df2}\u{622a}\u{65ad} {n} \u{884c} \u{00b7} Ctrl+E \u{5c55}\u{5f00} / truncated \u{00b7} Ctrl+E to expand)"
                     ),
-                    theme::info(),
+                    theme::meta_info(),
                 ));
             }
             let mut v = bordered(content, theme::border_tool());
@@ -980,9 +980,9 @@ fn render_event(event: &AgentEvent, expand: bool) -> Vec<Line<'static>> {
             let mut v = vec![
                 Line::styled(
                     format!("\u{8f6e}\u{6b21} {turn} \u{5b8c}\u{6210}"),
-                    theme::usage(),
+                    theme::meta_info(),
                 ),
-                Line::styled(format!("  {usage}"), theme::usage()),
+                Line::styled(format!("  {usage}"), theme::meta_info()),
             ];
             v.push(Line::default());
             v
@@ -998,7 +998,7 @@ fn render_event(event: &AgentEvent, expand: bool) -> Vec<Line<'static>> {
             } else {
                 let mut v: Vec<Line<'static>> = text
                     .split('\n')
-                    .map(|line| Line::styled(line.to_owned(), theme::info()))
+                    .map(|line| Line::styled(line.to_owned(), theme::meta_info()))
                     .collect();
                 v.push(Line::default());
                 v
@@ -1018,9 +1018,9 @@ fn render_event(event: &AgentEvent, expand: bool) -> Vec<Line<'static>> {
         AgentEvent::Reasoning(text) => {
             let line_count = text.lines().count();
             if expand {
-                let mut content: Vec<Line<'static>> = vec![Line::styled(
+                let mut content: Vec<Line<'static>> = vec![                Line::styled(
                     "\u{1f4ad} \u{601d}\u{8003}\u{8fc7}\u{7a0b} / Reasoning:",
-                    theme::info(),
+                    theme::meta_info(),
                 )];
                 for line in text.split('\n') {
                     content.push(Line::styled(line.to_string(), theme::streaming()));
@@ -1033,7 +1033,7 @@ fn render_event(event: &AgentEvent, expand: bool) -> Vec<Line<'static>> {
                     format!(
                         "\u{1f4ad} \u{601d}\u{8003}\u{8fc7}\u{7a0b} ({line_count} \u{884c} \u{00b7} Ctrl+E \u{5c55}\u{5f00} / reasoning \u{00b7} Ctrl+E to expand)"
                     ),
-                    theme::info(),
+                    theme::meta_info(),
                 )];
                 let mut v = bordered(content, theme::border_tool());
                 v.push(Line::default());
@@ -2630,7 +2630,16 @@ fn draw(f: &mut Frame, state: &mut TuiState) {
     // 消息区与侧栏之间的黑色分隔带（1 格宽纯背景列，无线条字符）。
     // Black separator band between messages and sidebar (1-cell pure
     // background column, no line glyph).
-    f.render_widget(Block::default().style(theme::bg_darker()), h_chunks[1]);
+    f.render_widget(Block::default().style(theme::divider_bg()), h_chunks[1]);
+
+    // 在主区域预填充 base bg，使透明的输入框/流式区本体坐落于 base 层上。
+    // 输入框 Block 仅保留左侧粗色条，本体无 bg style（spec: 本体透明）。
+    //
+    // Pre-fill the main column with base bg so the transparent
+    // input/streaming body sits on the base tier. The input Block keeps
+    // only the thick left color bar; its body carries no bg style (spec:
+    // transparent body).
+    f.render_widget(Block::default().style(theme::bg_base()), h_chunks[0]);
 
     let display = state.input.display_text();
     let input_lines = estimate_input_lines(&display, h_chunks[0].width.saturating_sub(3));
@@ -2890,8 +2899,10 @@ fn draw_streaming(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let streaming = Paragraph::new(content)
         .style(theme::streaming())
         .block(
+            // 本体透明：无 bg style，坐落于 draw() 预填充的 base bg 上。
+            // Body transparent: no bg style, sits on the base-bg
+            // pre-fill in draw() (spec: input + streaming transparent).
             Block::default()
-                .style(theme::bg_panel())
                 .padding(Padding::horizontal(1)),
         )
         .wrap(Wrap { trim: false });
@@ -2919,7 +2930,6 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
                     .borders(Borders::LEFT)
                     .border_type(BorderType::Thick)
                     .border_style(theme::border_user())
-                    .style(theme::bg_panel())
                     .padding(Padding::horizontal(1)),
             );
         f.render_widget(input, area);
@@ -2951,11 +2961,13 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
         .wrap(Wrap { trim: false })
         .scroll((state.input_scroll, 0))
         .block(
+            // 本体透明：无 bg style，仅保留左侧粗色条。
+            // Body transparent: no bg style, only the thick left color bar
+            // (spec: input body transparent on base tier).
             Block::default()
                 .borders(Borders::LEFT)
                 .border_type(BorderType::Thick)
                 .border_style(theme::border_user())
-                .style(theme::bg_panel())
                 .padding(Padding::horizontal(1)),
         );
 
@@ -3050,8 +3062,8 @@ fn todo_lines(todos: &[TodoItem], width: u16) -> Vec<Line<'static>> {
         .map(|t| {
             let (marker, style) = match t.status {
                 TodoStatus::InProgress => ("\u{25b6}", theme::status_thinking()),
-                TodoStatus::Pending => ("\u{25cb}", theme::info()),
-                TodoStatus::Completed => ("\u{2713}", theme::status_ready()),
+                TodoStatus::Pending => ("\u{25cb}", theme::meta_info()),
+                TodoStatus::Completed => ("\u{2713}", theme::status_ok()),
             };
             let prefix = format!(" {marker} ");
             let avail = w.saturating_sub(prefix.chars().count());
@@ -3075,58 +3087,63 @@ fn todo_lines(todos: &[TodoItem], width: u16) -> Vec<Line<'static>> {
 
 fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
     let block = Block::default()
-        .style(theme::bg_panel())
+        .style(theme::sidebar_bg())
         .padding(Padding::horizontal(1));
 
     let mut lines: Vec<Line> = Vec::new();
 
-    lines.push(Line::styled("CWD", theme::status_dim()));
+    // CWD
+    lines.push(Line::styled("CWD", theme::sidebar_title()));
     lines.push(Line::styled(
         format!(" {}", format_workdir(area.width.saturating_sub(5) as usize)),
-        theme::status_model(),
+        theme::meta_info(),
     ));
     lines.push(Line::default());
 
-    lines.push(Line::styled("Provider", theme::status_dim()));
+    // Provider
+    lines.push(Line::styled("Provider", theme::sidebar_title()));
     lines.push(Line::styled(
         format!(" {}", state.provider),
-        theme::status_model(),
+        theme::meta_info(),
     ));
     let plan = crate::providers::current_plan();
     if plan != crate::providers::ApiPlan::Standard {
         lines.push(Line::styled(
-            format!("  ↳ {}", plan.label()),
-            theme::status_dim(),
+            format!("  \u{21b3} {}", plan.label()),
+            theme::meta_info(),
         ));
     }
     lines.push(Line::default());
 
-    lines.push(Line::styled("Model", theme::status_dim()));
+    // Model
+    lines.push(Line::styled("Model", theme::sidebar_title()));
     lines.push(Line::styled(
         format!(" {}", state.model),
-        theme::status_model(),
+        theme::meta_info(),
     ));
     lines.push(Line::default());
 
-    lines.push(Line::styled("Context", theme::status_dim()));
+    // Context
+    lines.push(Line::styled("Context", theme::sidebar_title()));
     lines.push(Line::styled(
         format!(" {} tok", state.total_tokens),
-        theme::status_usage(),
+        theme::meta_info(),
     ));
     if !state.last_usage.is_empty() {
         lines.push(Line::styled(
             format!(" {}", state.last_usage),
-            theme::status_dim(),
+            theme::meta_info(),
         ));
     }
     lines.push(Line::default());
 
-    lines.push(Line::styled("Progress", theme::status_dim()));
+    // Progress
+    lines.push(Line::styled("Progress", theme::sidebar_title()));
     let bar_w = 15usize;
     let max = state.max_turns.max(1);
     // Use floating-point division with rounding so the bar fills proportionally.
     // Integer division (bar_w * current_turn / max) truncates and causes the
-    // bar to under-fill, especially in the mid-range (e.g. turn 3/25 → 0 blocks).
+    // bar to under-fill, especially in the mid-range (e.g. turn 3/25 -> 0 blocks).
     // 浮点除法 + 四舍五入，使进度条按比例填充。
     // 整数除法会截断，导致中间段进度条不满（如 3/25 → 0 格）。
     let filled = (bar_w as f64 * state.current_turn as f64 / max as f64).round() as usize;
@@ -3134,7 +3151,7 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
     let bar: String = "\u{2588}".repeat(filled) + &"\u{2591}".repeat(bar_w - filled);
     lines.push(Line::styled(
         format!("[{bar}] {}/{}", state.current_turn, state.max_turns),
-        theme::status_turn(),
+        theme::meta_info(),
     ));
 
     let (status_text, status_style) = if state.hitl.is_some() {
@@ -3143,13 +3160,14 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
         let sp = SPINNER_FRAMES[state.spinner];
         (format!("{sp} thinking"), theme::status_thinking())
     } else {
-        ("\u{2713} ready".to_string(), theme::status_ready())
+        ("\u{2713} ready".to_string(), theme::status_ok())
     };
     lines.push(Line::styled(status_text, status_style));
     lines.push(Line::default());
 
+    // Todos (keep as a group with the same title/content rules)
     if !state.todos.is_empty() {
-        lines.push(Line::styled("Todos", theme::status_dim()));
+        lines.push(Line::styled("Todos", theme::sidebar_title()));
         let content_w = area.width.saturating_sub(4);
         for line in todo_lines(&state.todos, content_w) {
             lines.push(line);
@@ -3157,15 +3175,20 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
         lines.push(Line::default());
     }
 
+    // Tools
     lines.push(Line::styled(
         format!("Tools ({})", state.tool_names.len()),
-        theme::status_dim(),
+        theme::sidebar_title(),
     ));
     for name in &state.tool_names {
-        lines.push(Line::raw(format!(" \u{2022} {name}")));
+        lines.push(Line::styled(
+            format!(" \u{2022} {name}"),
+            theme::tool_item(),
+        ));
     }
     lines.push(Line::default());
 
+    // MCP Servers
     if !state.mcp_servers.is_empty() {
         let connected = state.mcp_servers.iter().filter(|s| s.connected).count();
         let total_tools: usize = state.mcp_servers.iter().map(|s| s.tool_names.len()).sum();
@@ -3174,7 +3197,7 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
                 "MCP ({connected}/{} servers, {total_tools} tools)",
                 state.mcp_servers.len()
             ),
-            theme::status_dim(),
+            theme::sidebar_title(),
         ));
         for server in &state.mcp_servers {
             if server.connected {
@@ -3184,15 +3207,18 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
                         server.name,
                         server.tool_names.len()
                     ),
-                    theme::mcp_connected(),
+                    theme::status_ok(),
                 ));
                 for tn in &server.tool_names {
-                    lines.push(Line::styled(format!("   \u{2022} {tn}"), theme::mcp_tool()));
+                    lines.push(Line::styled(
+                        format!("   \u{2022} {tn}"),
+                        theme::tool_item(),
+                    ));
                 }
             } else {
                 lines.push(Line::styled(
                     format!(" \u{2717} {}", server.name),
-                    theme::mcp_failed(),
+                    theme::status_error(),
                 ));
                 if let Some(ref err) = server.error {
                     let truncated = if err.len() > 40 {
@@ -3200,20 +3226,24 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
                     } else {
                         format!("   {err}")
                     };
-                    lines.push(Line::styled(truncated, theme::mcp_error_detail()));
+                    lines.push(Line::styled(truncated, theme::meta_info()));
                 }
             }
         }
         lines.push(Line::default());
     }
 
+    // Skills
     if !state.skill_names.is_empty() {
         lines.push(Line::styled(
             format!("Skills ({})", state.skill_names.len()),
-            theme::status_dim(),
+            theme::sidebar_title(),
         ));
         for name in &state.skill_names {
-            lines.push(Line::raw(format!(" \u{2022} {name}")));
+            lines.push(Line::styled(
+                format!(" \u{2022} {name}"),
+                theme::tool_item(),
+            ));
         }
         lines.push(Line::default());
     }
@@ -3841,9 +3871,8 @@ mod tests {
 
     #[test]
     fn highlight_matches_patches_only_matched_keeps_fg() {
-        use ratatui::style::{Color, Style};
-        let red = Style::new().fg(Color::Red);
-        let blue = Style::new().fg(Color::Blue);
+        let red = theme::tool_result_err();
+        let blue = theme::border_user();
         let lines = vec![
             Line::from(vec![Span::styled("aaa".to_string(), red)]),
             Line::from(vec![Span::styled("bbb".to_string(), blue)]),
@@ -3851,11 +3880,11 @@ mod tests {
         ];
         let out = highlight_matches(lines, &[0, 1], Some(0));
         // 当前行（idx 0）：bg=Yellow，fg 仍为 Red
-        assert_eq!(out[0].spans[0].style.fg, Some(Color::Red));
-        assert_eq!(out[0].spans[0].style.bg, Some(Color::Yellow));
+        assert_eq!(out[0].spans[0].style.fg, theme::tool_result_err().fg);
+        assert_eq!(out[0].spans[0].style.bg, theme::search_current().bg);
         // 其它匹配行（idx 1）：bg=DarkGray，fg 仍为 Blue
-        assert_eq!(out[1].spans[0].style.fg, Some(Color::Blue));
-        assert_eq!(out[1].spans[0].style.bg, Some(Color::DarkGray));
+        assert_eq!(out[1].spans[0].style.fg, theme::border_user().fg);
+        assert_eq!(out[1].spans[0].style.bg, theme::search_match().bg);
         // 未匹配行（idx 2）：原样，无 bg
         assert_eq!(out[2].spans[0].style.fg, None);
         assert_eq!(out[2].spans[0].style.bg, None);
@@ -4163,7 +4192,7 @@ mod tests {
         assert!(text1.contains('\u{25cb}'), "pending marker ○: {text1}");
         assert_eq!(
             lines[1].spans[0].style.fg,
-            theme::info().fg,
+            theme::meta_info().fg,
             "pending should be DarkGray"
         );
 
@@ -4172,7 +4201,7 @@ mod tests {
         assert!(text2.contains('\u{2713}'), "completed marker ✓: {text2}");
         assert_eq!(
             lines[2].spans[0].style.fg,
-            theme::status_ready().fg,
+            theme::status_ok().fg,
             "completed should be Green"
         );
     }
@@ -4258,8 +4287,8 @@ mod tests {
 
     #[test]
     fn bordered_preserves_existing_spans() {
-        let s1 = Style::new().fg(ratatui::style::Color::Red);
-        let s2 = Style::new().fg(ratatui::style::Color::Blue);
+        let s1 = theme::tool_result_err();
+        let s2 = theme::border_user();
         let lines = vec![Line::from(vec![
             Span::styled("a".to_string(), s1),
             Span::styled("b".to_string(), s2),
@@ -4570,7 +4599,7 @@ mod tests {
         // 续行的边框 span 从第一行拷贝完整样式（含搜索 bg）——一致的 patch。
         // 结果：边框区与内容区在搜索高亮下颜色一致。
         let border = theme::border_user();
-        let content_style = theme::msg_text();
+        let content_style = theme::message_content();
         let lines = vec![
             Line {
                 spans: vec![
@@ -4598,12 +4627,12 @@ mod tests {
         );
         assert_eq!(
             out[0].spans[0].style.bg,
-            Some(ratatui::style::Color::Yellow),
+            theme::search_current().bg,
             "first line border IS search-patched (current match = Yellow)"
         );
         assert_eq!(
             out[1].spans[0].style.bg,
-            Some(ratatui::style::Color::Yellow),
+            theme::search_current().bg,
             "continuation border copies the same style (consistent patching)"
         );
     }

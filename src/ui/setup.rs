@@ -13,7 +13,7 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::Modifier,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
@@ -21,6 +21,7 @@ use ratatui::{
 use crate::config;
 use crate::providers::{ApiPlan, Provider, provider_models_for_plan};
 use crate::ui::selector::{SelectorItem, SelectorState};
+use crate::ui::theme;
 
 /// 供应商目录条目。setup 向导与 TUI 内 `/models` 供应商级切换共用此目录。
 /// Provider catalog entry. Shared by the setup wizard and the TUI `/models`
@@ -479,12 +480,12 @@ fn draw(f: &mut Frame, state: &mut SetupState) {
             vec![
                 Line::from(Span::styled(
                     "Enter your OpenAI-compatible API base URL:",
-                    Style::default().fg(Color::Gray),
+                    theme::selector_normal(),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
                     "e.g. https://api.openai.com/v1",
-                    Style::default().fg(Color::DarkGray),
+                    theme::selector_dim(),
                 )),
                 Line::from(""),
                 input_line(&state.input, state.cursor, "base_url> "),
@@ -495,12 +496,12 @@ fn draw(f: &mut Frame, state: &mut SetupState) {
             vec![
                 Line::from(Span::styled(
                     "Enter the model ID to use:",
-                    Style::default().fg(Color::Gray),
+                    theme::selector_normal(),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
                     "e.g. gpt-4o, claude-sonnet-4-6, glm-5.2",
-                    Style::default().fg(Color::DarkGray),
+                    theme::selector_dim(),
                 )),
                 Line::from(""),
                 input_line(&state.input, state.cursor, "model> "),
@@ -522,12 +523,12 @@ fn draw(f: &mut Frame, state: &mut SetupState) {
                 vec![
                     Line::from(Span::styled(
                         format!("Enter your API key ({env_var}):"),
-                        Style::default().fg(Color::Gray),
+                        theme::selector_normal(),
                     )),
                     Line::from(""),
                     Line::from(Span::styled(
                         "The key will be stored in .env (git-ignored).",
-                        Style::default().fg(Color::DarkGray),
+                        theme::selector_dim(),
                     )),
                     Line::from(""),
                     input_line(&state.input, state.cursor, "key> "),
@@ -541,8 +542,8 @@ fn draw(f: &mut Frame, state: &mut SetupState) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" moye Setup · {title} "))
-        .border_style(Style::default().fg(Color::Cyan));
+        .title(format!(" moye Setup \u{00b7} {title} "))
+        .border_style(theme::selector_title());
     let para = Paragraph::new(lines).block(block);
     f.render_widget(para, area);
 }
@@ -550,25 +551,22 @@ fn draw(f: &mut Frame, state: &mut SetupState) {
 fn draw_selector(f: &mut Frame, area: Rect, sel: &SelectorState) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" moye Setup · {} ", sel.title()))
-        .border_style(Style::default().fg(Color::Cyan));
+        .title(format!(" moye Setup \u{00b7} {} ", sel.title()))
+        .border_style(theme::selector_title());
 
     let visible = sel.visible();
     let mut lines: Vec<Line> = Vec::new();
     for (i, item) in visible.iter().enumerate() {
         let is_cursor = i == sel.cursor();
         let style = if is_cursor {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            theme::selector_highlight()
         } else {
-            Style::default().fg(Color::White)
+            theme::selector_normal()
         };
         let detail_style = if is_cursor {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
+            theme::selector_highlight()
         } else {
-            Style::default().fg(Color::DarkGray)
+            theme::selector_dim()
         };
         lines.push(Line::from(vec![
             Span::styled(format!("  {} ", if is_cursor { ">" } else { " " }), style),
@@ -583,7 +581,7 @@ fn draw_selector(f: &mut Frame, area: Rect, sel: &SelectorState) {
             "  {}  | \u{2191}\u{2193} navigate, Enter select",
             sel.filter()
         ),
-        Style::default().fg(Color::DarkGray),
+        theme::selector_dim(),
     )));
 
     let para = Paragraph::new(lines).block(block);
@@ -591,13 +589,12 @@ fn draw_selector(f: &mut Frame, area: Rect, sel: &SelectorState) {
 }
 
 fn input_line<'a>(input: &'a str, cursor: usize, prompt: &'a str) -> Line<'a> {
-    let mut spans = vec![Span::styled(prompt, Style::default().fg(Color::Yellow))];
+    let mut spans = vec![Span::styled(prompt, theme::selector_input())];
     spans.push(Span::raw(input));
     if cursor == input.len() {
         spans.push(Span::styled(
             "_",
-            Style::default()
-                .fg(Color::Gray)
+            theme::selector_normal()
                 .add_modifier(Modifier::SLOW_BLINK),
         ));
     }

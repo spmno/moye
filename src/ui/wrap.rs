@@ -283,8 +283,9 @@ pub(crate) fn wrap_lines(lines: &[Line<'static>], width: u16) -> Vec<Line<'stati
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::style::{Color, Style};
     use ratatui::text::{Line, Span};
+
+    use crate::ui::theme;
 
     fn widths(lines: &[Line<'static>]) -> Vec<usize> {
         lines
@@ -353,7 +354,7 @@ mod tests {
 
     #[test]
     fn preserves_line_level_style() {
-        let sty = Style::new().fg(Color::Red);
+        let sty = theme::tool_result_err();
         let line = Line::styled("hello world foo", sty);
         let out = wrap_line(&line, 6);
         assert!(out.len() > 1);
@@ -365,8 +366,8 @@ mod tests {
 
     #[test]
     fn preserves_span_styles() {
-        let s1 = Style::new().fg(Color::Red);
-        let s2 = Style::new().fg(Color::Blue);
+        let s1 = theme::tool_result_err();
+        let s2 = theme::border_user();
         let line = Line::from(vec![
             Span::styled("aaaaa", s1),
             Span::styled("bbbbb", s2),

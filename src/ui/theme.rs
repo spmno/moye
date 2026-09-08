@@ -4,28 +4,35 @@ use ratatui::style::{Color, Modifier, Style};
 
 // ===== OpenCode 风格调色板（dark）=====
 // ===== OpenCode-style palette (dark) =====
-// bg 层级: base #212121, panel #252525, darker #121212
+// bg 层级（3-tier，由亮到暗）:
+//   base    #212121  消息区背景（最亮）
+//   sidebar #1a1a1a  侧边栏背景（比 base 暗一档）
+//   divider #121212  1 格分隔列背景（最暗）
+// bg tier (3-tier, lightest → darkest):
+//   base    #212121  message area background (lightest)
+//   sidebar #1a1a1a  sidebar background (one notch darker than base)
+//   divider #121212  1-cell separator column background (darkest)
 // accents: primary(orange) #fab283, secondary(blue) #5c9cf5, accent(purple) #9d7cd8,
 //          error #e06c75, warning #f5a742, success #7fd88f, info(cyan) #56b6c2,
 //          muted text #6a6a6a, text #e0e0e0
 // diff tints: added bg #303A30, removed bg #3A3030
 
-/// 消息区基础背景（base tier）。
-/// Message area base background (base tier).
+/// 消息区基础背景（base tier，最亮）。
+/// Message area base background (base tier, lightest).
 pub fn bg_base() -> Style {
     Style::new().bg(Color::Rgb(0x21, 0x21, 0x21))
 }
 
-/// 侧边栏 / 输入框背景（panel tier，比 base 略亮）。
-/// Sidebar / input background (panel tier, slightly lighter than base).
-pub fn bg_panel() -> Style {
-    Style::new().bg(Color::Rgb(0x25, 0x25, 0x25))
+/// 侧边栏背景（sidebar tier，比 base 暗一档 #1a1a1a）。
+/// Sidebar background (sidebar tier, one notch darker than base #1a1a1a).
+pub fn sidebar_bg() -> Style {
+    Style::new().bg(Color::Rgb(0x1a, 0x1a, 0x1a))
 }
 
-/// 区域分隔带背景（darker tier，纯背景列、非线条字符）。
-/// Region separator band background (darker tier — a pure background
-/// column, not a line glyph).
-pub fn bg_darker() -> Style {
+/// 区域分隔带背景（divider tier，纯背景列、非线条字符，最暗 #121212）。
+/// Region separator band background (divider tier — a pure background
+/// column, not a line glyph; darkest tier #121212).
+pub fn divider_bg() -> Style {
     Style::new().bg(Color::Rgb(0x12, 0x12, 0x12))
 }
 
@@ -47,10 +54,10 @@ pub fn border_tool() -> Style {
     Style::new().fg(Color::Rgb(0x6a, 0x6a, 0x6a))
 }
 
-/// 消息正文文字色（muted gray）。
-/// Message body text color (muted gray).
-pub fn msg_text() -> Style {
-    Style::new().fg(Color::Rgb(0x6a, 0x6a, 0x6a))
+/// 消息正文文字色（default fg #e0e0e0）。
+/// Message body text color (default fg #e0e0e0).
+pub fn message_content() -> Style {
+    Style::new().fg(Color::Rgb(0xe0, 0xe0, 0xe0))
 }
 
 /// SDD 阶段色：调查者 cyan、规划者 purple、构建者 orange、审计者 green、验证者 blue。
@@ -107,20 +114,32 @@ pub fn error() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-pub fn info() -> Style {
-    Style::new().fg(Color::DarkGray)
+/// 元信息文字色（dimmed #6a6a6a）：回合计数、token/用量行、CWD 路径、
+/// 时间戳、git 信息、版本字符串、截断提示、diff 上下文行。
+///
+/// Meta-info text color (dimmed #6a6a6a): turn counters, token/usage
+/// lines, CWD path, timestamps, git info, version strings, truncation
+/// hints, diff context lines.
+pub fn meta_info() -> Style {
+    Style::new().fg(Color::Rgb(0x6a, 0x6a, 0x6a))
 }
 
+/// 系统消息色（blue fg）。
+/// System message color (blue fg).
 pub fn system() -> Style {
     Style::new().fg(Color::Blue)
 }
 
+/// 输入提示色（LightCyan + BOLD）。
+/// Input prompt color (LightCyan + BOLD).
 pub fn input_prompt() -> Style {
     Style::new()
         .fg(Color::LightCyan)
         .add_modifier(Modifier::BOLD)
 }
 
+/// 流式输出色（gray fg）。
+/// Streaming output color (gray fg).
 pub fn streaming() -> Style {
     Style::new().fg(Color::Gray)
 }
@@ -173,39 +192,39 @@ pub fn strong() -> Style {
     Style::new().add_modifier(Modifier::BOLD)
 }
 
-pub fn usage() -> Style {
-    Style::new().fg(Color::DarkGray)
+// ===== 侧边栏样式 =====
+// ===== Sidebar styles =====
+
+/// 侧边栏分组标题样式（muted fg + BOLD，轻微加粗无色彩噪音）。
+/// Sidebar group section title style (muted fg + BOLD; slight bold,
+/// no color noise).
+pub fn sidebar_title() -> Style {
+    Style::new()
+        .fg(Color::Rgb(0x6a, 0x6a, 0x6a))
+        .add_modifier(Modifier::BOLD)
 }
 
-// ===== 状态栏样式 =====
-// ===== Status bar styles =====
-
-pub fn status_model() -> Style {
-    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+/// 侧边栏列表项样式（dimmed #6a6a6a，用于工具名、MCP 服务名、技能名）。
+/// Sidebar list-item style (dimmed #6a6a6a, for tool names, MCP server
+/// names, skill names).
+pub fn tool_item() -> Style {
+    Style::new().fg(Color::Rgb(0x6a, 0x6a, 0x6a))
 }
 
-pub fn status_dim() -> Style {
-    Style::new().fg(Color::Gray)
-}
-
-pub fn status_turn() -> Style {
-    Style::new().fg(Color::Yellow)
-}
-
-pub fn status_usage() -> Style {
+/// 就绪/成功状态色（green）。
+/// Ready/success status color (green).
+pub fn status_ok() -> Style {
     Style::new().fg(Color::Green)
 }
 
-pub fn status_scroll() -> Style {
-    Style::new().fg(Color::LightBlue)
+/// 错误状态色（error red #e06c75）。
+/// Error status color (error red #e06c75).
+pub fn status_error() -> Style {
+    Style::new().fg(Color::Rgb(0xe0, 0x6c, 0x75))
 }
 
 pub fn status_thinking() -> Style {
     Style::new().fg(Color::LightYellow)
-}
-
-pub fn status_ready() -> Style {
-    Style::new().fg(Color::Green)
 }
 
 pub fn status_hitl() -> Style {
@@ -214,20 +233,8 @@ pub fn status_hitl() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-pub fn mcp_connected() -> Style {
-    Style::new().fg(Color::Green)
-}
-
-pub fn mcp_failed() -> Style {
-    Style::new().fg(Color::LightRed)
-}
-
-pub fn mcp_tool() -> Style {
-    Style::new().fg(Color::DarkGray)
-}
-
-pub fn mcp_error_detail() -> Style {
-    Style::new().fg(Color::DarkGray)
+pub fn status_scroll() -> Style {
+    Style::new().fg(Color::LightBlue)
 }
 
 // ===== 选择器样式 =====
@@ -275,4 +282,89 @@ pub fn search_current() -> Style {
 /// Other-match line highlight (dark-gray background).
 pub fn search_match() -> Style {
     Style::new().bg(Color::DarkGray)
+}
+
+// ===== syntect 胶水辅助 =====
+// ===== syntect glue helpers =====
+
+/// 从 syntect 高亮输出构造 RGB 颜色（避免在 markdown.rs 中直接引用 Color）。
+/// Construct an RGB color from syntect highlighting output
+/// (avoids a direct Color reference in markdown.rs).
+pub fn syntax_color(r: u8, g: u8, b: u8) -> Color {
+    Color::Rgb(r, g, b)
+}
+
+/// 检查样式的 fg 是否为 RGB 颜色（用于区分 syntect 着色与单色路径）。
+/// Check if a style's fg is an RGB color (used to distinguish syntect
+/// coloring from the monochrome path).
+#[cfg(test)]
+pub fn is_rgb_fg(style: Style) -> bool {
+    matches!(style.fg, Some(Color::Rgb(..)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 侧边栏背景 #1a1a1a 必须比消息区背景 #212121 更暗。
+    /// Sidebar bg #1a1a1a must be darker than base bg #212121.
+    #[test]
+    fn sidebar_bg_is_darker_than_base() {
+        let base_bg = bg_base().bg.expect("bg_base must have bg");
+        let side_bg = sidebar_bg().bg.expect("sidebar_bg must have bg");
+        match (base_bg, side_bg) {
+            (Color::Rgb(br, bg, bb), Color::Rgb(sr, sg, sb)) => {
+                assert!(sr < br, "sidebar R {sr:#x} must be < base R {br:#x}");
+                assert!(sg < bg, "sidebar G {sg:#x} must be < base G {bg:#x}");
+                assert!(sb < bb, "sidebar B {sb:#x} must be < base B {bb:#x}");
+            }
+            _ => panic!("both bg must be Color::Rgb"),
+        }
+    }
+
+    /// 分隔列背景 #121212 必须比侧边栏背景 #1a1a1a 更暗（3-tier 最暗）。
+    /// Divider bg #121212 must be darker than sidebar bg #1a1a1a
+    /// (darkest of the 3 tiers).
+    #[test]
+    fn divider_is_darkest_tier() {
+        let side_bg = sidebar_bg().bg.expect("sidebar_bg must have bg");
+        let div_bg = divider_bg().bg.expect("divider_bg must have bg");
+        match (side_bg, div_bg) {
+            (Color::Rgb(sr, sg, sb), Color::Rgb(dr, dg, db)) => {
+                assert!(dr < sr, "divider R {dr:#x} must be < sidebar R {sr:#x}");
+                assert!(dg < sg, "divider G {dg:#x} must be < sidebar G {sg:#x}");
+                assert!(db < sb, "divider B {db:#x} must be < sidebar B {sb:#x}");
+            }
+            _ => panic!("both bg must be Color::Rgb"),
+        }
+    }
+
+    /// 侧边栏标题样式必须带 BOLD 修饰符。
+    /// Sidebar title style must carry the BOLD modifier.
+    #[test]
+    fn sidebar_title_is_bold() {
+        let style = sidebar_title();
+        assert!(
+            style.add_modifier.contains(Modifier::BOLD),
+            "sidebar_title must be BOLD"
+        );
+    }
+
+    /// 输入框组件样式验证：border_user 不设 bg（本体透明），
+    /// bg_base 设 bg（作为透明输入框下方的 base 层）。
+    ///
+    /// Input block component check: border_user sets no bg
+    /// (transparent body), bg_base sets bg (the base tier underneath
+    /// the transparent input).
+    #[test]
+    fn input_block_components_have_no_bg() {
+        assert!(
+            border_user().bg.is_none(),
+            "border_user must not set bg (input body transparent)"
+        );
+        assert!(
+            bg_base().bg.is_some(),
+            "bg_base must set bg (base tier underneath transparent input)"
+        );
+    }
 }

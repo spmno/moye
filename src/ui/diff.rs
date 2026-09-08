@@ -3,7 +3,7 @@
 //!
 //! - 删除行红色（`theme::diff_del()`：error fg + bg #3A3030 红色着色）、
 //!   插入行绿色（`theme::diff_add()`：success fg + bg #303A30 绿色着色）、
-//!   上下文行暗灰（`theme::info()` fg + bg #212121）。
+//!   上下文行暗灰（`theme::meta_info()` fg + bg #212121）。
 //! - 不变行段折叠：每个变化前后最多保留 2 行上下文，多余折叠为单行标记。
 //! - 总行数上限 60，超出截断并追加标记行。
 //! - 内容行行级样式为 `theme::code_block()`（`wrap.rs:is_code_line` 契约），
@@ -14,7 +14,7 @@
 //!
 //! - Deletes are red (`theme::diff_del()`: error fg + bg #3A3030 red tint),
 //!   inserts green (`theme::diff_add()`: success fg + bg #303A30 green tint),
-//!   context lines dark-gray (`theme::info()` fg + bg #212121).
+//!   context lines dark-gray (`theme::meta_info()` fg + bg #212121).
 //! - Unchanged runs are collapsed: at most 2 context lines around each change;
 //!   longer middle runs collapse to a single marker line.
 //! - Total emitted lines capped at 60; overflow is truncated with a marker line.
@@ -78,7 +78,7 @@ pub fn unified_diff_lines(edit: &FileEdit, expand: bool) -> Vec<Line<'static>> {
             let line = match tag {
                 ChangeTag::Delete => content_line("-", val, theme::diff_del()),
                 ChangeTag::Insert => content_line("+", val, theme::diff_add()),
-                ChangeTag::Equal => content_line(" ", val, theme::info().patch(theme::diff_context_bg())),
+                ChangeTag::Equal => content_line(" ", val, theme::meta_info().patch(theme::diff_context_bg())),
             };
             out.push(line);
             if out.len() >= cap {
@@ -194,7 +194,7 @@ fn content_line(prefix: &str, value: &str, content_style: Style) -> Line<'static
 /// 构建标记/截断行：default 行级样式（非 code_block），dim。
 /// Build a marker/truncation line: default line-level style (not code_block), dim.
 fn marker_line(text: &str) -> Line<'static> {
-    Line::styled(text.to_string(), theme::info())
+    Line::styled(text.to_string(), theme::meta_info())
 }
 
 #[cfg(test)]
@@ -279,8 +279,8 @@ mod tests {
         for c in &contexts {
             assert_eq!(
                 line_fg(c),
-                theme::info().fg,
-                "context line fg must match info"
+                theme::meta_info().fg,
+                "context line fg must match meta_info"
             );
         }
     }
@@ -291,7 +291,7 @@ mod tests {
         let lines = unified_diff_lines(&edit, false);
         let has_tinted_bg = lines.iter().any(|l| {
             l.spans.iter().any(|s| {
-                s.style.bg == Some(Color::Rgb(0x3A, 0x30, 0x30))
+                s.style.bg == theme::diff_del().bg
             })
         });
         assert!(
@@ -306,7 +306,7 @@ mod tests {
         let lines = unified_diff_lines(&edit, false);
         let has_tinted_bg = lines.iter().any(|l| {
             l.spans.iter().any(|s| {
-                s.style.bg == Some(Color::Rgb(0x30, 0x3A, 0x30))
+                s.style.bg == theme::diff_add().bg
             })
         });
         assert!(

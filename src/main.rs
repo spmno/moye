@@ -43,6 +43,15 @@ use tracing::info;
 async fn main() -> Result<()> {
     init_logging();
 
+    // --version / -V：打印版本号并退出。必须在配置向导与 .env 加载之前检查——
+    // 没有配置/API Key 时也要能正常打印。
+    // --version / -V: print version and exit. Must be checked before the setup
+    // wizard and .env loading so it works with no config/API key present.
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("{}", version_string());
+        return Ok(());
+    }
+
     // 统一解析 agent.toml（仅此一处），各模块共享同一份配置。
     // 若本地 agent.toml 和全局 config.toml 均不存在，启动首次配置向导。
     // Parse agent.toml once here; all modules share this single config.
@@ -212,4 +221,22 @@ fn init_logging() {
         .init();
 
     info!("[trace] \u{65e5}\u{5fd7}\u{6587}\u{4ef6}: {log_name}");
+}
+
+/// 版本字符串：`moye <semver>`，版本号编译期从 Cargo.toml 注入，避免两处维护。
+/// Version string: `moye <semver>` — injected from Cargo.toml at compile time
+/// so the version lives in exactly one place.
+fn version_string() -> String {
+    format!("moye {}", env!("CARGO_PKG_VERSION"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn version_string_matches_cargo_toml() {
+        let v = super::version_string();
+        assert_eq!(v, format!("moye {}", env!("CARGO_PKG_VERSION")));
+        let semver = v.trim_start_matches("moye ");
+        assert_eq!(semver.split('.').count(), 3, "expected semver x.y.z");
+    }
 }

@@ -93,6 +93,11 @@ pub enum ApprovalVerdict {
 /// - `check_path()`: 同步路径校验,返回 `true` 表示在沙箱允许范围内。
 ///   与现有 `Sandbox::check_path()` 的 `Result<(), SandboxError>` 等价:
 ///   `Ok(())` → `true`,`Err(_)` → `false`(todo 4 用 `.is_ok()` 包装)。
+/// - `auth_version()`: 授权版本计数器。每当沙箱的授权路径集合扩大时递增。
+///   持久 shell 在 exec 时比较当前版本与 spawn 时记录的版本;不匹配则
+///   重启 shell(bwrap 命名空间在 spawn 时冻结,后续授权的新目录在旧
+///   命名空间中不存在 → ENOENT)。默认返回 0(mocks / 无动态授权的
+///   provider 无需实现此方法)。
 pub trait SandboxProvider: Send + Sync {
     /// 探测当前平台可用的沙箱能力等级(无 I/O,纯环境/能力检查)。
     #[allow(dead_code)] // infrastructure for future phases
@@ -105,6 +110,47 @@ pub trait SandboxProvider: Send + Sync {
     /// 检查路径是否在沙箱允许范围内。`true` = 允许,`false` = 拒绝。
     #[allow(dead_code)] // infrastructure for future phases
     fn check_path(&self, path: &str) -> bool;
+
+    /// 授权版本计数器。每当沙箱的授权路径集合扩大时递增。
+    /// 持久 shell 在 exec 时比较此值与 spawn 时记录的值;不匹配则重启
+    /// shell(bwrap 命名空间在 spawn 时冻结,后续 authorize 的新目录
+    /// 在旧命名空间中不存在 → ENOENT)。
+    ///
+    /// Authorization version counter. Incremented whenever the sandbox's
+    /// authorized path set widens. Persistent shells compare this against the
+    /// version recorded at spawn time; mismatch → respawn (the bwrap
+    /// namespace is frozen at spawn, so newly authorized dirs are invisible
+    /// in the stale namespace → ENOENT).
+    ///
+    /// 默认返回 0 —— mocks 和无动态授权的 provider 无需实现此方法即可编译。
+    /// Default returns 0 — mocks and providers without dynamic authorization
+    /// compile unchanged.
+    fn auth_version(&self) -> u64 {
+        0
+    }
+
+    /// Per-child Landlock `pre_exec` hook. 返回一个闭包,在 fork 后 execve
+    /// 前被调用,装一个预构造好的 Landlock ruleset。
+    ///
+    /// 闭包返回 `Ok(())` 表示 ruleset 安装成功,子进程继续 execve;
+    /// 返回 `Err(msg)` 表示失败,execve 不执行(pre_exec 标准语义)。
+    ///
+    /// 闭包在 fork 的子进程中执行,必须 async-signal-safe:
+    /// 成功路径不分配内存、不加锁,仅调用 `prctl` 和
+    /// `landlock_restrict_self` 两个系统调用。错误路径可有少量分配
+    /// (子进程即将终止,不继续 exec)。
+    ///
+    /// 默认返回 `None` —— 无 Landlock 强制的 provider(SimpleSandbox /
+    /// MockSandbox)不实现此方法,shell 不附加 `pre_exec`。
+    ///
+    /// The closure runs in a forked child before execve and must be
+    /// async-signal-safe: no allocation and no locks on the success path,
+    /// only the two syscalls (`prctl(PR_SET_NO_NEW_PRIVS)` and
+    /// `landlock_restrict_self`). Default returns `None`.
+    #[allow(dead_code)]
+    fn pre_exec_landlock(&self) -> Option<Box<dyn Fn() -> Result<(), String> + Send + Sync + 'static>> {
+        None
+    }
 }
 
 /// Shell seam —— shell 命令执行能力。
@@ -270,6 +316,23 @@ mod mocks {
         assert_eq!(sb.probe(), ProbeLevel::Unusable);
         assert!(sb.grant_args(&[], &[]).is_none());
         assert!(sb.check_path("anywhere"));
+    }
+
+    /// The default `auth_version()` returns 0 — mocks don't implement it,
+    /// proving the default method keeps existing impls compiling.
+    #[test]
+    fn mock_sandbox_default_auth_version_is_zero() {
+        let sb = MockSandbox;
+        assert_eq!(sb.auth_version(), 0);
+    }
+
+    /// The default `pre_exec_landlock()` returns `None` — mocks don't
+    /// implement it, proving the default method keeps existing impls
+    /// compiling and shell.rs skips the pre_exec attachment.
+    #[test]
+    fn mock_sandbox_default_pre_exec_landlock_is_none() {
+        let sb = MockSandbox;
+        assert!(sb.pre_exec_landlock().is_none());
     }
 
     #[test]

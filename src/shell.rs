@@ -58,14 +58,27 @@ pub struct ShellSession {
     #[allow(dead_code)]
     max_output_chars: usize,
     dead: bool,
+    /// 此 shell spawn 时记录的沙箱授权版本。
+    /// 若当前 provider.auth_version() 与此值不同,说明 bwrap 命名空间
+    /// 已过期(spawn 后新 authorize 的目录在旧命名空间中不存在 → ENOENT),
+    /// shell 需要重启。
+    /// The sandbox authorization version recorded when this shell was spawned.
+    /// If the current provider.auth_version() differs, the bwrap namespace
+    /// is stale (dirs authorized after spawn don't exist in the old namespace
+    /// → ENOENT) and the shell must respawn.
+    spawned_version: u64,
 }
 
 impl ShellSession {
     /// Spawn a new sandbox-wrapped `sh` process with stdin/stdout/stderr piped.
     /// 生成一个沙箱包裹的 `sh` 子进程，stdin/stdout/stderr 均为管道。
+    ///
+    /// `auth_version` is the sandbox's authorization version at spawn time;
+    /// stored on the session so `LazyShell::exec` can detect staleness later.
     async fn spawn(
         sandbox: &dyn SandboxProvider,
         max_output_chars: usize,
+        auth_version: u64,
     ) -> std::io::Result<Self> {
         let nonce = generate_nonce();
         let mut cmd = build_shell_command(sandbox);
@@ -89,11 +102,23 @@ impl ShellSession {
             nonce,
             max_output_chars,
             dead: false,
+            spawned_version: auth_version,
         })
     }
 
     fn is_dead(&self) -> bool {
         self.dead
+    }
+
+    /// Kill the shell's process group and reap the child. Reused by both the
+    /// timeout path and the version-staleness respawn path.
+    /// 杀掉 shell 的进程组并回收子进程。超时路径与版本过期重启路径共用。
+    async fn kill(&mut self) {
+        if self.pid != 0 {
+            let _ = unsafe { libc::kill(-(self.pid as i32), libc::SIGKILL) };
+        }
+        let _ = self.child.wait().await;
+        self.dead = true;
     }
 
     /// Execute a command and return (stdout, stderr, exit_code).
@@ -150,11 +175,7 @@ impl ShellSession {
             Err(_) => {
                 // Timeout — kill the entire process group (shell + children like `sleep`).
                 // 超时——杀掉整个进程组（shell + 子进程如 `sleep`）。
-                if self.pid != 0 {
-                    let _ = unsafe { libc::kill(-(self.pid as i32), libc::SIGKILL) };
-                }
-                let _ = self.child.wait().await;
-                self.dead = true;
+                self.kill().await;
                 Err(format!("command timed out after {}s", timeout.as_secs()))
             }
         }
@@ -178,6 +199,8 @@ fn build_shell_command(sandbox: &dyn SandboxProvider) -> tokio::process::Command
     } else {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.process_group(0);
+        #[cfg(target_os = "linux")]
+        attach_landlock_pre_exec(sandbox, &mut cmd);
         cmd
     }
 }
@@ -197,7 +220,30 @@ fn build_bash_command(sandbox: &dyn SandboxProvider, command: &str) -> tokio::pr
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg(command);
         cmd.process_group(0);
+        #[cfg(target_os = "linux")]
+        attach_landlock_pre_exec(sandbox, &mut cmd);
         cmd
+    }
+}
+
+/// Attach a Landlock `pre_exec` hook to the command, if the sandbox provider
+/// supplies one. Called from both `build_shell_command` and
+/// `build_bash_command` when `grant_args` returned `None` (no bwrap).
+/// 当 `grant_args` 返回 `None`(无 bwrap)时,附加 Landlock pre_exec 回调。
+#[cfg(target_os = "linux")]
+fn attach_landlock_pre_exec(sandbox: &dyn SandboxProvider, cmd: &mut tokio::process::Command) {
+    if let Some(landlock_fn) = sandbox.pre_exec_landlock() {
+        // SAFETY: The closure returned by pre_exec_landlock() makes only two
+        // syscalls on the success path: prctl(PR_SET_NO_NEW_PRIVS) and
+        // landlock_restrict_self(ruleset_fd, 0). No heap allocation, no locks
+        // — async-signal-safe per signal-safety(7). The OwnedFd keeping the
+        // ruleset fd alive is moved into the closure and remains valid until
+        // the child execs or exits. On the error path, format! allocation is
+        // acceptable (the child will not exec). The closure is Fn (only reads
+        // the captured Box<dyn Fn> via &self), satisfying the FnMut bound.
+        unsafe {
+            cmd.pre_exec(move || landlock_fn().map_err(std::io::Error::other));
+        }
     }
 }
 
@@ -279,20 +325,41 @@ impl LazyShell {
     ///
     /// Returns (stdout, stderr, exit_code). On timeout/death, the next call
     /// respawns a fresh shell (state loss is acceptable).
+    ///
+    /// Version check: if the sandbox's authorization version has changed
+    /// since this shell was spawned, the bwrap namespace is stale —
+    /// directories authorized after spawn don't exist inside the frozen
+    /// namespace (ENOENT). The stale shell is killed and a fresh one
+    /// spawned with the updated mounts. cwd/env loss on respawn is
+    /// acceptable; stale isolation is worse.
+    /// 版本检查：若沙箱授权版本自 shell 生成后已变化，bwrap 命名空间过期——
+    /// spawn 后授权的目录在冻结的命名空间中不存在（ENOENT）。杀掉过期 shell
+    /// 并用更新后的挂载生成新 shell。重启时 cwd/env 丢失可接受；
+    /// 过期隔离更危险。
     pub async fn exec(
         &self,
         command: &str,
         timeout: Duration,
     ) -> Result<(String, String, i32), String> {
         let mut session = self.inner.lock().await;
-        let need_spawn = session
-            .as_ref()
-            .map(|s| s.is_dead())
-            .unwrap_or(true);
-        if need_spawn {
-            let new_session = ShellSession::spawn(self.sandbox.as_ref(), self.max_output_chars)
-                .await
-                .map_err(|e| format!("failed to spawn shell: {e}"))?;
+        let current_version = self.sandbox.auth_version();
+        let need_respawn = match session.as_ref() {
+            None => true,
+            Some(s) => s.is_dead() || s.spawned_version != current_version,
+        };
+        if need_respawn {
+            if let Some(ref mut old) = *session {
+                if !old.is_dead() {
+                    old.kill().await;
+                }
+            }
+            let new_session = ShellSession::spawn(
+                self.sandbox.as_ref(),
+                self.max_output_chars,
+                current_version,
+            )
+            .await
+            .map_err(|e| format!("failed to spawn shell: {e}"))?;
             *session = Some(new_session);
         }
         let s = session.as_mut().unwrap();
@@ -326,6 +393,16 @@ pub struct BackgroundRegistry {
     inner: Mutex<HashMap<String, BackgroundShell>>,
     counter: AtomicU64,
     max_output_chars: usize,
+    /// 最近一次 `start()` 时记录的沙箱授权版本。
+    /// 版本变化时,所有已存在的后台 shell 的 bwrap 命名空间同样冻结
+    /// 在旧版本——它们与前台 shell 一样过期,必须被杀掉
+    /// (过期隔离是安全风险,不自动重启——杀掉是安全行为)。
+    /// The sandbox auth version recorded at the last `start()`.
+    /// On version change, existing background shells' bwrap namespaces
+    /// are equally frozen at the old version — they are just as stale
+    /// as foreground shells and must be killed (stale isolation is a
+    /// hazard; killing is the safe behavior, not auto-respawn).
+    spawned_version: AtomicU64,
 }
 
 impl BackgroundRegistry {
@@ -334,12 +411,23 @@ impl BackgroundRegistry {
             inner: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(0),
             max_output_chars,
+            spawned_version: AtomicU64::new(0),
         }
     }
 
     /// Start a background command. Returns its id (`bg-{n}`) immediately.
     /// 启动后台命令。立即返回其 id（`bg-{n}`）。
     pub fn start(&self, command: &str, sandbox: &dyn SandboxProvider) -> std::io::Result<String> {
+        // Version check at the background exec path: if the sandbox auth
+        // version has changed since the last background shell started, kill
+        // all existing background shells — their frozen namespaces are
+        // equally stale (stale isolation is a hazard).
+        // 后台 exec 路径的版本检查：若沙箱授权版本自上次后台 shell
+        // 启动后已变化，杀掉所有现有后台 shell——它们的冻结命名空间
+        // 同样过期（过期隔离是安全风险）。
+        let current_version = sandbox.auth_version();
+        self.check_version(current_version);
+
         let id = format!("bg-{}", self.counter.fetch_add(1, Ordering::Relaxed));
 
         let mut cmd = build_bash_command(sandbox, command);
@@ -442,6 +530,35 @@ impl BackgroundRegistry {
         }
     }
 
+    /// Kill all background shells by sending SIGKILL to each process group.
+    /// Does not wait for reaping — reader tasks will eventually record exit
+    /// codes. Reused by `check_version` and `shutdown`.
+    /// 杀掉所有后台 shell：向每个进程组发送 SIGKILL。不等待回收——
+    /// 读取任务会最终记录退出码。被 check_version 与 shutdown 复用。
+    pub fn kill_all(&self) {
+        let inner = self.inner.lock().unwrap();
+        for shell in inner.values() {
+            if shell.pid != 0 {
+                let _ = unsafe { libc::kill(-(shell.pid as i32), libc::SIGKILL) };
+            }
+        }
+    }
+
+    /// Check if the sandbox authorization version has changed since the last
+    /// background shell was started. On mismatch, kill all existing background
+    /// shells (their frozen namespaces are stale) and update the recorded
+    /// version. Called from `start()` — the background exec path.
+    /// 检查沙箱授权版本自上次后台 shell 启动后是否变化。不匹配时杀掉
+    /// 所有现有后台 shell（它们的冻结命名空间已过期）并更新记录的版本。
+    /// 从 start()（后台 exec 路径）调用。
+    pub fn check_version(&self, provider_version: u64) {
+        let spawned = self.spawned_version.load(Ordering::Relaxed);
+        if spawned != provider_version {
+            self.kill_all();
+            self.spawned_version.store(provider_version, Ordering::Relaxed);
+        }
+    }
+
     /// Kill all children and wait for reader tasks to reap them.
     /// 杀掉所有子进程并等待读取任务回收。
     #[allow(dead_code)]
@@ -517,7 +634,7 @@ mod tests {
     /// echo 往返：输出与退出码 0。
     #[tokio::test]
     async fn shell_echo_roundtrip_exit_code() {
-        let mut session = ShellSession::spawn(no_sandbox().as_ref(), 20000)
+        let mut session = ShellSession::spawn(no_sandbox().as_ref(), 20000, 0)
             .await
             .expect("spawn");
         let (stdout, stderr, code) = session
@@ -533,7 +650,7 @@ mod tests {
     /// `cd` 跨两次 exec 持久化。
     #[tokio::test]
     async fn shell_cd_persists_across_execs() {
-        let mut session = ShellSession::spawn(no_sandbox().as_ref(), 20000)
+        let mut session = ShellSession::spawn(no_sandbox().as_ref(), 20000, 0)
             .await
             .expect("spawn");
         session
@@ -552,7 +669,7 @@ mod tests {
     /// `export` 跨 exec 持久化。
     #[tokio::test]
     async fn shell_export_persists_across_execs() {
-        let mut session = ShellSession::spawn(no_sandbox().as_ref(), 20000)
+        let mut session = ShellSession::spawn(no_sandbox().as_ref(), 20000, 0)
             .await
             .expect("spawn");
         session
@@ -571,7 +688,7 @@ mod tests {
     /// 非零退出码被捕获。
     #[tokio::test]
     async fn shell_nonzero_exit_captured() {
-        let mut session = ShellSession::spawn(no_sandbox().as_ref(), 20000)
+        let mut session = ShellSession::spawn(no_sandbox().as_ref(), 20000, 0)
             .await
             .expect("spawn");
         let (stdout, _, code) = session
@@ -707,5 +824,94 @@ mod tests {
         // After shutdown, the process should be gone.
         let alive_after = unsafe { libc::kill(pid as i32, 0) } == 0;
         assert!(!alive_after, "child should be dead after shutdown");
+    }
+
+    /// After an authorization bump, exec respawns a fresh shell.
+    /// The env var set in exec 1 does NOT survive the respawn (fresh env).
+    /// 授权递增后，exec 重启新 shell。exec 1 设置的环境变量在重启后消失。
+    #[tokio::test]
+    async fn shell_version_change_respawns() {
+        let sb = Arc::new(SimpleSandbox::with_backend(&[], SandboxBackend::Off));
+        let lazy = LazyShell::new(sb.clone() as Arc<dyn SandboxProvider>, 20000);
+
+        // exec 1: set a marker env var.
+        lazy.exec("export MOYE_VMARKER=alive", Duration::from_secs(10))
+            .await
+            .expect("exec 1");
+        // verify the marker is set.
+        let (stdout, _, _) = lazy
+            .exec("echo $MOYE_VMARKER", Duration::from_secs(10))
+            .await
+            .expect("verify marker");
+        assert_eq!(stdout.trim(), "alive");
+
+        // bump the authorization version.
+        sb.authorize("/tmp/moye_vmarker_test");
+
+        // exec 2: should respawn; the marker env var must be gone.
+        let (stdout, _, _) = lazy
+            .exec("echo $MOYE_VMARKER", Duration::from_secs(10))
+            .await
+            .expect("exec 2 after bump");
+        assert_eq!(
+            stdout.trim(),
+            "",
+            "fresh shell should not retain the marker env var"
+        );
+    }
+
+    /// Without a version bump, execs reuse the same shell (env var persists).
+    /// 无版本递增时，exec 复用同一 shell（环境变量持久化）。
+    #[tokio::test]
+    async fn shell_no_bump_reuses_shell() {
+        let sb = Arc::new(SimpleSandbox::with_backend(&[], SandboxBackend::Off));
+        let lazy = LazyShell::new(sb.clone() as Arc<dyn SandboxProvider>, 20000);
+
+        // exec 1: set a marker env var.
+        lazy.exec("export MOYE_REUSE=persist", Duration::from_secs(10))
+            .await
+            .expect("exec 1");
+
+        // exec 2: no version bump → same shell, marker should persist.
+        let (stdout, _, _) = lazy
+            .exec("echo $MOYE_REUSE", Duration::from_secs(10))
+            .await
+            .expect("exec 2");
+        assert_eq!(
+            stdout.trim(),
+            "persist",
+            "same shell should retain env var without version bump"
+        );
+    }
+
+    /// After a version bump, check_version kills stale background shells.
+    /// 版本递增后，check_version 杀掉过期的后台 shell。
+    #[tokio::test]
+    async fn bg_version_change_kills_stale() {
+        let sb = Arc::new(SimpleSandbox::with_backend(&[], SandboxBackend::Off));
+        let bg = BackgroundRegistry::new(20000);
+
+        let id = bg
+            .start("sleep 300", sb.as_ref())
+            .expect("start");
+
+        let pid = {
+            let inner = bg.inner.lock().unwrap();
+            inner.get(&id).map(|s| s.pid).unwrap_or(0)
+        };
+        assert!(pid != 0, "pid should be non-zero");
+
+        let alive_before = unsafe { libc::kill(pid as i32, 0) } == 0;
+        assert!(alive_before, "bg shell should be alive before version change");
+
+        sb.authorize("/tmp/moye_bg_version_test");
+        assert_eq!(sb.auth_version(), 1, "version should be 1 after authorize");
+
+        bg.check_version(sb.auth_version());
+
+        bg.shutdown().await;
+
+        let alive_after = unsafe { libc::kill(pid as i32, 0) } == 0;
+        assert!(!alive_after, "bg shell should be dead after version change + shutdown");
     }
 }

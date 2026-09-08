@@ -21,6 +21,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::seam::{ProbeLevel, SandboxProvider};
@@ -182,6 +183,13 @@ pub struct SimpleSandbox {
     /// 用户已授权访问的额外目录（规范化后的绝对路径）。
     /// Extra directories authorized by the user (canonicalized absolute paths).
     authorized: Arc<Mutex<HashSet<PathBuf>>>,
+    /// 授权版本计数器。每当 authorized 集合扩大时递增（Ordering::Relaxed）。
+    /// 持久 shell 用此值检测 bwrap 命名空间是否过期（spawn 时冻结的命名空间
+    /// 不含后续 authorize 的新目录 → ENOENT）。
+    /// Authorization version counter. Incremented whenever `authorized` widens
+    /// (Relaxed ordering). Persistent shells use this to detect namespace staleness
+    /// (a namespace frozen at spawn doesn't include later-authorized dirs → ENOENT).
+    auth_version: Arc<AtomicU64>,
     /// 是否启用沙箱。
     /// Whether the sandbox is enabled.
     enabled: bool,
@@ -248,6 +256,7 @@ impl SimpleSandbox {
         Self {
             root,
             authorized: Arc::new(Mutex::new(HashSet::new())),
+            auth_version: Arc::new(AtomicU64::new(0)),
             enabled,
             backend,
         }
@@ -417,6 +426,7 @@ impl SimpleSandbox {
         let resolved = self.resolve_path(dir);
         let canon = self.canonicalize_safe(&resolved);
         self.authorized.lock().unwrap().insert(canon);
+        self.auth_version.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 检查 bash 命令是否访问沙箱外的路径。
@@ -506,6 +516,7 @@ impl SimpleSandbox {
         if let Some(parent) = resolved.parent() {
             let canon = self.canonicalize_safe(parent);
             self.authorized.lock().unwrap().insert(canon);
+            self.auth_version.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -601,6 +612,10 @@ impl SandboxProvider for SimpleSandbox {
 
     fn check_path(&self, path: &str) -> bool {
         SimpleSandbox::check_path(self, path).is_ok()
+    }
+
+    fn auth_version(&self) -> u64 {
+        self.auth_version.load(Ordering::Relaxed)
     }
 }
 
@@ -1241,6 +1256,7 @@ mod tests {
         let sb = Sandbox {
             root: PathBuf::from("."),
             authorized: Arc::new(Mutex::new(HashSet::new())),
+            auth_version: Arc::new(AtomicU64::new(0)),
             enabled: false,
             backend: SandboxBackend::Off,
         };
@@ -1291,6 +1307,7 @@ mod tests {
         let sb = Sandbox {
             root: PathBuf::from("/tmp"),
             authorized: Arc::new(Mutex::new(HashSet::new())),
+            auth_version: Arc::new(AtomicU64::new(0)),
             enabled: true,
             backend: SandboxBackend::Path,
         };
@@ -1302,6 +1319,7 @@ mod tests {
         let sb = Sandbox {
             root: PathBuf::from("/tmp"),
             authorized: Arc::new(Mutex::new(HashSet::new())),
+            auth_version: Arc::new(AtomicU64::new(0)),
             enabled: false,
             backend: SandboxBackend::Off,
         };
@@ -1315,6 +1333,7 @@ mod tests {
         let sb = Sandbox {
             root: workspace.clone(),
             authorized: Arc::new(Mutex::new(HashSet::new())),
+            auth_version: Arc::new(AtomicU64::new(0)),
             enabled: true,
             backend: SandboxBackend::Bwrap,
         };
@@ -1341,6 +1360,7 @@ mod tests {
             authorized: Arc::new(Mutex::new(HashSet::from([PathBuf::from(
                 "/tmp/authorized",
             )]))),
+            auth_version: Arc::new(AtomicU64::new(0)),
             enabled: true,
             backend: SandboxBackend::Bwrap,
         };
@@ -1353,6 +1373,7 @@ mod tests {
         let sb = Sandbox {
             root: PathBuf::from("/home/user/project"),
             authorized: Arc::new(Mutex::new(HashSet::new())),
+            auth_version: Arc::new(AtomicU64::new(0)),
             enabled: true,
             backend: SandboxBackend::Seatbelt,
         };
@@ -1366,6 +1387,7 @@ mod tests {
         let sb = Sandbox {
             root: PathBuf::from("/home/user/project"),
             authorized: Arc::new(Mutex::new(HashSet::new())),
+            auth_version: Arc::new(AtomicU64::new(0)),
             enabled: true,
             backend: SandboxBackend::Seatbelt,
         };
@@ -1534,5 +1556,46 @@ mod tests {
     fn quoted_real_path_still_extracted() {
         let paths = extract_paths_from_command(r#"cat "/etc/passwd""#);
         assert!(paths.contains(&"/etc/passwd".to_string()));
+    }
+
+    /// 授权版本计数器初始为 0。
+    /// Authorization version counter starts at 0.
+    #[test]
+    fn auth_version_starts_at_zero() {
+        let sb = SimpleSandbox::new();
+        assert_eq!(sb.auth_version(), 0);
+    }
+
+    /// 每次授权递增版本计数器（两次授权 → 2）。
+    /// Each authorization increments the version counter (two authorizations → 2).
+    #[test]
+    fn authorize_bumps_version() {
+        let sb = SimpleSandbox::new();
+        assert_eq!(sb.auth_version(), 0);
+        sb.authorize("/tmp");
+        assert_eq!(sb.auth_version(), 1);
+        sb.authorize("/var");
+        assert_eq!(sb.auth_version(), 2);
+    }
+
+    /// 无修改时版本计数器保持不变。
+    /// Version counter stays stable without mutations.
+    #[test]
+    fn no_mutation_keeps_version_stable() {
+        let sb = SimpleSandbox::new();
+        let _ = sb.check_path("src/main.rs");
+        let _ = sb.check_bash("ls");
+        let _ = sb.check_tool("read_file", r#"{"path":"src/main.rs"}"#);
+        assert_eq!(sb.auth_version(), 0);
+    }
+
+    /// authorize_tool 递增版本计数器。
+    /// authorize_tool increments the version counter.
+    #[test]
+    fn authorize_tool_bumps_version() {
+        let sb = SimpleSandbox::new();
+        assert_eq!(sb.auth_version(), 0);
+        sb.authorize_tool("read_file", r#"{"path":"/tmp/foo"}"#);
+        assert!(sb.auth_version() >= 1, "version should be >= 1 after authorize_tool");
     }
 }

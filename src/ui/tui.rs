@@ -3181,7 +3181,7 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let mut lines: Vec<Line> = Vec::new();
 
     // CWD
-    lines.push(Line::styled("CWD", theme::sidebar_title()));
+    lines.push(Line::styled("Directory", theme::sidebar_title()));
     lines.push(Line::styled(
         format!(" {}", format_workdir(area.width.saturating_sub(5) as usize)),
         theme::meta_info(),

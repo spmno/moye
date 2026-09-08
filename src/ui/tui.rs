@@ -3046,6 +3046,37 @@ fn draw(f: &mut Frame, state: &mut TuiState) {
 /// directly above the input box, rounded border with border_user (blue),
 /// selected row uses selector_highlight, descriptions use selector_dim.
 /// The popup Rect is stored in state.autocomplete_area for mouse hit-testing.
+/// 自动补全用的显示宽度：ASCII 计 1 列、其余计 2 列（与本文件光标宽度模型一致）。
+/// Display width for autocomplete: ASCII = 1 column, others = 2 (matches the
+/// cursor width model used elsewhere in this file).
+fn ac_display_width(s: &str) -> usize {
+    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+}
+
+/// 把描述截断到指定显示宽度，超出时末位替换为 `…`。
+/// Truncate a description to the given display width, replacing the last
+/// column with `…` when cut.
+fn ac_truncate(s: &str, max_w: usize) -> String {
+    if ac_display_width(s) <= max_w {
+        return s.to_string();
+    }
+    if max_w == 0 {
+        return String::new();
+    }
+    let budget = max_w - 1;
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = if c.is_ascii() { 1 } else { 2 };
+        if w + cw > budget {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    format!("{out}\u{2026}")
+}
+
 fn draw_autocomplete(f: &mut Frame, input_area: Rect, state: &mut TuiState) {
     let Some(query) = autocomplete_query(state) else {
         state.autocomplete_area = Rect::new(0, 0, 0, 0);
@@ -3058,14 +3089,28 @@ fn draw_autocomplete(f: &mut Frame, input_area: Rect, state: &mut TuiState) {
     }
     let sel = state.autocomplete_sel.min(matches.len() - 1);
 
+    // 宽度按全部匹配行的最宽内容自适应（CJK 按 2 列计），封顶输入区宽；
+    // 用全部匹配而非可见窗口，避免滚动选择时宽度跳动。
+    // Width adapts to the widest row across ALL matches (CJK counts as 2
+    // columns), capped at input width. Using all matches (not the visible
+    // window) keeps the width stable while scrolling the selection.
+    let max_content = matches
+        .iter()
+        .map(|&i| {
+            let (c, d, _) = PALETTE_COMMANDS[i];
+            ac_display_width(c) + 2 + ac_display_width(d)
+        })
+        .max()
+        .unwrap_or(0) as u16;
     let shown = matches.len().min(AUTOCOMPLETE_MAX_ROWS);
-    let pw = 40u16.min(input_area.width);
+    let pw = (max_content + 2).min(input_area.width);
     let ph = shown as u16 + 2;
     let py = input_area.y.saturating_sub(ph);
     let popup_area = Rect::new(input_area.x, py, pw, ph);
 
     let (start, end) = window_indices(matches.len(), sel, AUTOCOMPLETE_MAX_ROWS);
 
+    let inner_w = pw.saturating_sub(2) as usize;
     let mut lines: Vec<Line> = Vec::new();
     for match_i in start..end {
         let (cmd, desc, _) = PALETTE_COMMANDS[matches[match_i]];
@@ -3075,10 +3120,11 @@ fn draw_autocomplete(f: &mut Frame, input_area: Rect, state: &mut TuiState) {
         } else {
             theme::selector_normal()
         };
+        let desc_w = inner_w.saturating_sub(ac_display_width(cmd) + 2);
         lines.push(Line::from(vec![
             Span::styled(cmd.to_string(), name_style),
             Span::styled("  ".to_string(), name_style),
-            Span::styled(desc.to_string(), theme::selector_dim()),
+            Span::styled(ac_truncate(desc, desc_w), theme::selector_dim()),
         ]));
     }
 
@@ -5575,5 +5621,30 @@ mod tests {
     fn autocomplete_enter_empty_matches_submits_typed() {
         let decision = autocomplete_enter_decision("/zz", 0, &[]);
         assert_eq!(decision, AutocompleteDecision::SubmitTyped);
+    }
+
+    #[test]
+    fn ac_display_width_cjk_counts_two() {
+        assert_eq!(ac_display_width("abc"), 3);
+        assert_eq!(ac_display_width("模型"), 4);
+        assert_eq!(ac_display_width("a模b"), 4);
+    }
+
+    #[test]
+    fn ac_truncate_no_cut_when_fits() {
+        assert_eq!(ac_truncate("short", 10), "short");
+        assert_eq!(ac_truncate("正好合适", 8), "正好合适");
+    }
+
+    #[test]
+    fn ac_truncate_cuts_with_ellipsis_and_respects_cjk_boundary() {
+        let out = ac_truncate("code self-modify <file>", 8);
+        assert_eq!(ac_display_width(&out), 8);
+        assert!(out.ends_with('\u{2026}'));
+        // CJK 字符不应被劈开：预算 4 列时只容下一个汉字 + …
+        // CJK chars must not be split: a 4-column budget fits one Han char + …
+        let out2 = ac_truncate("模型切换", 4);
+        assert_eq!(out2, "模\u{2026}");
+        assert_eq!(ac_truncate("anything", 0), "");
     }
 }

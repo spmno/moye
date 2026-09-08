@@ -604,6 +604,16 @@ struct TuiState {
     /// 侧边栏 Rect：draw_sidebar 时写入，handle_mouse_event 命中测试时读。
     /// Sidebar Rect: written in draw_sidebar, read in handle_mouse_event for hit-testing.
     sidebar_area: Rect,
+    /// 自动补全弹窗选中索引（当前匹配列表中的位置）。
+    /// Autocomplete popup selection index (position within the current matches list).
+    autocomplete_sel: usize,
+    /// 自动补全弹窗 Rect：draw_autocomplete 时写入，鼠标点击命中测试时读。
+    /// Autocomplete popup Rect: written in draw_autocomplete, read for mouse click hit-testing.
+    autocomplete_area: Rect,
+    /// 自动补全弹窗是否被 Esc 关闭。谓词取反此标志——缓冲区变化或新 `/` 令牌时清除。
+    /// Whether the autocomplete popup was dismissed by Esc. The predicate ANDs
+    /// !dismissed — cleared when the buffer changes or a new `/` token starts.
+    autocomplete_dismissed: bool,
 }
 
 impl TuiState {
@@ -659,6 +669,9 @@ impl TuiState {
             sidebar_collapsed: std::collections::HashSet::from([SidebarSection::Tools]),
             sidebar_headers: Vec::new(),
             sidebar_area: Rect::new(0, 0, 0, 0),
+            autocomplete_sel: 0,
+            autocomplete_area: Rect::new(0, 0, 0, 0),
+            autocomplete_dismissed: false,
         }
     }
 
@@ -1228,7 +1241,7 @@ async fn run_loop(
                         handle_key_event(key, state, ctx, action_tx);
                     }
                     crossterm::event::Event::Mouse(mouse) => {
-                        handle_mouse_event(mouse, state);
+                        handle_mouse_event(mouse, state, ctx, action_tx);
                     }
                     crossterm::event::Event::Paste(text)
                         if !state.thinking && state.hitl.is_none() =>
@@ -1241,6 +1254,7 @@ async fn run_loop(
                             sel.input_paste(text.trim());
                         } else {
                             state.input.insert_str(&text);
+                            state.autocomplete_dismissed = false;
                         }
                     }
                     _ => {}
@@ -1457,6 +1471,24 @@ fn handle_key_event(
         return;
     }
 
+    // 斜杠命令自动补全弹窗：派生态（缓冲区以 `/` 开头且首个令牌无空白）。
+    // 置于搜索守卫之后、Esc 中断守卫之前——使 Esc 关闭弹窗而非中断任务，
+    // Up/Down 循环选择而非触发输入历史。弹窗活跃时所有这些键被消费（return）。
+    //
+    // Slash-command autocomplete popup: derived state (buffer starts with `/`
+    // and the first token has no whitespace). Placed after the search guard
+    // and before the Esc-thinking guard so Esc closes the popup instead of
+    // aborting the task, and Up/Down cycle selection instead of triggering
+    // input history. When the popup is active, all these keys are consumed (return).
+    let ac_matches: Vec<usize> = autocomplete_query(state)
+        .map(autocomplete_matches)
+        .unwrap_or_default();
+    if !ac_matches.is_empty()
+        && apply_autocomplete_key(state, key, &ac_matches, ctx, action_tx)
+    {
+        return;
+    }
+
     // Esc: interrupt the running task (only when thinking and not in HITL mode).
     // Esc：中断正在运行的任务（仅在 thinking 且非 HITL 模式时生效）。
     if key.code == KeyCode::Esc && state.thinking {
@@ -1560,12 +1592,15 @@ fn handle_key_event(
         }
         KeyCode::Char(c) => {
             state.input.insert_char(c);
+            state.autocomplete_dismissed = false;
         }
         KeyCode::Backspace => {
             state.input.backspace();
+            state.autocomplete_dismissed = false;
         }
         KeyCode::Delete => {
             state.input.delete();
+            state.autocomplete_dismissed = false;
         }
         KeyCode::Left => {
             state.input.cursor_left();
@@ -1843,7 +1878,117 @@ fn apply_search_draw(
     }
 }
 
-fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
+/// 弹窗活跃时的按键处理。返回 true=已消费（弹窗独占键盘），false=交给主链。
+/// 弹窗活跃 = 派生态谓词为真且匹配非空（调用方已算好 matches）。
+///
+/// Key handler when the autocomplete popup is active. Returns true=consumed
+/// (popup owns the keyboard), false=delegate to the main chain.
+/// Active = derived predicate is true and matches are non-empty (caller
+/// has already computed `matches`).
+fn apply_autocomplete_key(
+    state: &mut TuiState,
+    key: KeyEvent,
+    matches: &[usize],
+    ctx: &Arc<AppContext>,
+    action_tx: &EventSender,
+) -> bool {
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
+    {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+        open_palette(state);
+        return true;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            state.autocomplete_dismissed = true;
+            true
+        }
+        KeyCode::Up => {
+            state.autocomplete_sel = prev_match(state.autocomplete_sel, matches.len());
+            true
+        }
+        KeyCode::Down => {
+            state.autocomplete_sel = next_match(state.autocomplete_sel, matches.len());
+            true
+        }
+        KeyCode::Tab => {
+            if let Some(completion) = autocomplete_tab_complete(state.autocomplete_sel, matches) {
+                state.input.buffer = completion;
+                state.input.cursor = state.input.buffer.len();
+            }
+            true
+        }
+        KeyCode::Enter => {
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                return false;
+            }
+            let shift_only =
+                key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+            if !shift_only || state.thinking {
+                return true;
+            }
+            let decision = autocomplete_enter_decision(
+                &state.input.buffer,
+                state.autocomplete_sel,
+                matches,
+            );
+            match decision {
+                AutocompleteDecision::SubmitTyped => {
+                    if let Some(input) = state.input.take_submitted() {
+                        state.input_history.record(input.clone());
+                        if let Err(e) = state.input_history.save() {
+                            warn!("failed to save input history: {e}");
+                        }
+                        handle_command(input, state, ctx, action_tx);
+                    }
+                }
+                AutocompleteDecision::Run(cmd) => {
+                    state.input.buffer.clear();
+                    state.input.cursor = 0;
+                    state.input_history.record(cmd.clone());
+                    if let Err(e) = state.input_history.save() {
+                        warn!("failed to save input history: {e}");
+                    }
+                    handle_command(cmd, state, ctx, action_tx);
+                }
+                AutocompleteDecision::Complete(completion) => {
+                    state.input.buffer = completion;
+                    state.input.cursor = state.input.buffer.len();
+                }
+            }
+            true
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.input.insert_char(c);
+            state.autocomplete_sel = 0;
+            state.autocomplete_dismissed = false;
+            true
+        }
+        KeyCode::Backspace => {
+            state.input.backspace();
+            state.autocomplete_sel = 0;
+            state.autocomplete_dismissed = false;
+            true
+        }
+        KeyCode::Delete => {
+            state.input.delete();
+            state.autocomplete_sel = 0;
+            state.autocomplete_dismissed = false;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn handle_mouse_event(
+    mouse: MouseEvent,
+    state: &mut TuiState,
+    ctx: &Arc<AppContext>,
+    action_tx: &EventSender,
+) {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             state.scroll_offset = state.scroll_offset.saturating_add(3);
@@ -1858,6 +2003,62 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
         MouseEventKind::Down(MouseButton::Left) => {
             let row = mouse.row;
             let col = mouse.column;
+            // 自动补全弹窗命中测试：点击行 → 应用该行动作（与 Enter 同语义）。
+            // Autocomplete popup hit-test: clicking a row applies that row's
+            // action (same semantics as Enter on it).
+            let ac = state.autocomplete_area;
+            if ac.width > 0
+                && row >= ac.y
+                && row < ac.y.saturating_add(ac.height)
+                && col >= ac.x
+                && col < ac.x.saturating_add(ac.width)
+            {
+                let inner_row = row.saturating_sub(ac.y + 1);
+                if inner_row < ac.height.saturating_sub(2) {
+                    let query = autocomplete_query(state);
+                    let ac_matches = query
+                        .map(autocomplete_matches)
+                        .unwrap_or_default();
+                    if !ac_matches.is_empty() {
+                        let sel = state.autocomplete_sel.min(ac_matches.len() - 1);
+                        let (start, _end) =
+                            window_indices(ac_matches.len(), sel, AUTOCOMPLETE_MAX_ROWS);
+                        let match_idx = start + inner_row as usize;
+                        if match_idx < ac_matches.len() {
+                            let decision = autocomplete_enter_decision(
+                                &state.input.buffer,
+                                match_idx,
+                                &ac_matches,
+                            );
+                            match decision {
+                                AutocompleteDecision::SubmitTyped => {
+                                    if let Some(input) = state.input.take_submitted() {
+                                        state.input_history.record(input.clone());
+                                        if let Err(e) = state.input_history.save() {
+                                            warn!("failed to save input history: {e}");
+                                        }
+                                        handle_command(input, state, ctx, action_tx);
+                                    }
+                                }
+                                AutocompleteDecision::Run(cmd) => {
+                                    state.input.buffer.clear();
+                                    state.input.cursor = 0;
+                                    state.input_history.record(cmd.clone());
+                                    if let Err(e) = state.input_history.save() {
+                                        warn!("failed to save input history: {e}");
+                                    }
+                                    handle_command(cmd, state, ctx, action_tx);
+                                }
+                                AutocompleteDecision::Complete(completion) => {
+                                    state.input.buffer = completion;
+                                    state.input.cursor = state.input.buffer.len();
+                                }
+                            }
+                        }
+                    }
+                }
+                return;
+            }
             // 侧边栏区段标题命中测试：点击折叠/展开，不启动消息选区。
             // Sidebar header hit-test: clicking toggles a section, does NOT start selection.
             let sb = state.sidebar_area;
@@ -2151,6 +2352,131 @@ fn apply_palette_selection(
             Some(PaletteExec::Planted)
         }
     }
+}
+
+// ===== Slash-command autocomplete (derived-state popup) =====
+// ===== 斜杠命令自动补全（派生态弹窗） =====
+
+/// 弹窗可见行数上限（不含边框）。
+/// Max visible rows in the popup (excluding border).
+const AUTOCOMPLETE_MAX_ROWS: usize = 8;
+
+/// 自动补全 Enter 决策结果。
+/// Autocomplete Enter decision outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AutocompleteDecision {
+    /// 缓冲区恰好等于选中命令 → 正常提交（裸 `/model` 仍可运行）。
+    /// Buffer exactly equals the selected command → normal submit
+    /// (bare `/model` still runs).
+    SubmitTyped,
+    /// 选中 Execute 项（部分匹配）→ 运行该命令。
+    /// Selected Execute item (partial match) → run that command.
+    Run(String),
+    /// 选中 PlantInput 项 或 Tab → 缓冲区变为 `/cmd `，光标在末尾。
+    /// Selected PlantInput item or Tab → buffer becomes `/cmd `,
+    /// cursor at end.
+    Complete(String),
+}
+
+/// 派生态谓词：缓冲区以 `/` 开头、首个令牌无空白、非 thinking/search/selector/hitl
+/// 模式、未被 Esc 关闭时返回 `Some(filter)`，否则返回 `None`。
+///
+/// Derived-state predicate: returns `Some(filter)` (buffer after `/`) when
+/// the buffer starts with `/`, the first token has no whitespace, no other
+/// mode owns the keyboard, and the popup hasn't been dismissed. Otherwise `None`.
+fn autocomplete_query(state: &TuiState) -> Option<&str> {
+    if state.thinking
+        || state.search.is_some()
+        || state.selector.is_some()
+        || state.hitl.is_some()
+        || state.autocomplete_dismissed
+    {
+        return None;
+    }
+    let buf = &state.input.buffer;
+    if !buf.starts_with('/') {
+        return None;
+    }
+    let after_slash = &buf[1..];
+    if after_slash.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some(after_slash)
+}
+
+/// 纯函数：返回 PALETTE_COMMANDS 中命令名（大小写无关）包含 query 的索引。
+/// 空 query → 全部条目（表序）。非空 → 子串匹配，表序保留。
+///
+/// Pure: returns indices into PALETTE_COMMANDS whose command name contains
+/// query (case-insensitive substring). Empty query → all entries (table order).
+fn autocomplete_matches(query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..PALETTE_COMMANDS.len()).collect();
+    }
+    let q = query.to_lowercase();
+    PALETTE_COMMANDS
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (cmd, _, _))| {
+            if cmd.to_lowercase().contains(&q) {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// 纯函数：计算使 sel 可见的滚动窗口 `[start, end)`。
+/// len ≤ max → 全部可见；否则窗口居中于 sel 并钳制到边界。
+///
+/// Pure: computes the scroll window `[start, end)` that keeps `sel` visible.
+/// len ≤ max → entire range; otherwise window centered on sel, clamped to bounds.
+fn window_indices(len: usize, sel: usize, max: usize) -> (usize, usize) {
+    if len <= max {
+        return (0, len);
+    }
+    let half = max / 2;
+    let start = sel.saturating_sub(half).min(len.saturating_sub(max));
+    (start, start + max)
+}
+
+/// 纯函数：Enter 决策。缓冲区恰好等于选中命令 → SubmitTyped；
+/// 部分 Execute → Run(cmd)；部分 PlantInput → Complete("/cmd ")。
+/// matches 为空 → SubmitTyped（正常提交路径）。
+///
+/// Pure: Enter decision. Buffer exactly equals the selected command → SubmitTyped;
+/// partial Execute → Run(cmd); partial PlantInput → Complete("/cmd ").
+/// Empty matches → SubmitTyped (normal submit path).
+fn autocomplete_enter_decision(
+    buffer: &str,
+    sel_idx: usize,
+    matches: &[usize],
+) -> AutocompleteDecision {
+    if matches.is_empty() {
+        return AutocompleteDecision::SubmitTyped;
+    }
+    let idx = matches[sel_idx.min(matches.len() - 1)];
+    let (cmd, _, action) = PALETTE_COMMANDS[idx];
+    if buffer == cmd {
+        return AutocompleteDecision::SubmitTyped;
+    }
+    match action {
+        PaletteAction::Execute => AutocompleteDecision::Run(cmd.to_string()),
+        PaletteAction::PlantInput => AutocompleteDecision::Complete(format!("{cmd} ")),
+    }
+}
+
+/// 纯函数：Tab 总是补全为 `/cmd `（不执行）。无匹配 → None。
+///
+/// Pure: Tab always completes to `/cmd ` (no execution). No matches → None.
+fn autocomplete_tab_complete(sel_idx: usize, matches: &[usize]) -> Option<String> {
+    if matches.is_empty() {
+        return None;
+    }
+    let idx = matches[sel_idx.min(matches.len() - 1)];
+    let (cmd, _, _) = PALETTE_COMMANDS[idx];
+    Some(format!("{cmd} "))
 }
 
 /// 处理 `/models` 供应商切换流中选择器 Enter 的结果，按当前阶段推进或完成切换。
@@ -2702,12 +3028,70 @@ fn draw(f: &mut Frame, state: &mut TuiState) {
     draw_input(f, v_chunks[2], state);
     draw_sidebar(f, h_chunks[2], state);
 
+    draw_autocomplete(f, v_chunks[2], state);
+
     if state.hitl.is_some() {
         draw_hitl_overlay(f, state);
     }
     if state.selector.is_some() {
         draw_selector(f, state);
     }
+}
+
+/// 渲染斜杠命令自动补全弹窗（派生态）：锚定在输入框正上方，
+/// 圆角边框 border_user 蓝色，选中行 selector_highlight，描述 selector_dim。
+/// 弹窗区域写入 state.autocomplete_area 供鼠标命中测试。
+///
+/// Renders the slash-command autocomplete popup (derived state): anchored
+/// directly above the input box, rounded border with border_user (blue),
+/// selected row uses selector_highlight, descriptions use selector_dim.
+/// The popup Rect is stored in state.autocomplete_area for mouse hit-testing.
+fn draw_autocomplete(f: &mut Frame, input_area: Rect, state: &mut TuiState) {
+    let Some(query) = autocomplete_query(state) else {
+        state.autocomplete_area = Rect::new(0, 0, 0, 0);
+        return;
+    };
+    let matches = autocomplete_matches(query);
+    if matches.is_empty() {
+        state.autocomplete_area = Rect::new(0, 0, 0, 0);
+        return;
+    }
+    let sel = state.autocomplete_sel.min(matches.len() - 1);
+
+    let shown = matches.len().min(AUTOCOMPLETE_MAX_ROWS);
+    let pw = 40u16.min(input_area.width);
+    let ph = shown as u16 + 2;
+    let py = input_area.y.saturating_sub(ph);
+    let popup_area = Rect::new(input_area.x, py, pw, ph);
+
+    let (start, end) = window_indices(matches.len(), sel, AUTOCOMPLETE_MAX_ROWS);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for match_i in start..end {
+        let (cmd, desc, _) = PALETTE_COMMANDS[matches[match_i]];
+        let is_selected = match_i == sel;
+        let name_style = if is_selected {
+            theme::selector_highlight()
+        } else {
+            theme::selector_normal()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(cmd.to_string(), name_style),
+            Span::styled("  ".to_string(), name_style),
+            Span::styled(desc.to_string(), theme::selector_dim()),
+        ]));
+    }
+
+    f.render_widget(Clear, popup_area);
+    let popup = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(theme::border_user()),
+    );
+    f.render_widget(popup, popup_area);
+
+    state.autocomplete_area = popup_area;
 }
 
 /// 渲染选择器弹窗（opencode 风格）：标题 + 可滚动列表 + 过滤/自定义输入行。
@@ -4981,5 +5365,215 @@ mod tests {
         let (vis, hidden) = cap_items(&s.tool_names, SIDEBAR_SECTION_MAX_ITEMS);
         assert_eq!(vis.len(), 8);
         assert_eq!(hidden, 3);
+    }
+
+    // ===== 斜杠命令自动补全测试 / Slash-command autocomplete tests =====
+
+    fn ac_state(buffer: &str) -> TuiState {
+        let mut s = tui_state_for_test();
+        s.input.buffer = buffer.to_string();
+        s.input.cursor = buffer.len();
+        s
+    }
+
+    #[test]
+    fn autocomplete_query_slash_only_returns_empty() {
+        let s = ac_state("/");
+        assert_eq!(autocomplete_query(&s), Some(""));
+    }
+
+    #[test]
+    fn autocomplete_query_partial_returns_after_slash() {
+        let s = ac_state("/mo");
+        assert_eq!(autocomplete_query(&s), Some("mo"));
+    }
+
+    #[test]
+    fn autocomplete_query_with_space_returns_none() {
+        let s = ac_state("/model x");
+        assert_eq!(autocomplete_query(&s), None, "space in buffer → None");
+    }
+
+    #[test]
+    fn autocomplete_query_non_slash_returns_none() {
+        let s = ac_state("abc");
+        assert_eq!(autocomplete_query(&s), None);
+    }
+
+    #[test]
+    fn autocomplete_query_newline_returns_none() {
+        let s = ac_state("/\n");
+        assert_eq!(autocomplete_query(&s), None, "newline after / → None");
+    }
+
+    #[test]
+    fn autocomplete_query_dismissed_returns_none() {
+        let mut s = ac_state("/mo");
+        s.autocomplete_dismissed = true;
+        assert_eq!(autocomplete_query(&s), None, "dismissed → None");
+    }
+
+    #[test]
+    fn autocomplete_query_thinking_returns_none() {
+        let mut s = ac_state("/mo");
+        s.thinking = true;
+        assert_eq!(autocomplete_query(&s), None, "thinking → None");
+    }
+
+    #[test]
+    fn autocomplete_query_search_mode_returns_none() {
+        let mut s = ac_state("/mo");
+        s.search = Some(SearchState::new());
+        assert_eq!(autocomplete_query(&s), None, "search mode → None");
+    }
+
+    #[test]
+    fn autocomplete_query_selector_mode_returns_none() {
+        let mut s = ac_state("/mo");
+        s.selector = Some(SelectorState::new("t".into(), vec![], false));
+        assert_eq!(autocomplete_query(&s), None, "selector mode → None");
+    }
+
+    #[test]
+    fn autocomplete_matches_empty_returns_all() {
+        let m = autocomplete_matches("");
+        assert_eq!(m.len(), PALETTE_COMMANDS.len(), "empty query → all entries");
+        for (i, &idx) in m.iter().enumerate() {
+            assert_eq!(i, idx, "table order preserved at position {i}");
+        }
+    }
+
+    #[test]
+    fn autocomplete_matches_mo_returns_model_and_models() {
+        let m = autocomplete_matches("mo");
+        let cmds: Vec<&str> = m.iter().map(|&i| PALETTE_COMMANDS[i].0).collect();
+        assert!(cmds.contains(&"/model"), "must contain /model: {cmds:?}");
+        assert!(cmds.contains(&"/models"), "must contain /models: {cmds:?}");
+    }
+
+    #[test]
+    fn autocomplete_matches_zz_returns_empty() {
+        let m = autocomplete_matches("zz");
+        assert!(m.is_empty(), "zz → no matches");
+    }
+
+    #[test]
+    fn autocomplete_matches_case_insensitive() {
+        let m = autocomplete_matches("MO");
+        let cmds: Vec<&str> = m.iter().map(|&i| PALETTE_COMMANDS[i].0).collect();
+        assert!(cmds.contains(&"/model"), "case-insensitive match /model");
+        assert!(cmds.contains(&"/models"), "case-insensitive match /models");
+    }
+
+    #[test]
+    fn autocomplete_enter_exact_match_submits_typed() {
+        // buffer exactly equals the selected command → SubmitTyped.
+        let matches = autocomplete_matches("model");
+        // matches = [idx_of_/models, idx_of_/model]; pick the /model position.
+        let model_pos = matches
+            .iter()
+            .position(|&i| PALETTE_COMMANDS[i].0 == "/model")
+            .unwrap();
+        let decision = autocomplete_enter_decision("/model", model_pos, &matches);
+        assert_eq!(decision, AutocompleteDecision::SubmitTyped);
+    }
+
+    #[test]
+    fn autocomplete_enter_partial_execute_runs() {
+        // /mo partial match on /models (Execute) → Run("/models").
+        let matches = autocomplete_matches("mo");
+        let models_pos = matches
+            .iter()
+            .position(|&i| PALETTE_COMMANDS[i].0 == "/models")
+            .unwrap();
+        let decision = autocomplete_enter_decision("/mo", models_pos, &matches);
+        assert_eq!(decision, AutocompleteDecision::Run("/models".to_string()));
+    }
+
+    #[test]
+    fn autocomplete_enter_partial_plant_input_completes() {
+        // /mo partial match on /model (PlantInput) → Complete("/model ").
+        let matches = autocomplete_matches("mo");
+        let model_pos = matches
+            .iter()
+            .position(|&i| PALETTE_COMMANDS[i].0 == "/model")
+            .unwrap();
+        let decision = autocomplete_enter_decision("/mo", model_pos, &matches);
+        assert_eq!(decision, AutocompleteDecision::Complete("/model ".to_string()));
+    }
+
+    #[test]
+    fn autocomplete_tab_always_completes() {
+        // Tab on /models → Complete-like string "/models " (no Run).
+        let matches = autocomplete_matches("mo");
+        let models_pos = matches
+            .iter()
+            .position(|&i| PALETTE_COMMANDS[i].0 == "/models")
+            .unwrap();
+        let tab = autocomplete_tab_complete(models_pos, &matches);
+        assert_eq!(tab.as_deref(), Some("/models "));
+
+        // Tab on /model (PlantInput) also completes, never runs.
+        let model_pos = matches
+            .iter()
+            .position(|&i| PALETTE_COMMANDS[i].0 == "/model")
+            .unwrap();
+        let tab = autocomplete_tab_complete(model_pos, &matches);
+        assert_eq!(tab.as_deref(), Some("/model "));
+    }
+
+    #[test]
+    fn autocomplete_tab_empty_matches_returns_none() {
+        assert_eq!(autocomplete_tab_complete(0, &[]), None);
+    }
+
+    #[test]
+    fn window_indices_sel_zero() {
+        let (start, end) = window_indices(14, 0, 8);
+        assert_eq!((start, end), (0, 8), "sel=0 → window starts at 0");
+    }
+
+    #[test]
+    fn window_indices_sel_last() {
+        let (start, end) = window_indices(14, 13, 8);
+        assert_eq!((start, end), (6, 14), "sel=13 → window ends at 14, sel visible");
+        assert!(start <= 13 && 13 < end, "sel must be within window");
+    }
+
+    #[test]
+    fn window_indices_len_under_max() {
+        let (start, end) = window_indices(5, 2, 8);
+        assert_eq!((start, end), (0, 5), "len<max → full range");
+    }
+
+    #[test]
+    fn window_indices_len_equals_max() {
+        let (start, end) = window_indices(8, 4, 8);
+        assert_eq!((start, end), (0, 8), "len==max → full range");
+    }
+
+    #[test]
+    fn autocomplete_cycle_wraps_both_directions() {
+        // Reuses next_match/prev_match (already tested for search); verify
+        // the autocomplete path uses the same wraparound with 3 matches.
+        assert_eq!(next_match(2, 3), 0, "forward wrap 2→0");
+        assert_eq!(prev_match(0, 3), 2, "backward wrap 0→2");
+    }
+
+    #[test]
+    fn autocomplete_complete_sets_buffer_and_cursor() {
+        // Applying a Complete decision: buffer becomes "/model " with cursor at end.
+        let mut s = ac_state("/mo");
+        let completion = "/model ".to_string();
+        s.input.buffer = completion.clone();
+        s.input.cursor = s.input.buffer.len();
+        assert_eq!(s.input.buffer, "/model ");
+        assert_eq!(s.input.cursor, 7, "cursor at end of '/model '");
+    }
+
+    #[test]
+    fn autocomplete_enter_empty_matches_submits_typed() {
+        let decision = autocomplete_enter_decision("/zz", 0, &[]);
+        assert_eq!(decision, AutocompleteDecision::SubmitTyped);
     }
 }

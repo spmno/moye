@@ -22,6 +22,13 @@ pub fn bg_panel() -> Style {
     Style::new().bg(Color::Rgb(0x25, 0x25, 0x25))
 }
 
+/// 区域分隔带背景（darker tier，纯背景列、非线条字符）。
+/// Region separator band background (darker tier — a pure background
+/// column, not a line glyph).
+pub fn bg_darker() -> Style {
+    Style::new().bg(Color::Rgb(0x12, 0x12, 0x12))
+}
+
 /// 用户消息块左边框色（OpenCode blue）。
 /// User message block left-border color (OpenCode blue).
 pub fn border_user() -> Style {

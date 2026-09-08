@@ -2620,12 +2620,21 @@ fn draw(f: &mut Frame, state: &mut TuiState) {
 
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(1), Constraint::Length(34)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(34),
+        ])
         .split(area);
 
+    // 消息区与侧栏之间的黑色分隔带（1 格宽纯背景列，无线条字符）。
+    // Black separator band between messages and sidebar (1-cell pure
+    // background column, no line glyph).
+    f.render_widget(Block::default().style(theme::bg_darker()), h_chunks[1]);
+
     let display = state.input.display_text();
-    let input_lines = estimate_input_lines(&display, h_chunks[0].width);
-    let inner_width = (h_chunks[0].width.saturating_sub(2)).max(1) as usize;
+    let input_lines = estimate_input_lines(&display, h_chunks[0].width.saturating_sub(3));
+    let inner_width = (h_chunks[0].width.saturating_sub(3)).max(1) as usize;
     let cursor_line = cursor_display_line(&display, state.input.cursor, inner_width);
     let (input_height, input_scroll) = input_window(input_lines, cursor_line, 10);
     let input_height = input_height.min(area.height / 2);
@@ -2643,7 +2652,7 @@ fn draw(f: &mut Frame, state: &mut TuiState) {
     draw_messages(f, v_chunks[0], state);
     draw_streaming(f, v_chunks[1], state);
     draw_input(f, v_chunks[2], state);
-    draw_sidebar(f, h_chunks[1], state);
+    draw_sidebar(f, h_chunks[2], state);
 
     if state.hitl.is_some() {
         draw_hitl_overlay(f, state);
@@ -2907,6 +2916,9 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
             .style(theme::selector_input())
             .block(
                 Block::default()
+                    .borders(Borders::LEFT)
+                    .border_type(BorderType::Thick)
+                    .border_style(theme::border_user())
                     .style(theme::bg_panel())
                     .padding(Padding::horizontal(1)),
             );
@@ -2922,7 +2934,7 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
             x = x.saturating_add(w);
         }
         let inner_right = area.x.saturating_add(area.width).saturating_sub(1);
-        let cx = (area.x + 1 + x).min(inner_right);
+        let cx = (area.x + 2 + x).min(inner_right);
         let cy = area.y;
         f.set_cursor_position((cx, cy));
         return;
@@ -2940,6 +2952,9 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
         .scroll((state.input_scroll, 0))
         .block(
             Block::default()
+                .borders(Borders::LEFT)
+                .border_type(BorderType::Thick)
+                .border_style(theme::border_user())
                 .style(theme::bg_panel())
                 .padding(Padding::horizontal(1)),
         );
@@ -2947,7 +2962,7 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
     f.render_widget(input, area);
 
     if !state.thinking {
-        let inner_width = (area.width.saturating_sub(2)).max(1) as usize;
+        let inner_width = (area.width.saturating_sub(3)).max(1) as usize;
         let mut x: usize = 0;
         let mut y: u16 = 0;
         for c in state.input.buffer[..state.input.cursor].chars() {
@@ -2964,7 +2979,7 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
                 }
             }
         }
-        let cx = area.x + 1 + x as u16;
+        let cx = area.x + 2 + x as u16;
         let max_y = area.y + area.height.saturating_sub(1);
         // 减去滚动偏移，使光标在可见区域内定位。
         // Subtract scroll offset so the cursor positions within the visible area.

@@ -3050,7 +3050,20 @@ fn draw(f: &mut Frame, state: &mut TuiState) {
 /// Display width for autocomplete: ASCII = 1 column, others = 2 (matches the
 /// cursor width model used elsewhere in this file).
 fn ac_display_width(s: &str) -> usize {
-    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+    s.chars()
+        .map(|c| {
+            if c == '\u{2026}' {
+                // U+2026 在终端按窄字符渲染（宽度 1），否则截断宽度永远算不对。
+                // U+2026 renders narrow (width 1) in terminals; counting it
+                // as 2 would break every truncation width calculation.
+                1
+            } else if c.is_ascii() {
+                1
+            } else {
+                2
+            }
+        })
+        .sum()
 }
 
 /// 把描述截断到指定显示宽度，超出时末位替换为 `…`。

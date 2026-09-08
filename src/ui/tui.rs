@@ -595,6 +595,15 @@ struct TuiState {
     /// Todo list from the todo_write tool — updated by TodoUpdate events,
     /// rendered in the sidebar.
     todos: Vec<TodoItem>,
+    /// 侧边栏折叠状态集合；初始含 Tools（默认折叠）。
+    /// Set of collapsed sidebar sections; initialized with Tools (collapsed by default).
+    sidebar_collapsed: std::collections::HashSet<SidebarSection>,
+    /// 命中映射：(屏幕行号, 区段)。每帧 draw_sidebar 重建。
+    /// Hit-test map: (screen row, section). Repopulated every draw_sidebar.
+    sidebar_headers: Vec<(u16, SidebarSection)>,
+    /// 侧边栏 Rect：draw_sidebar 时写入，handle_mouse_event 命中测试时读。
+    /// Sidebar Rect: written in draw_sidebar, read in handle_mouse_event for hit-testing.
+    sidebar_area: Rect,
 }
 
 impl TuiState {
@@ -647,6 +656,9 @@ impl TuiState {
             palette_active: false,
             rewind_active: false,
             todos: Vec::new(),
+            sidebar_collapsed: std::collections::HashSet::from([SidebarSection::Tools]),
+            sidebar_headers: Vec::new(),
+            sidebar_area: Rect::new(0, 0, 0, 0),
         }
     }
 
@@ -1846,6 +1858,23 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
         MouseEventKind::Down(MouseButton::Left) => {
             let row = mouse.row;
             let col = mouse.column;
+            // 侧边栏区段标题命中测试：点击折叠/展开，不启动消息选区。
+            // Sidebar header hit-test: clicking toggles a section, does NOT start selection.
+            let sb = state.sidebar_area;
+            if row >= sb.y
+                && row < sb.y.saturating_add(sb.height)
+                && col >= sb.x
+                && col < sb.x.saturating_add(sb.width)
+            {
+                if let Some(section) = section_at_row(&state.sidebar_headers, row) {
+                    if state.sidebar_collapsed.contains(&section) {
+                        state.sidebar_collapsed.remove(&section);
+                    } else {
+                        state.sidebar_collapsed.insert(section);
+                    }
+                    return;
+                }
+            }
             let inner = state.msg_area;
             if row >= inner.y && row < inner.y.saturating_add(inner.height) {
                 let logical = Selection::screen_to_logical(row, inner.y, state.msg_scroll);
@@ -3095,10 +3124,59 @@ fn todo_lines(todos: &[TodoItem], width: u16) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
+/// 侧边栏可折叠的列表区段。
+/// Collapsible list sections in the sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SidebarSection {
+    Tools,
+    Mcp,
+    Skills,
+    Todos,
+}
+
+/// 展开区段最多显示的条目数；超出部分折叠为 "… {n} more"。
+/// Max items shown in an expanded section; overflow collapses to "… {n} more".
+const SIDEBAR_SECTION_MAX_ITEMS: usize = 8;
+
+/// 构造区段标题行：`{title} ({count}) {marker}`。
+/// marker 为 ▾(展开) / ▸(折叠)。
+/// Build a section header line: `{title} ({count}) {marker}`,
+/// where marker is ▾ (expanded) / ▸ (collapsed).
+fn section_header(title: &str, count: usize, collapsed: bool) -> String {
+    let marker = if collapsed { '\u{25b8}' } else { '\u{25be}' };
+    format!("{title} ({count}) {marker}")
+}
+
+/// 截取前 `max` 条，返回 (可见切片, 隐藏数)。
+/// Cap to the first `max` items, returning (visible slice, hidden count).
+fn cap_items<T>(items: &[T], max: usize) -> (&[T], usize) {
+    let len = items.len();
+    if len <= max {
+        (items, 0)
+    } else {
+        (&items[..max], len - max)
+    }
+}
+
+/// 根据屏幕行号在命中映射中查找对应的区段；命中映射每帧 draw_sidebar 重建。
+/// Look up the section for a given screen row in the hit-test map,
+/// which is repopulated every frame in draw_sidebar.
+fn section_at_row(headers: &[(u16, SidebarSection)], row: u16) -> Option<SidebarSection> {
+    headers
+        .iter()
+        .find(|(r, _)| *r == row)
+        .map(|(_, s)| *s)
+}
+
+fn draw_sidebar(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let block = Block::default()
         .style(theme::sidebar_bg())
         .padding(Padding::horizontal(1));
+
+    // 存侧边栏 Rect + 重建命中映射（每帧 draw_sidebar 重写）。
+    // Store sidebar Rect + rebuild hit-test map (overwritten every draw_sidebar).
+    state.sidebar_area = area;
+    state.sidebar_headers.clear();
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -3175,85 +3253,143 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
     lines.push(Line::styled(status_text, status_style));
     lines.push(Line::default());
 
-    // Todos (keep as a group with the same title/content rules)
+    // Todos (collapsible, expanded by default)
     if !state.todos.is_empty() {
-        lines.push(Line::styled("Todos", theme::sidebar_title()));
-        let content_w = area.width.saturating_sub(4);
-        for line in todo_lines(&state.todos, content_w) {
-            lines.push(line);
-        }
-        lines.push(Line::default());
-    }
-
-    // Tools
-    lines.push(Line::styled(
-        format!("Tools ({})", state.tool_names.len()),
-        theme::sidebar_title(),
-    ));
-    for name in &state.tool_names {
+        let collapsed = state.sidebar_collapsed.contains(&SidebarSection::Todos);
+        state
+            .sidebar_headers
+            .push((area.y + lines.len() as u16, SidebarSection::Todos));
         lines.push(Line::styled(
-            format!(" \u{2022} {name}"),
-            theme::tool_item(),
-        ));
-    }
-    lines.push(Line::default());
-
-    // MCP Servers
-    if !state.mcp_servers.is_empty() {
-        let connected = state.mcp_servers.iter().filter(|s| s.connected).count();
-        let total_tools: usize = state.mcp_servers.iter().map(|s| s.tool_names.len()).sum();
-        lines.push(Line::styled(
-            format!(
-                "MCP ({connected}/{} servers, {total_tools} tools)",
-                state.mcp_servers.len()
-            ),
+            section_header("Todos", state.todos.len(), collapsed),
             theme::sidebar_title(),
         ));
-        for server in &state.mcp_servers {
-            if server.connected {
+        if !collapsed {
+            let content_w = area.width.saturating_sub(4);
+            let (visible, hidden) = cap_items(&state.todos, SIDEBAR_SECTION_MAX_ITEMS);
+            for line in todo_lines(visible, content_w) {
+                lines.push(line);
+            }
+            if hidden > 0 {
                 lines.push(Line::styled(
-                    format!(
-                        " \u{2713} {} ({} tools)",
-                        server.name,
-                        server.tool_names.len()
-                    ),
-                    theme::status_ok(),
+                    format!(" \u{2026} {hidden} more"),
+                    theme::meta_info(),
                 ));
-                for tn in &server.tool_names {
-                    lines.push(Line::styled(
-                        format!("   \u{2022} {tn}"),
-                        theme::tool_item(),
-                    ));
-                }
-            } else {
-                lines.push(Line::styled(
-                    format!(" \u{2717} {}", server.name),
-                    theme::status_error(),
-                ));
-                if let Some(ref err) = server.error {
-                    let truncated = if err.len() > 40 {
-                        format!("   {err:.40}...")
-                    } else {
-                        format!("   {err}")
-                    };
-                    lines.push(Line::styled(truncated, theme::meta_info()));
-                }
             }
         }
         lines.push(Line::default());
     }
 
-    // Skills
-    if !state.skill_names.is_empty() {
+    // Tools (collapsible, collapsed by default)
+    {
+        let collapsed = state.sidebar_collapsed.contains(&SidebarSection::Tools);
+        state
+            .sidebar_headers
+            .push((area.y + lines.len() as u16, SidebarSection::Tools));
         lines.push(Line::styled(
-            format!("Skills ({})", state.skill_names.len()),
+            section_header("Tools", state.tool_names.len(), collapsed),
             theme::sidebar_title(),
         ));
-        for name in &state.skill_names {
-            lines.push(Line::styled(
-                format!(" \u{2022} {name}"),
-                theme::tool_item(),
-            ));
+        if !collapsed {
+            let (visible, hidden) = cap_items(&state.tool_names, SIDEBAR_SECTION_MAX_ITEMS);
+            for name in visible {
+                lines.push(Line::styled(
+                    format!(" \u{2022} {name}"),
+                    theme::tool_item(),
+                ));
+            }
+            if hidden > 0 {
+                lines.push(Line::styled(
+                    format!(" \u{2026} {hidden} more"),
+                    theme::meta_info(),
+                ));
+            }
+        }
+        lines.push(Line::default());
+    }
+
+    // MCP Servers (collapsible, expanded by default)
+    if !state.mcp_servers.is_empty() {
+        let connected = state.mcp_servers.iter().filter(|s| s.connected).count();
+        let total_tools: usize = state.mcp_servers.iter().map(|s| s.tool_names.len()).sum();
+        let collapsed = state.sidebar_collapsed.contains(&SidebarSection::Mcp);
+        let marker = if collapsed { '\u{25b8}' } else { '\u{25be}' };
+        state
+            .sidebar_headers
+            .push((area.y + lines.len() as u16, SidebarSection::Mcp));
+        lines.push(Line::styled(
+            format!(
+                "MCP ({connected}/{} servers, {total_tools} tools) {marker}",
+                state.mcp_servers.len()
+            ),
+            theme::sidebar_title(),
+        ));
+        if !collapsed {
+            let (visible, hidden) = cap_items(&state.mcp_servers, SIDEBAR_SECTION_MAX_ITEMS);
+            for server in visible {
+                if server.connected {
+                    lines.push(Line::styled(
+                        format!(
+                            " \u{2713} {} ({} tools)",
+                            server.name,
+                            server.tool_names.len()
+                        ),
+                        theme::status_ok(),
+                    ));
+                    for tn in &server.tool_names {
+                        lines.push(Line::styled(
+                            format!("   \u{2022} {tn}"),
+                            theme::tool_item(),
+                        ));
+                    }
+                } else {
+                    lines.push(Line::styled(
+                        format!(" \u{2717} {}", server.name),
+                        theme::status_error(),
+                    ));
+                    if let Some(ref err) = server.error {
+                        let truncated = if err.len() > 40 {
+                            format!("   {err:.40}...")
+                        } else {
+                            format!("   {err}")
+                        };
+                        lines.push(Line::styled(truncated, theme::meta_info()));
+                    }
+                }
+            }
+            if hidden > 0 {
+                lines.push(Line::styled(
+                    format!(" \u{2026} {hidden} more"),
+                    theme::meta_info(),
+                ));
+            }
+        }
+        lines.push(Line::default());
+    }
+
+    // Skills (collapsible, expanded by default)
+    if !state.skill_names.is_empty() {
+        let collapsed = state.sidebar_collapsed.contains(&SidebarSection::Skills);
+        state
+            .sidebar_headers
+            .push((area.y + lines.len() as u16, SidebarSection::Skills));
+        lines.push(Line::styled(
+            section_header("Skills", state.skill_names.len(), collapsed),
+            theme::sidebar_title(),
+        ));
+        if !collapsed {
+            let (visible, hidden) = cap_items(&state.skill_names, SIDEBAR_SECTION_MAX_ITEMS);
+            for name in visible {
+                lines.push(Line::styled(
+                    format!(" \u{2022} {name}"),
+                    theme::tool_item(),
+                ));
+            }
+            if hidden > 0 {
+                lines.push(Line::styled(
+                    format!(" \u{2026} {hidden} more"),
+                    theme::meta_info(),
+                ));
+            }
         }
         lines.push(Line::default());
     }
@@ -4681,5 +4817,169 @@ mod tests {
         assert_ne!(HitlDecision::Allow, HitlDecision::Deny);
         assert_ne!(HitlDecision::Allow, HitlDecision::Always);
         assert_ne!(HitlDecision::Deny, HitlDecision::Always);
+    }
+
+    // ── 侧边栏折叠：section_header / cap_items / section_at_row / toggle ──
+    // ── Sidebar collapse: section_header / cap_items / section_at_row / toggle ──
+
+    #[test]
+    fn section_header_collapsed_shows_right_marker() {
+        let h = section_header("Tools", 11, true);
+        assert!(h.contains("Tools"), "title present: {h}");
+        assert!(h.contains("(11)"), "count in parens: {h}");
+        assert!(h.contains('\u{25b8}'), "collapsed marker \u{25b8}: {h}");
+        assert!(
+            !h.contains('\u{25be}'),
+            "must NOT show expanded marker: {h}"
+        );
+    }
+
+    #[test]
+    fn section_header_expanded_shows_down_marker() {
+        let h = section_header("Skills", 3, false);
+        assert!(h.contains("Skills"), "title present: {h}");
+        assert!(h.contains("(3)"), "count in parens: {h}");
+        assert!(h.contains('\u{25be}'), "expanded marker \u{25be}: {h}");
+        assert!(
+            !h.contains('\u{25b8}'),
+            "must NOT show collapsed marker: {h}"
+        );
+    }
+
+    #[test]
+    fn cap_items_empty_returns_zero_hidden() {
+        let items: Vec<i32> = vec![];
+        let (vis, hidden) = cap_items(&items, 8);
+        assert!(vis.is_empty(), "empty input → empty visible");
+        assert_eq!(hidden, 0, "empty input → 0 hidden");
+    }
+
+    #[test]
+    fn cap_items_at_max_returns_all_zero_hidden() {
+        let items: Vec<i32> = (0..8).collect();
+        let (vis, hidden) = cap_items(&items, 8);
+        assert_eq!(vis.len(), 8, "exactly max → all visible");
+        assert_eq!(hidden, 0, "exactly max → 0 hidden");
+    }
+
+    #[test]
+    fn cap_items_over_max_caps_and_counts_hidden() {
+        let items: Vec<i32> = (0..11).collect();
+        let (vis, hidden) = cap_items(&items, 8);
+        assert_eq!(vis.len(), 8, "11 items, max 8 → 8 visible");
+        assert_eq!(hidden, 3, "11 items, max 8 → 3 hidden");
+        assert_eq!(vis[0], 0, "first item preserved");
+        assert_eq!(vis[7], 7, "last visible is item 7");
+    }
+
+    #[test]
+    fn sidebar_toggle_double_toggle_restores_state() {
+        let mut s = tui_state_for_test();
+        // Tools is collapsed by default.
+        assert!(
+            s.sidebar_collapsed.contains(&SidebarSection::Tools),
+            "Tools collapsed by default"
+        );
+        // Toggle: remove → expanded.
+        s.sidebar_collapsed.remove(&SidebarSection::Tools);
+        assert!(
+            !s.sidebar_collapsed.contains(&SidebarSection::Tools),
+            "after first toggle Tools is expanded"
+        );
+        // Toggle back: insert → collapsed.
+        s.sidebar_collapsed.insert(SidebarSection::Tools);
+        assert!(
+            s.sidebar_collapsed.contains(&SidebarSection::Tools),
+            "after second toggle Tools is collapsed again"
+        );
+    }
+
+    #[test]
+    fn section_at_row_finds_matching_section() {
+        let headers = vec![
+            (5u16, SidebarSection::Todos),
+            (12u16, SidebarSection::Tools),
+            (20u16, SidebarSection::Skills),
+        ];
+        assert_eq!(
+            section_at_row(&headers, 5),
+            Some(SidebarSection::Todos),
+            "row 5 → Todos"
+        );
+        assert_eq!(
+            section_at_row(&headers, 12),
+            Some(SidebarSection::Tools),
+            "row 12 → Tools"
+        );
+        assert_eq!(
+            section_at_row(&headers, 20),
+            Some(SidebarSection::Skills),
+            "row 20 → Skills"
+        );
+    }
+
+    #[test]
+    fn section_at_row_returns_none_for_gap() {
+        let headers = vec![(5u16, SidebarSection::Tools), (10u16, SidebarSection::Skills)];
+        assert_eq!(section_at_row(&headers, 7), None, "row 7 is a gap → None");
+        assert_eq!(section_at_row(&headers, 0), None, "row 0 is a gap → None");
+        assert_eq!(
+            section_at_row(&headers, 100),
+            None,
+            "row 100 is a gap → None"
+        );
+    }
+
+    #[test]
+    fn section_at_row_empty_headers_returns_none() {
+        let headers: Vec<(u16, SidebarSection)> = vec![];
+        assert_eq!(section_at_row(&headers, 0), None);
+    }
+
+    #[test]
+    fn sidebar_tools_collapsed_by_default_with_eleven_tools() {
+        let tools: Vec<String> = (0..11)
+            .map(|i| format!("tool_{i}"))
+            .collect();
+        let s = TuiState::new(
+            "test".into(),
+            "m".into(),
+            10,
+            tools,
+            vec![],
+            vec![],
+        );
+        // Tools is collapsed by default; MCP/Skills/Todos are not.
+        assert!(
+            s.sidebar_collapsed.contains(&SidebarSection::Tools),
+            "Tools collapsed by default"
+        );
+        assert!(
+            !s.sidebar_collapsed.contains(&SidebarSection::Mcp),
+            "MCP expanded by default"
+        );
+        assert!(
+            !s.sidebar_collapsed.contains(&SidebarSection::Skills),
+            "Skills expanded by default"
+        );
+        assert!(
+            !s.sidebar_collapsed.contains(&SidebarSection::Todos),
+            "Todos expanded by default"
+        );
+        // Collapsed header for 11 tools contains "Tools (11)" + ▸, not tool names.
+        let header = section_header("Tools", 11, true);
+        assert!(header.contains("Tools (11)"), "header text: {header}");
+        assert!(header.contains('\u{25b8}'), "collapsed marker: {header}");
+        assert!(
+            !header.contains("tool_0"),
+            "collapsed header must NOT contain tool names: {header}"
+        );
+        // After toggling expanded, the header marker flips to ▾.
+        let header_exp = section_header("Tools", 11, false);
+        assert!(header_exp.contains('\u{25be}'), "expanded marker: {header_exp}");
+        // cap_items on 11 tools with max 8 → 3 hidden (overflow line).
+        let (vis, hidden) = cap_items(&s.tool_names, SIDEBAR_SECTION_MAX_ITEMS);
+        assert_eq!(vis.len(), 8);
+        assert_eq!(hidden, 3);
     }
 }

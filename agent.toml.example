@@ -189,6 +189,31 @@ rule_escalation_threshold = 3
 # authorized_dirs = ["~/.config", "/tmp/moye", "../shared-libs"]
 authorized_dirs = []
 
+# 命令规则：对 run_bash 的 command 字符串做 glob 匹配，首条匹配胜出（allow/ask/deny）。
+# 在只读/会改变状态分类之前评估——让用户预授权高频可信命令（如 cargo test、git status）
+# 或限制只读分类的命令。仅影响 run_bash，其他工具不受影响。
+# 省略时为空，行为与现有只读/会改变状态分类完全一致（向后兼容）。
+#
+# Command rules: glob-matched against run_bash command strings, first match wins
+# (allow/ask/deny). Evaluated BEFORE the readonly/mutating classification — lets
+# users pre-approve trusted frequent commands (e.g. cargo test, git status) or
+# restrict readonly-classified commands. Only affects run_bash; other tools unaffected.
+# Absent → empty, fully backward compatible with existing classification.
+#
+# pattern 支持 * 通配符（匹配任意可为空序列）；其余字符按字面；大小写敏感。
+# pattern supports * wildcards (matches any possibly-empty sequence);
+# all other chars literal; case-sensitive.
+#
+# 示例 / Example:
+# command_rules = [
+#   { pattern = "cargo test*", tier = "allow" },
+#   { pattern = "cargo build*", tier = "allow" },
+#   { pattern = "git status*", tier = "allow" },
+#   { pattern = "git log*", tier = "allow" },
+#   { pattern = "npm run build*", tier = "allow" },
+#   { pattern = "rm *", tier = "deny" },
+# ]
+
 # ── 验证门 / Verify Gate ─────────────────────────────────────────────────
 # 在 Builder 产出后、Auditor 评审前自动运行构建/测试命令。
 # 失败时将错误输出回传给 Builder 重试（最多 max_retries 次），耗尽则跳过审计。

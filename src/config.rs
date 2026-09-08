@@ -12,7 +12,7 @@
 
 use crate::context::ContextConfig;
 use crate::memory::MemoryConfig;
-use crate::registry::{RoleConfig, ToolPerms};
+use crate::registry::{CommandRule, RoleConfig, ToolPerms};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -188,6 +188,14 @@ pub struct SandboxConfig {
 
     #[serde(default)]
     pub authorized_dirs: Vec<String>,
+
+    /// 命令规则：对 `run_bash` 的 command 做 glob 匹配，首条匹配胜出（allow/ask/deny）。
+    /// 省略时为空（完全向后兼容，行为与现有只读/会改变状态分类一致）。
+    /// Command rules: glob-matched against `run_bash` commands, first match wins
+    /// (allow/ask/deny). Absent → empty (fully backward compatible, behavior
+    /// matches existing readonly/mutating classification).
+    #[serde(default)]
+    pub command_rules: Vec<CommandRule>,
 }
 
 impl Default for SandboxConfig {
@@ -196,6 +204,7 @@ impl Default for SandboxConfig {
             backend: default_sandbox_backend(),
             mode: default_sandbox_mode(),
             authorized_dirs: Vec::new(),
+            command_rules: Vec::new(),
         }
     }
 }
@@ -1647,5 +1656,73 @@ preamble = "prompts/builder.md"
         assert!(!cfg.agents.roles.contains_key("researcher"));
         assert!(cfg.agents.roles.contains_key("builder"));
         assert!(cfg.agents.custom.contains_key("researcher"));
+    }
+
+    // ── [sandbox].command_rules 测试 / command_rules tests ──
+
+    #[test]
+    fn sandbox_command_rules_absent_defaults_empty() {
+        let cfg: Config = toml::from_str("[sandbox]\nbackend = \"auto\"\n").unwrap();
+        assert!(cfg.sandbox.command_rules.is_empty());
+    }
+
+    #[test]
+    fn sandbox_command_rules_parsed_in_order() {
+        let toml_str = r#"
+[sandbox]
+backend = "auto"
+mode = "auto"
+command_rules = [
+  { pattern = "cargo test*", tier = "allow" },
+  { pattern = "rm *", tier = "deny" },
+  { pattern = "git * log", tier = "allow" },
+]
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.sandbox.command_rules.len(), 3);
+        assert_eq!(cfg.sandbox.command_rules[0].pattern, "cargo test*");
+        assert_eq!(cfg.sandbox.command_rules[0].tier, Permission::Allow);
+        assert_eq!(cfg.sandbox.command_rules[1].pattern, "rm *");
+        assert_eq!(cfg.sandbox.command_rules[1].tier, Permission::Deny);
+        assert_eq!(cfg.sandbox.command_rules[2].pattern, "git * log");
+        assert_eq!(cfg.sandbox.command_rules[2].tier, Permission::Allow);
+    }
+
+    #[test]
+    fn sandbox_command_rules_profile_overlay_preserves_rules() {
+        let toml_str = r#"
+[sandbox]
+backend = "auto"
+mode = "auto"
+command_rules = [{ pattern = "cargo test*", tier = "allow" }]
+
+[profile.strict]
+name = "strict"
+patches = [
+  { id = "sandbox", config = { backend = "landlock", mode = "landlock", authorized_dirs = [], command_rules = [{ pattern = "rm *", tier = "deny" }] } },
+]
+"#;
+        let cfg = Config::from_str_with_profile(toml_str, Some("strict"))
+            .expect("profile parse should succeed");
+        assert_eq!(cfg.sandbox.backend, "landlock");
+        assert_eq!(cfg.sandbox.command_rules.len(), 1);
+        assert_eq!(cfg.sandbox.command_rules[0].pattern, "rm *");
+        assert_eq!(cfg.sandbox.command_rules[0].tier, Permission::Deny);
+    }
+
+    #[test]
+    fn tool_perms_command_rules_serde_skipped_in_role_config() {
+        let toml_str = r#"
+[agents.builder]
+model = "kimi-k3"
+preamble = "prompts/builder.md"
+permissions.read_file = "allow"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let builder = cfg.agents.roles.get("builder").unwrap();
+        assert!(
+            builder.permissions.command_rules.is_empty(),
+            "serde(skip) → command_rules always empty when deserialized from role TOML"
+        );
     }
 }

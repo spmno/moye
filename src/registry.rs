@@ -61,6 +61,13 @@ pub struct ToolPerms {
     pub web_fetch: Permission,
     #[serde(default = "default_ask")]
     pub web_search: Permission,
+    /// 命令规则：对 `run_bash` 的 command 做 glob 匹配，首条匹配胜出（allow/ask/deny）。
+    /// 全局列表（从 `[sandbox].command_rules` 注入），非按角色；serde skip 保持角色 TOML 解析干净。
+    /// Command rules: glob-matched against `run_bash` commands, first match wins
+    /// (allow/ask/deny). Global list (injected from `[sandbox].command_rules`),
+    /// not per-role; serde skip keeps role-config TOML parsing clean.
+    #[serde(skip)]
+    pub command_rules: Vec<CommandRule>,
 }
 
 /// 读类工具默认允许（自动执行）。
@@ -84,6 +91,7 @@ impl Default for ToolPerms {
             write_file: Permission::Ask,
             web_fetch: Permission::Ask,
             web_search: Permission::Ask,
+            command_rules: Vec::new(),
         }
     }
 }
@@ -152,6 +160,62 @@ impl Permission {
     }
 }
 
+/// 单条命令规则：用 glob 模式匹配 `run_bash` 的 command 字符串，决定其权限分级。
+/// 在只读/会改变状态分类之前评估，让用户预授权高频可信命令或限制只读分类的命令。
+/// A single command rule: glob-matches the `run_bash` command string to decide
+/// its permission tier. Evaluated BEFORE the readonly/mutating classification so
+/// users can pre-approve trusted frequent commands or restrict readonly-classified
+/// commands.
+///
+/// `pattern` 支持 `*` 通配符（匹配任意可为空序列）；其余字符按字面；大小写敏感。
+/// `pattern` supports `*` wildcards (matches any possibly-empty sequence);
+/// all other chars are literal; case-sensitive.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CommandRule {
+    /// glob 模式，如 `"cargo test*"`、`"rm *"`、`"git * log"`。
+    /// Glob pattern, e.g. `"cargo test*"`, `"rm *"`, `"git * log"`.
+    pub pattern: String,
+    /// 匹配时返回的权限分级（allow / ask / deny）。
+    /// Permission tier returned on match (allow / ask / deny).
+    pub tier: Permission,
+}
+
+/// Glob 匹配：`*` 匹配任意（可为空）字符序列；其余字符按字面；大小写敏感。
+/// 空模式匹配 nothing（返回 false），用于 `command_rules` 的 pattern 匹配。
+/// Glob match: `*` matches any (possibly empty) char sequence; all other chars
+/// literal; case-sensitive. An empty pattern matches nothing (returns false).
+fn glob_match(pattern: &str, text: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let mut pi = 0usize;
+    let mut ti = 0usize;
+    let mut star: Option<usize> = None;
+    let mut match_pos = 0usize;
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            match_pos = ti;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            match_pos += 1;
+            ti = match_pos;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 impl ToolPerms {
     /// 按 `tool_name` + `args` 解析单条权限。与 `agent_loop::decide_tier` 行为一致
     /// （`run_bash` 需从 `args.command` 判断只读/会改变状态）。未知工具默认 `Ask`。
@@ -184,6 +248,16 @@ impl ToolPerms {
             "task" => Permission::Allow,
             "run_bash" => {
                 let command = args.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                // 命令规则：首条匹配胜出（allow/ask/deny），在只读/会改变状态分类之前评估，
+                // 让用户预授权高频可信命令或限制只读分类的命令。
+                // Command rules: first match wins (allow/ask/deny), evaluated before the
+                // readonly/mutating classification so users can pre-approve trusted frequent
+                // commands or restrict readonly-classified commands.
+                for rule in &self.command_rules {
+                    if glob_match(&rule.pattern, command) {
+                        return rule.tier;
+                    }
+                }
                 if crate::tools::is_readonly_bash(command) {
                     self.run_bash_readonly
                 } else {
@@ -707,12 +781,15 @@ impl AgentRegistry {
     #[allow(dead_code)]
     pub fn tool_perms(&self, role: Role) -> ToolPerms {
         let key = format!("{role:?}").to_lowercase();
-        self.config
+        let mut perms = self
+            .config
             .agents
             .roles
             .get(&key)
             .map(|rc| rc.permissions.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        perms.command_rules = self.config.sandbox.command_rules.clone();
+        perms
     }
 
     /// 返回所有 MCP 服务器的显示信息（名称、状态、工具列表、错误信息）。
@@ -739,10 +816,12 @@ impl AgentRegistry {
     pub fn agent_spec(&self, role: Role) -> AgentSpec {
         let key = format!("{role:?}").to_lowercase();
         let rc = self.config.agents.roles.get(&key);
+        let mut permissions = rc.map(|c| c.permissions.clone()).unwrap_or_default();
+        permissions.command_rules = self.config.sandbox.command_rules.clone();
         AgentSpec {
             name: key,
             preamble_path: rc.map(|c| c.preamble.clone()).unwrap_or_default(),
-            permissions: rc.map(|c| c.permissions.clone()).unwrap_or_default(),
+            permissions,
             model: rc.map(|c| c.model.clone()),
             max_turns: rc.and_then(|c| c.max_turns),
             embedded_preamble: Some(crate::prompts::default_for(role)),
@@ -753,10 +832,12 @@ impl AgentRegistry {
     /// Builds an `AgentSpec` from `[agents.custom.<name>]`; None if not configured.
     pub fn custom_spec(&self, name: &str) -> Option<AgentSpec> {
         let cc = self.config.agents.custom.get(name)?;
+        let mut permissions = cc.permissions.clone();
+        permissions.command_rules = self.config.sandbox.command_rules.clone();
         Some(AgentSpec {
             name: name.to_string(),
             preamble_path: cc.preamble.clone(),
-            permissions: cc.permissions.clone(),
+            permissions,
             model: cc.model.clone(),
             max_turns: None,
             embedded_preamble: None,
@@ -2104,6 +2185,7 @@ patches = [
             write_file: Permission::Deny,
             web_fetch: Permission::Ask,
             web_search: Permission::Ask,
+            command_rules: Vec::new(),
         }
     }
 
@@ -3239,5 +3321,134 @@ permissions.edit_file = "deny"
         let reg = registry_with_roles();
         let names = reg.custom_names();
         assert_eq!(names, vec!["researcher"]);
+    }
+
+    // ── command_rules: glob_match matrix + permission_for precedence ──
+
+    fn perms_with_rules(rules: &[(&str, Permission)]) -> ToolPerms {
+        let mut perms = perms_allow_readonly_deny_mutating();
+        perms.command_rules = rules
+            .iter()
+            .map(|(p, t)| CommandRule {
+                pattern: p.to_string(),
+                tier: *t,
+            })
+            .collect();
+        perms
+    }
+
+    #[test]
+    fn glob_match_empty_pattern_matches_nothing() {
+        assert!(!glob_match("", "anything"));
+        assert!(!glob_match("", ""));
+    }
+
+    #[test]
+    fn glob_match_star_matches_everything() {
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("*", "cargo test --release"));
+    }
+
+    #[test]
+    fn glob_match_exact_equality() {
+        assert!(glob_match("ls", "ls"));
+        assert!(!glob_match("ls", "ls -la"));
+        assert!(!glob_match("ls", "LS"));
+    }
+
+    #[test]
+    fn glob_match_prefix_wildcard() {
+        assert!(glob_match("cargo test*", "cargo test"));
+        assert!(glob_match("cargo test*", "cargo test --release"));
+        assert!(!glob_match("cargo test*", "cargo build"));
+    }
+
+    #[test]
+    fn glob_match_suffix_wildcard() {
+        assert!(glob_match("*--release", "cargo test --release"));
+        assert!(!glob_match("*--release", "cargo build"));
+    }
+
+    #[test]
+    fn glob_match_infix_wildcard() {
+        assert!(glob_match("git * log", "git abc log"));
+        assert!(!glob_match("git * log", "git log"));
+        assert!(glob_match("git *log", "git log"));
+        assert!(!glob_match("git * log", "git abc commit"));
+    }
+
+    #[test]
+    fn glob_match_multiple_wildcards() {
+        assert!(glob_match("*c*", "abc"));
+        assert!(glob_match("a*b*c", "aXbYc"));
+        assert!(glob_match("a*b*c", "abc"));
+    }
+
+    #[test]
+    fn glob_match_case_sensitive() {
+        assert!(!glob_match("C*", "cargo"));
+        assert!(glob_match("c*", "cargo"));
+        assert!(!glob_match("Cargo*", "cargo test"));
+    }
+
+    #[test]
+    fn glob_match_deny_pattern() {
+        assert!(glob_match("rm *", "rm -rf /"));
+        assert!(!glob_match("rm *", "rm"));
+        assert!(glob_match("rm*", "rm"));
+        assert!(!glob_match("rm *", "ls -la"));
+    }
+
+    #[test]
+    fn permission_for_command_rule_allow_overrides_mutating_classification() {
+        let perms = perms_with_rules(&[("cargo test*", Permission::Allow)]);
+        let args = serde_json::json!({"command": "cargo test --release"});
+        assert_eq!(perms.permission_for("run_bash", &args), Permission::Allow);
+    }
+
+    #[test]
+    fn permission_for_command_rule_deny_overrides_readonly_classification() {
+        let perms = perms_with_rules(&[("ls*", Permission::Deny)]);
+        let args = serde_json::json!({"command": "ls -la"});
+        assert_eq!(perms.permission_for("run_bash", &args), Permission::Deny);
+    }
+
+    #[test]
+    fn permission_for_command_rule_first_match_wins() {
+        let perms = perms_with_rules(&[
+            ("cargo *", Permission::Allow),
+            ("cargo test*", Permission::Deny),
+        ]);
+        let args = serde_json::json!({"command": "cargo test --release"});
+        assert_eq!(perms.permission_for("run_bash", &args), Permission::Allow);
+    }
+
+    #[test]
+    fn permission_for_command_rule_no_match_falls_back_to_classification() {
+        let perms = perms_with_rules(&[("cargo test*", Permission::Allow)]);
+        let args = serde_json::json!({"command": "git status"});
+        assert_eq!(perms.permission_for("run_bash", &args), Permission::Allow);
+    }
+
+    #[test]
+    fn permission_for_command_rule_empty_command() {
+        let perms = perms_with_rules(&[("cargo test*", Permission::Allow)]);
+        let args = serde_json::json!({"command": ""});
+        assert_eq!(perms.permission_for("run_bash", &args), Permission::Deny);
+    }
+
+    #[test]
+    fn permission_for_command_rule_malformed_args_falls_back() {
+        let perms = perms_with_rules(&[("cargo test*", Permission::Allow)]);
+        let args = serde_json::json!({"path": "not-a-command"});
+        assert_eq!(perms.permission_for("run_bash", &args), Permission::Deny);
+    }
+
+    #[test]
+    fn permission_for_command_rules_only_affect_run_bash() {
+        let perms = perms_with_rules(&[("edit*", Permission::Allow)]);
+        let args = serde_json::json!({"path": "x", "old": "a", "new": "b"});
+        assert_eq!(perms.permission_for("edit_file", &args), Permission::Deny);
     }
 }

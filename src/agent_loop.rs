@@ -1455,6 +1455,7 @@ mod tests {
             write_file: Permission::Ask,
             web_fetch: Permission::Allow,
             web_search: Permission::Allow,
+            command_rules: Vec::new(),
         }
     }
 

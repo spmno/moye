@@ -3060,8 +3060,6 @@ fn todo_lines(todos: &[TodoItem], width: u16) -> Vec<Line<'static>> {
 
 fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
     let block = Block::default()
-        .borders(Borders::LEFT)
-        .border_style(theme::border())
         .style(theme::bg_panel())
         .padding(Padding::horizontal(1));
 

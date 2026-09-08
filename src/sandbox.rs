@@ -196,6 +196,13 @@ pub struct SimpleSandbox {
     /// OS 级沙箱后端（已解析，非 Auto）。
     /// OS-level sandbox backend (resolved, not Auto).
     backend: SandboxBackend,
+    /// 是否允许网络访问（仅 bwrap 后端生效）。
+    /// false 时 wrap_command 在 bwrap argv 追加 --unshare-net。
+    /// Landlock 后端无法控制网络，此字段被忽略。
+    /// Whether network access is allowed (bwrap backend only).
+    /// When false, wrap_command appends --unshare-net to the bwrap argv.
+    /// Landlock can't do network namespaces; this field is ignored.
+    allow_network: bool,
 }
 
 /// 向后兼容别名：现有代码以 `Sandbox` 名引用具体类型，todo 4 重命名为 `SimpleSandbox`
@@ -253,12 +260,32 @@ impl SimpleSandbox {
         let root = std::env::current_dir()
             .and_then(|p| p.canonicalize())
             .unwrap_or_else(|_| PathBuf::from("."));
+        // 从全局配置读取 allow_network；测试环境（未初始化配置）默认 true。
+        // Read allow_network from the global config; defaults to true in tests
+        // (config not yet initialized).
+        let cfg = crate::config::config();
+        let allow_network = cfg
+            .map(|c| c.sandbox.allow_network)
+            .unwrap_or(true);
+        // Landlock 后端无法创建网络命名空间——allow_network=false 在 landlock
+        // 模式下被忽略。启动时 warn 一次，提醒用户配置无效。
+        // Landlock can't create network namespaces — allow_network=false is
+        // ignored in landlock mode. Warn once at sandbox build time.
+        if let Some(c) = cfg {
+            if c.sandbox.mode == "landlock" && !c.sandbox.allow_network {
+                tracing::warn!(
+                    "[sandbox].allow_network = false is ignored in landlock mode; \
+                     Landlock is path-level access control and cannot isolate network"
+                );
+            }
+        }
         Self {
             root,
             authorized: Arc::new(Mutex::new(HashSet::new())),
             auth_version: Arc::new(AtomicU64::new(0)),
             enabled,
             backend,
+            allow_network,
         }
     }
 
@@ -347,6 +374,14 @@ impl SimpleSandbox {
                 argv.push("--tmpfs".into());
                 argv.push("/tmp".into());
                 argv.push("--die-with-parent".into());
+                // 网络隔离：allow_network=false 时创建独立网络命名空间（无网卡）。
+                // Landlock 后端无法做网络隔离——此分支仅 bwrap 进入。
+                // Network isolation: allow_network=false creates an isolated net
+                // namespace (no interfaces). Landlock can't isolate networks — this
+                // branch is bwrap-only.
+                if !self.allow_network {
+                    argv.push("--unshare-net".into());
+                }
                 Some(argv)
             }
             SandboxBackend::Seatbelt => {
@@ -536,6 +571,20 @@ impl SimpleSandbox {
     /// Checks whether a path is within the sandbox (under root or an authorized directory).
     fn is_within_sandbox(&self, path: &Path) -> bool {
         let canon = self.canonicalize_safe(path);
+        // 规范化失败时（canon == path），原始路径可能仍含 .. 组件，
+        // starts_with 会因字面前缀匹配而误判为沙箱内。
+        // 保守处理：规范化失败且路径含 .. 时视为逃逸。
+        // When canonicalization fails (canon == path), the raw path may still
+        // contain .. components, and starts_with gives a false positive because
+        // the literal prefix matches before .. is resolved. Conservative fix:
+        // treat unresolved .. as an escape attempt.
+        if canon.as_path() == path
+            && path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return false;
+        }
         // 项目根目录及其子目录
         // Project root and its subdirectories
         if canon.starts_with(&self.root) {
@@ -896,6 +945,11 @@ fn expand_env_var_token(token: &str) -> Option<String> {
 /// Cleans a token: strips shell redirection operators and quotes.
 fn clean_token(token: &str) -> &str {
     let mut s = token;
+    // dd 的 of= 参数：`of=/etc/x` → 去除 `of=` 前缀以提取目标路径。
+    // dd's of= argument: strip the `of=` prefix to extract the target path.
+    if s.starts_with("of=") {
+        s = &s[3..];
+    }
     // 去除前导重定向操作符：>, >>, <, 2>, &>
     // Strip leading redirection operators: >, >>, <, 2>, &>
     loop {
@@ -1259,6 +1313,7 @@ mod tests {
             auth_version: Arc::new(AtomicU64::new(0)),
             enabled: false,
             backend: SandboxBackend::Off,
+            allow_network: true,
         };
         assert!(sb.check_path("/etc/passwd").is_ok());
         assert!(sb.check_bash("cat /etc/passwd").is_ok());
@@ -1310,6 +1365,7 @@ mod tests {
             auth_version: Arc::new(AtomicU64::new(0)),
             enabled: true,
             backend: SandboxBackend::Path,
+            allow_network: true,
         };
         assert!(sb.wrap_command().is_none());
     }
@@ -1322,6 +1378,7 @@ mod tests {
             auth_version: Arc::new(AtomicU64::new(0)),
             enabled: false,
             backend: SandboxBackend::Off,
+            allow_network: true,
         };
         assert!(sb.wrap_command().is_none());
     }
@@ -1336,6 +1393,7 @@ mod tests {
             auth_version: Arc::new(AtomicU64::new(0)),
             enabled: true,
             backend: SandboxBackend::Bwrap,
+            allow_network: true,
         };
         let argv = sb.wrap_command().expect("bwrap should produce argv");
         assert_eq!(argv[0], "bwrap");
@@ -1363,6 +1421,7 @@ mod tests {
             auth_version: Arc::new(AtomicU64::new(0)),
             enabled: true,
             backend: SandboxBackend::Bwrap,
+            allow_network: true,
         };
         let argv = sb.wrap_command().expect("bwrap should produce argv");
         assert!(argv.contains(&"/tmp/authorized".to_string()));
@@ -1376,6 +1435,7 @@ mod tests {
             auth_version: Arc::new(AtomicU64::new(0)),
             enabled: true,
             backend: SandboxBackend::Seatbelt,
+            allow_network: true,
         };
         let policy = sb.seatbelt_policy();
         assert!(policy.contains("deny file-write*"));
@@ -1390,6 +1450,7 @@ mod tests {
             auth_version: Arc::new(AtomicU64::new(0)),
             enabled: true,
             backend: SandboxBackend::Seatbelt,
+            allow_network: true,
         };
         let policy = sb.seatbelt_policy();
         for dev in ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"] {
@@ -1597,5 +1658,135 @@ mod tests {
         assert_eq!(sb.auth_version(), 0);
         sb.authorize_tool("read_file", r#"{"path":"/tmp/foo"}"#);
         assert!(sb.auth_version() >= 1, "version should be >= 1 after authorize_tool");
+    }
+
+    // ── 写入向量电池 / Write-vector battery ──────────────────────────────
+    // 这些测试枚举 shell 写入通道，逐一验证 check_bash 能捕获触及沙箱外路径的
+    // 向量。每个向量要么已被证明捕获（测试通过），要么被修复后通过。
+    // 注意：这是 HITL 路径检查层的启发式提取——OS 级 bwrap/landlock 才是真正的
+    // 强制层；此处的目标是捕获常见向量以触发用户提示，而非完整 shell 语法解析。
+    //
+    // These tests enumerate shell write channels, verifying that check_bash
+    // catches each vector that touches an out-of-sandbox path. Each vector is
+    // either proven already-caught (test passes) or fixed then proven.
+    // Note: this is the heuristic extraction layer of the HITL path-check gate
+    // — the OS-level bwrap/landlock is the real enforcement; the extractor's
+    // job is catching COMMON vectors so users get prompted, not full shell parsing.
+
+    /// 写入向量电池：每个向量触及沙箱外路径（/etc 或 ../../etc），
+    /// check_bash 必须返回 Err。
+    /// Write-vector battery: each vector touches an out-of-sandbox path;
+    /// check_bash must return Err.
+    #[test]
+    fn write_vector_battery() {
+        let sb = Sandbox::new();
+        // 绝对路径形式 / Absolute-path forms
+        let absolute: &[(&str, &str)] = &[
+            ("> /etc/x", "echo x > /etc/x"),
+            (">> /etc/x", "echo x >> /etc/x"),
+            ("2> /etc/e", "echo x 2> /etc/e"),
+            ("&> /etc/x", "echo x &> /etc/x"),
+            ("&>> /etc/x", "echo x &>> /etc/x"),
+            ("tee /etc/x", "tee /etc/x"),
+            ("tee -a /etc/x", "tee -a /etc/x"),
+            ("dd of=/etc/x", "dd if=/dev/zero of=/etc/x bs=1 count=1"),
+            ("cp dest /etc/x", "cp a /etc/x"),
+            ("mv dest /etc/x", "mv a /etc/x"),
+            ("tar -cf /etc/x.tar", "tar -cf /etc/x.tar ."),
+            ("install dest /etc/x", "install a /etc/x"),
+            ("ln -s dest /etc/x", "ln -s a /etc/x"),
+        ];
+        for (desc, cmd) in absolute {
+            assert!(
+                sb.check_bash(cmd).is_err(),
+                "write vector {desc} (absolute) should be caught, command: {cmd}"
+            );
+        }
+        // 相对路径形式（.. 逃逸）/ Relative-path forms (.. escape)
+        let relative: &[(&str, &str)] = &[
+            ("> ../../etc/x", "echo x > ../../etc/x"),
+            (">> ../../etc/x", "echo x >> ../../etc/x"),
+            ("tee ../../etc/x", "tee ../../etc/x"),
+            ("dd of=../../etc/x", "dd if=/dev/zero of=../../etc/x bs=1 count=1"),
+            ("cp dest ../../etc/x", "cp a ../../etc/x"),
+            ("tar -cf ../../etc/x.tar", "tar -cf ../../etc/x.tar ."),
+            ("ln -s dest ../../etc/x", "ln -s a ../../etc/x"),
+        ];
+        for (desc, cmd) in relative {
+            assert!(
+                sb.check_bash(cmd).is_err(),
+                "write vector {desc} (relative) should be caught, command: {cmd}"
+            );
+        }
+    }
+
+    // ── allow_network / --unshare-net 测试 ──────────────────────────────
+
+    /// allow_network=false 时 bwrap argv 必须包含 --unshare-net。
+    /// When allow_network is false, the bwrap argv must contain --unshare-net.
+    #[test]
+    fn wrap_command_bwrap_unshare_net_when_disabled() {
+        let workspace = std::env::current_dir().unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let sb = Sandbox {
+            root: workspace,
+            authorized: Arc::new(Mutex::new(HashSet::new())),
+            auth_version: Arc::new(AtomicU64::new(0)),
+            enabled: true,
+            backend: SandboxBackend::Bwrap,
+            allow_network: false,
+        };
+        let argv = sb.wrap_command().expect("bwrap should produce argv");
+        assert!(
+            argv.contains(&"--unshare-net".to_string()),
+            "bwrap argv must contain --unshare-net when allow_network=false: {argv:?}"
+        );
+    }
+
+    /// allow_network=true（默认）时 bwrap argv 不得包含 --unshare-net。
+    /// When allow_network is true (default), the bwrap argv must NOT contain --unshare-net.
+    #[test]
+    fn wrap_command_bwrap_no_unshare_net_when_enabled() {
+        let workspace = std::env::current_dir().unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let sb = Sandbox {
+            root: workspace,
+            authorized: Arc::new(Mutex::new(HashSet::new())),
+            auth_version: Arc::new(AtomicU64::new(0)),
+            enabled: true,
+            backend: SandboxBackend::Bwrap,
+            allow_network: true,
+        };
+        let argv = sb.wrap_command().expect("bwrap should produce argv");
+        assert!(
+            !argv.contains(&"--unshare-net".to_string()),
+            "bwrap argv must NOT contain --unshare-net when allow_network=true: {argv:?}"
+        );
+    }
+
+    /// allow_network=false 在非 bwrap 后端（Path/Off）下不得产生 --unshare-net。
+    /// allow_network=false must NOT add --unshare-net for non-bwrap backends (Path/Off).
+    #[test]
+    fn wrap_command_non_bwrap_ignores_allow_network() {
+        let sb = Sandbox {
+            root: PathBuf::from("/tmp"),
+            authorized: Arc::new(Mutex::new(HashSet::new())),
+            auth_version: Arc::new(AtomicU64::new(0)),
+            enabled: true,
+            backend: SandboxBackend::Path,
+            allow_network: false,
+        };
+        assert!(sb.wrap_command().is_none());
+    }
+
+    /// SimpleSandbox::new() 在测试环境（配置未初始化）默认 allow_network=true。
+    /// SimpleSandbox::new() defaults to allow_network=true in tests (config not init).
+    #[test]
+    fn new_defaults_allow_network_true() {
+        let sb = SimpleSandbox::new();
+        assert!(
+            sb.allow_network,
+            "allow_network should default to true when config is not initialized"
+        );
     }
 }

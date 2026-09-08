@@ -1709,6 +1709,20 @@ fn has_file_redirect(s: &str) -> bool {
     false
 }
 
+/// Token-boundary 前缀匹配：段 `s` 匹配前缀 `p` 当且仅当 `s == p` 或
+/// `s` 以 `p` 开头且 `p` 之后紧跟一个空白字符（词边界）。
+/// 这防止 `lsd` 误匹配 `ls`、`cat-bomb` 误匹配 `cat`、`findstr` 误匹配 `find`。
+/// 多词前缀（如 `"git status"`）同样适用：`git statusish` 不会匹配 `git status`。
+///
+/// Token-boundary prefix match: segment `s` matches prefix `p` iff `s == p` or
+/// `s` starts with `p` and the char right after `p` is whitespace (word boundary).
+/// This prevents `lsd` from matching `ls`, `cat-bomb` from matching `cat`,
+/// `findstr` from matching `find`. Multi-word prefixes (e.g. `"git status"`)
+/// work the same way: `git statusish` does not match `git status`.
+fn prefix_matches(s: &str, p: &str) -> bool {
+    s == p || (s.starts_with(p) && s[p.len()..].starts_with(char::is_whitespace))
+}
+
 /// 判断 shell 命令是否为只读（可安全自动执行）还是会改变状态（需询问）。
 /// Determines whether a shell command is read-only (safe to auto-run) or mutating (needs prompting).
 /// 拿不准时返回 false —— 循环会将其视为"会改变状态"并询问人类，
@@ -1866,14 +1880,14 @@ pub fn is_readonly_bash(command: &str) -> bool {
             let after = s.strip_prefix("xargs").unwrap_or("").trim();
             let inner = after.split_whitespace().find(|t| !t.starts_with('-'));
             match inner {
-                Some(cmd) if !READONLY_PREFIXES.iter().any(|p| cmd.starts_with(p)) => {
+                Some(cmd) if !READONLY_PREFIXES.iter().any(|p| prefix_matches(cmd, p)) => {
                     return false;
                 }
                 _ => {} // None = xargs defaults to echo (safe); Some = inner is readonly
             }
             continue;
         }
-        if !READONLY_PREFIXES.iter().any(|p| s.starts_with(p)) {
+        if !READONLY_PREFIXES.iter().any(|p| prefix_matches(&s, p)) {
             return false;
         }
     }
@@ -2445,6 +2459,50 @@ mod tests {
     #[test]
     fn escaped_separator_not_segmented() {
         assert!(is_readonly_bash("grep 'a\\;b' file"));
+    }
+
+    /// Token-boundary 守护：命令名恰好以只读前缀开头但后跟非空白字符时，
+    /// 不应被误判为只读。`lsd` / `cat-bomb` / `findstr` 应归为会改变状态。
+    /// Token-boundary guard: a command whose name merely starts with a readonly
+    /// prefix but is followed by a non-whitespace char must NOT be classified
+    /// read-only. `lsd` / `cat-bomb` / `findstr` should be mutating.
+    #[test]
+    fn prefix_boundary_rejects_suffixed_commands() {
+        assert!(!is_readonly_bash("lsd --delete"));
+        assert!(!is_readonly_bash("cat-bomb"));
+        assert!(!is_readonly_bash("findstr x"));
+        // 多词前缀也需边界守护：`git statusish` 不应匹配 `git status`
+        assert!(!is_readonly_bash("git statusish"));
+        assert!(!is_readonly_bash("git logish"));
+    }
+
+    /// Token-boundary 回归守护：合法的只读命令不得因边界修复而被拒。
+    /// Token-boundary regression guard: legitimate read-only commands must
+    /// still pass after the boundary fix.
+    #[test]
+    fn prefix_boundary_keeps_legitimate_readonly() {
+        assert!(is_readonly_bash("ls -la"));
+        assert!(is_readonly_bash("cat file"));
+        assert!(is_readonly_bash("git status"));
+        assert!(is_readonly_bash("git log --oneline"));
+        assert!(is_readonly_bash("find . -name x"));
+        assert!(is_readonly_bash("sed -n '1p' file"));
+        assert!(is_readonly_bash("awk '{print}' file"));
+        assert!(is_readonly_bash("grep pattern src"));
+        assert!(is_readonly_bash("head -10 file"));
+        assert!(is_readonly_bash("stat file.txt"));
+    }
+
+    /// xargs 内部命令也需 token-boundary 守护：`xargs lsd` 应归为会改变状态，
+    /// `xargs grep` 应保持只读。
+    /// xargs inner command needs the token-boundary guard too: `xargs lsd`
+    /// should be mutating, `xargs grep` should stay read-only.
+    #[test]
+    fn xargs_inner_command_boundary() {
+        assert!(!is_readonly_bash("xargs lsd"));
+        assert!(!is_readonly_bash("find . | xargs cat-bomb"));
+        assert!(is_readonly_bash("find . -name '*.rs' | xargs grep 'foo'"));
+        assert!(is_readonly_bash("find . -name '*.go' | xargs wc -l"));
     }
 
     /// offset/limit 分页：默认从第 0 行读取 max_read_lines 行。

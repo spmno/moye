@@ -189,6 +189,15 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub authorized_dirs: Vec<String>,
 
+    /// 是否允许网络访问（仅 bwrap 后端生效，默认 true）。
+    /// false 时 bwrap 命令行附加 --unshare-net 隔离网络命名空间。
+    /// Landlock 后端无法控制网络，此选项被忽略（启动时 warn）。
+    /// Whether to allow network access (bwrap backend only, default true).
+    /// When false, bwrap argv gets --unshare-net to isolate the net namespace.
+    /// Landlock can't do network namespaces; this option is ignored (warn at startup).
+    #[serde(default = "default_allow_network")]
+    pub allow_network: bool,
+
     /// 命令规则：对 `run_bash` 的 command 做 glob 匹配，首条匹配胜出（allow/ask/deny）。
     /// 省略时为空（完全向后兼容，行为与现有只读/会改变状态分类一致）。
     /// Command rules: glob-matched against `run_bash` commands, first match wins
@@ -204,6 +213,7 @@ impl Default for SandboxConfig {
             backend: default_sandbox_backend(),
             mode: default_sandbox_mode(),
             authorized_dirs: Vec::new(),
+            allow_network: true,
             command_rules: Vec::new(),
         }
     }
@@ -215,6 +225,10 @@ fn default_sandbox_backend() -> String {
 
 fn default_sandbox_mode() -> String {
     "auto".to_string()
+}
+
+fn default_allow_network() -> bool {
+    true
 }
 
 /// `[profile]` 小节：profile 叠加配置（声明式配置组合）。
@@ -903,6 +917,7 @@ authorized_dirs = ["~/.config", "/tmp/moye"]
         assert!(cfg.sandbox.authorized_dirs.is_empty());
         assert_eq!(cfg.sandbox.backend, "auto");
         assert_eq!(cfg.sandbox.mode, "auto");
+        assert!(cfg.sandbox.allow_network);
         assert_eq!(cfg.memory.rules_file, "rules.json");
     }
 
@@ -1350,6 +1365,35 @@ backend = "bwrap"
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.sandbox.mode, "auto");
         assert_eq!(cfg.sandbox.backend, "bwrap");
+    }
+
+    #[test]
+    fn sandbox_allow_network_defaults_true() {
+        // Given: [sandbox] without allow_network field.
+        // When: parsing.
+        // Then: cfg.sandbox.allow_network == true (default).
+        let toml_str = r#"
+[sandbox]
+backend = "auto"
+mode = "auto"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.sandbox.allow_network);
+    }
+
+    #[test]
+    fn sandbox_allow_network_parsed_false() {
+        // Given: [sandbox] with allow_network = false.
+        // When: parsing.
+        // Then: cfg.sandbox.allow_network == false.
+        let toml_str = r#"
+[sandbox]
+backend = "bwrap"
+mode = "bwrap"
+allow_network = false
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.sandbox.allow_network);
     }
 
     #[test]

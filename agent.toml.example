@@ -189,6 +189,17 @@ rule_escalation_threshold = 3
 # authorized_dirs = ["~/.config", "/tmp/moye", "../shared-libs"]
 authorized_dirs = []
 
+# 是否允许网络访问（仅 bwrap 后端生效，默认 true）。
+# false 时 bwrap 命令行附加 --unshare-net，将子进程隔离到无网卡的命名空间。
+# Landlock 后端无法控制网络命名空间——此选项在 landlock 模式下被忽略
+# （启动时 tracing::warn 提醒）。
+#
+# Whether to allow network access (bwrap backend only, default true).
+# When false, bwrap argv gets --unshare-net, isolating child processes in a
+# net namespace with no interfaces. Landlock can't do network namespaces — this
+# option is ignored in landlock mode (tracing::warn at startup).
+# allow_network = true
+
 # 命令规则：对 run_bash 的 command 字符串做 glob 匹配，首条匹配胜出（allow/ask/deny）。
 # 在只读/会改变状态分类之前评估——让用户预授权高频可信命令（如 cargo test、git status）
 # 或限制只读分类的命令。仅影响 run_bash，其他工具不受影响。

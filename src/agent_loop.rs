@@ -1074,7 +1074,7 @@ async fn run_autonomous_inner(
         }
         let stream = runner.stream().await;
 
-        match consume_stream(stream, Some(hitl_waiting), tx).await {
+        match consume_stream(stream, Some(hitl_waiting), sse_idle_timeout(), tx).await {
             Ok(output) => {
                 if let Err(e) =
                     session_log.append(crate::session_log::SessionEvent::AssistantMessage {
@@ -1219,6 +1219,25 @@ pub async fn run_autonomous_spec(
     .await
 }
 
+/// 从配置解析 SSE 空闲超时 Duration。
+/// Resolve the SSE idle timeout Duration from config.
+///
+/// 读取 `[context].sse_idle_timeout_secs`（默认 300 秒）。
+/// 设为 0 时返回一个极长超时（实质禁用空闲检测，不推荐但可用）。
+/// Reads `[context].sse_idle_timeout_secs` (default 300s).
+/// When set to 0, returns a very long duration (effectively disabling idle
+/// detection — not recommended but available).
+pub fn sse_idle_timeout() -> Duration {
+    let secs = crate::config::config()
+        .map(|c| c.context.sse_idle_timeout_secs)
+        .unwrap_or(300);
+    if secs == 0 {
+        Duration::from_secs(86_400 * 365) // 1 year — effectively disabled
+    } else {
+        Duration::from_secs(secs)
+    }
+}
+
 /// 判断错误是否为 SSE 流式断连（可安全重试）。
 /// Determines whether an error is an SSE stream disconnect (safe to retry).
 pub fn is_stream_error(e: &anyhow::Error) -> bool {
@@ -1260,12 +1279,13 @@ pub fn is_context_overflow_error(e: &anyhow::Error) -> bool {
 pub async fn consume_stream<R>(
     mut stream: StreamingResult<R>,
     hitl_waiting: Option<Arc<AtomicBool>>,
+    idle_timeout: Duration,
     tx: &EventSender,
 ) -> anyhow::Result<String> {
     use MultiTurnStreamItem;
     use rig_core::streaming::StreamedAssistantContent;
 
-    const CHUNK_TIMEOUT: Duration = Duration::from_secs(120);
+    let chunk_timeout = idle_timeout;
 
     let mut output = String::new();
     let mut all_reasoning = String::new();
@@ -1274,7 +1294,7 @@ pub async fn consume_stream<R>(
         // When a HITL prompt is active the stream is blocked inside the hook's
         // `confirm()` future awaiting the user's keypress.  The `hitl_waiting`
         // flag is set *during* `stream.next()` (inside `confirm()`), so it may
-        // be false on entry but become true mid-call.  If the 120-second
+        // be false on entry but become true mid-call.  If the idle timeout
         // timeout fires while HITL is active the stream future is dropped,
         // which cancels `confirm()` and orphans the oneshot responder still
         // held by the TUI.  To avoid this we retry without a timeout when the
@@ -1282,12 +1302,12 @@ pub async fn consume_stream<R>(
         // 当 HITL 确认处于活动状态时，流被阻塞在 hook 的 `confirm()` future 中
         // 等待用户按键。`hitl_waiting` 标志是在 `stream.next()` 期间（在
         // `confirm()` 内部）设置的，因此进入时可能为 false 但中途变为 true。
-        // 如果 120 秒超时在 HITL 活动期间触发，流 future 被丢弃，会取消
+        // 如果空闲超时在 HITL 活动期间触发，流 future 被丢弃，会取消
         // `confirm()` 并使 TUI 仍持有的 oneshot responder 成为孤儿。为避免
         // 此问题，当标志被设置时无超时重试。
         let next = match &hitl_waiting {
             Some(flag) if flag.load(Ordering::Relaxed) => stream.next().await,
-            _ => match tokio::time::timeout(CHUNK_TIMEOUT, stream.next()).await {
+            _ => match tokio::time::timeout(chunk_timeout, stream.next()).await {
                 Ok(item) => item,
                 Err(_) => {
                     // Check whether HITL started during the timed wait.
@@ -1303,7 +1323,7 @@ pub async fn consume_stream<R>(
                         continue;
                     }
                     warn!(
-                        timeout_secs = CHUNK_TIMEOUT.as_secs(),
+                        timeout_secs = chunk_timeout.as_secs(),
                         accumulated_output_chars = output.len(),
                         accumulated_reasoning_chars = all_reasoning.len(),
                         "SSE idle timeout, connection may have dropped"
@@ -1312,10 +1332,10 @@ pub async fn consume_stream<R>(
                         "SSE 空闲超时 / SSE idle timeout（{} 秒无数据），连接可能已断开。\n  · 已收到: {} 字符文本、{} 字符推理内容\n  · 上层会自动重试（如果是可重试错误）\n\
                          [System] SSE idle timeout (no data for {}s), connection may have dropped. \
                          Received {} chars text, {} chars reasoning. Upper layer will auto-retry if applicable.",
-                        CHUNK_TIMEOUT.as_secs(),
+                        chunk_timeout.as_secs(),
                         output.len(),
                         all_reasoning.len(),
-                        CHUNK_TIMEOUT.as_secs(),
+                        chunk_timeout.as_secs(),
                         output.len(),
                         all_reasoning.len()
                     ));

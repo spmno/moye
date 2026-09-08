@@ -408,7 +408,7 @@ impl RoleAgent {
             );
             let stream = self.agent.runner(&prompt).stream().await;
 
-            match crate::agent_loop::consume_stream(stream, None, tx).await {
+            match crate::agent_loop::consume_stream(stream, None, crate::agent_loop::sse_idle_timeout(), tx).await {
                 Ok(output) => return Ok(output),
                 Err(e) if crate::agent_loop::is_stream_error(&e) && attempt < MAX_RETRIES => {
                     let remaining = MAX_RETRIES - attempt;
@@ -1015,7 +1015,7 @@ async fn classify_with_llm(
     let stream = agent.runner(&prompt).stream().await;
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        crate::agent_loop::consume_stream(stream, None, &tx),
+        crate::agent_loop::consume_stream(stream, None, crate::agent_loop::sse_idle_timeout(), &tx),
     )
     .await
     .ok()?

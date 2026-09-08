@@ -60,6 +60,15 @@ max_bash_output_chars = 20000
 max_read_lines = 500
 microcompact_threshold = 20000
 microcompact_protected_results = 3
+# SSE 流式空闲超时（秒）：两个 SSE 事件之间的最大允许间隔。
+# 超过此间隔无数据时视为连接断开，触发自动重试。
+# 推理模型（glm / deepseek-v4 / doubao-seed 等）思考阶段可能长时间不产出事件，
+# 120 秒过短会误判断连；300 秒（5 分钟）更安全。设为 0 可禁用（不推荐）。
+# SSE stream idle timeout (seconds): max gap between SSE events before the
+# connection is treated as dropped and auto-retry kicks in. Reasoning models
+# may go silent for minutes during thinking; 300s (5 min) is safer than 120s.
+# Set to 0 to disable (not recommended).
+sse_idle_timeout_secs = 300
 
 # 各角色选择自己的模型与提示词文件。可用 REPL 命令 model <slug> 全局覆盖。
 # 按工具的 HITL（人在环）权限分级：

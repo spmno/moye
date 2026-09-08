@@ -415,6 +415,14 @@ pub fn is_reasoning_model(model: &str) -> bool {
         // 推理阶段耗尽预算导致可见输出被截断成一两个字。
         // Volcengine Doubao Seed series (all variants) emit `reasoning_content`.
         || lower.starts_with("doubao-seed")
+        // Kimi K3+ 系列（kimi-k3 等）及裸 "kimi" slug 支持 thinking 模式，
+        // 输出 `reasoning_content`，属于推理模型，需要跳过 max_tokens 以避免
+        // 推理阶段耗尽预算。
+        // 部分用户网关将 "kimi" 直接映射到 K3，因此裸 "kimi" 也按推理模型处理。
+        // Kimi K3+ series (kimi-k3 etc.) and bare "kimi" slug support thinking mode
+        // and emit `reasoning_content`; skip max_tokens to avoid budget exhaustion.
+        // Some gateways map bare "kimi" to K3, so treat it as reasoning model too.
+        || lower.contains("kimi-k3") || lower == "kimi"
 }
 
 /// 对话型 Agent 别名：基于 OpenAI CompletionModel 的 rig Agent（兼容所有供应商）。
@@ -701,7 +709,9 @@ pub fn context_limit_for_model(model: &str) -> usize {
     let provider = Provider::from_env();
     let lower = model.to_lowercase();
     // 模型特定的覆盖 / Model-specific overrides
-    if lower.contains("kimi-k3") {
+    // Kimi K3 系列（含网关裸 "kimi" → K3 的别名）上下文 1M。
+    // Kimi K3 series (including bare "kimi" alias mapped to K3 by some gateways) has 1M context.
+    if lower.contains("kimi-k3") || lower == "kimi" {
         return 1_000_000;
     }
     if lower.contains("kimi") {
@@ -791,6 +801,7 @@ mod tests {
     #[test]
     fn context_limit_for_kimi_model() {
         assert_eq!(context_limit_for_model("kimi-k3"), 1_000_000);
+        assert_eq!(context_limit_for_model("kimi"), 1_000_000);
         assert_eq!(context_limit_for_model("kimi-k2.7-code-highspeed"), 256_000);
     }
 
@@ -961,11 +972,18 @@ mod tests {
         assert!(is_reasoning_model("doubao-seed-2-1-pro-260628"));
         assert!(is_reasoning_model("doubao-seed-2.0-code"));
         assert!(is_reasoning_model("DOUBAO-SEED-EVOLVING"));
+        // Kimi K3 支持思考模式，输出 reasoning_content，属于推理模型。
+        // Kimi K3 supports thinking mode and emits reasoning_content.
+        assert!(is_reasoning_model("kimi-k3"));
+        assert!(is_reasoning_model("KIMI-K3"));
+        // 部分网关将裸 "kimi" 直接映射到 K3，也应识别为推理模型。
+        // Some gateways map bare "kimi" to K3; must be detected too.
+        assert!(is_reasoning_model("kimi"));
+        assert!(is_reasoning_model("KIMI"));
     }
 
     #[test]
     fn is_reasoning_model_rejects_non_reasoning_models() {
-        assert!(!is_reasoning_model("kimi-k3"));
         assert!(!is_reasoning_model("gpt-4o"));
         assert!(!is_reasoning_model("qwen-plus"));
         assert!(!is_reasoning_model("doubao-1-5-pro-256k"));

@@ -1,23 +1,25 @@
 //! unified diff 渲染器：把 `edit_file` 的 old/new 文本渲染为带颜色的
 //! ratatui `Line` 列表，用于 TUI 消息流展示。
 //!
-//! - 删除行红色（`theme::tool_result_err()`）、插入行绿色（`theme::tool_result_ok()`）、
-//!   上下文行暗灰（`theme::info()`）。
+//! - 删除行红色（`theme::diff_del()`：error fg + bg #3A3030 红色着色）、
+//!   插入行绿色（`theme::diff_add()`：success fg + bg #303A30 绿色着色）、
+//!   上下文行暗灰（`theme::info()` fg + bg #212121）。
 //! - 不变行段折叠：每个变化前后最多保留 2 行上下文，多余折叠为单行标记。
 //! - 总行数上限 60，超出截断并追加标记行。
 //! - 内容行行级样式为 `theme::code_block()`（`wrap.rs:is_code_line` 契约），
-//!   per-span 颜色叠加其上。
+//!   per-span fg + bg 着色叠加其上。
 //!
 //! Unified diff renderer: turns the old/new text of an `edit_file` call into a
 //! colored list of ratatui `Line`s for the TUI message stream.
 //!
-//! - Deletes are red (`theme::tool_result_err()`), inserts green (`theme::tool_result_ok()`),
-//!   context lines dark-gray (`theme::info()`).
+//! - Deletes are red (`theme::diff_del()`: error fg + bg #3A3030 red tint),
+//!   inserts green (`theme::diff_add()`: success fg + bg #303A30 green tint),
+//!   context lines dark-gray (`theme::info()` fg + bg #212121).
 //! - Unchanged runs are collapsed: at most 2 context lines around each change;
 //!   longer middle runs collapse to a single marker line.
 //! - Total emitted lines capped at 60; overflow is truncated with a marker line.
 //! - Content lines carry `theme::code_block()` as their line-level style (the
-//!   `wrap.rs:is_code_line` contract); per-span colors patch over it.
+//!   `wrap.rs:is_code_line` contract); per-span fg + bg tints patch over it.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -74,9 +76,9 @@ pub fn unified_diff_lines(edit: &FileEdit, expand: bool) -> Vec<Line<'static>> {
         if keep[i] {
             let (tag, val) = &raw[i];
             let line = match tag {
-                ChangeTag::Delete => content_line("-", val, theme::tool_result_err()),
-                ChangeTag::Insert => content_line("+", val, theme::tool_result_ok()),
-                ChangeTag::Equal => content_line(" ", val, theme::info()),
+                ChangeTag::Delete => content_line("-", val, theme::diff_del()),
+                ChangeTag::Insert => content_line("+", val, theme::diff_add()),
+                ChangeTag::Equal => content_line(" ", val, theme::info().patch(theme::diff_context_bg())),
             };
             out.push(line);
             if out.len() >= cap {
@@ -172,14 +174,17 @@ fn estimate_remaining(raw: &[(ChangeTag, String)], keep: &[bool], idx: usize) ->
     count
 }
 
-/// 构建内容行：前缀 + 内容，行级样式 `theme::code_block()`，span 颜色为给定 fg。
+/// 构建内容行：前缀 + 内容，行级样式 `theme::code_block()`，span 样式
+/// 为给定 `content_style`（含 fg + bg 着色）——前缀 span 也带 bg，确保整行
+/// 着色连续。
 /// Build a content line: prefix + value, line-level style `theme::code_block()`,
-/// span fg from the given style.
-fn content_line(prefix: &str, value: &str, fg_style: Style) -> Line<'static> {
+/// span style = `content_style` (carries fg + bg tint). The prefix span also
+/// carries the bg so the full row is tinted continuously.
+fn content_line(prefix: &str, value: &str, content_style: Style) -> Line<'static> {
     Line {
         spans: vec![
-            Span::raw(format!("{prefix} ")),
-            Span::styled(value.to_string(), fg_style),
+            Span::styled(format!("{prefix} "), content_style),
+            Span::styled(value.to_string(), content_style),
         ],
         style: theme::code_block(),
         alignment: None,
@@ -239,7 +244,7 @@ mod tests {
             assert_eq!(
                 line_fg(d),
                 theme::tool_result_err().fg,
-                "delete line must be LightRed"
+                "delete line fg must match tool_result_err"
             );
         }
     }
@@ -257,7 +262,7 @@ mod tests {
             assert_eq!(
                 line_fg(ins),
                 theme::tool_result_ok().fg,
-                "insert line must be Green"
+                "insert line fg must match tool_result_ok"
             );
         }
     }
@@ -275,9 +280,39 @@ mod tests {
             assert_eq!(
                 line_fg(c),
                 theme::info().fg,
-                "context line must be DarkGray"
+                "context line fg must match info"
             );
         }
+    }
+
+    #[test]
+    fn delete_spans_carry_tinted_bg() {
+        let edit = make_edit("line one\n", "line two\n");
+        let lines = unified_diff_lines(&edit, false);
+        let has_tinted_bg = lines.iter().any(|l| {
+            l.spans.iter().any(|s| {
+                s.style.bg == Some(Color::Rgb(0x3A, 0x30, 0x30))
+            })
+        });
+        assert!(
+            has_tinted_bg,
+            "delete spans must carry bg #3A3030 tint"
+        );
+    }
+
+    #[test]
+    fn insert_spans_carry_tinted_bg() {
+        let edit = make_edit("line one\n", "line two\n");
+        let lines = unified_diff_lines(&edit, false);
+        let has_tinted_bg = lines.iter().any(|l| {
+            l.spans.iter().any(|s| {
+                s.style.bg == Some(Color::Rgb(0x30, 0x3A, 0x30))
+            })
+        });
+        assert!(
+            has_tinted_bg,
+            "insert spans must carry bg #303A30 tint"
+        );
     }
 
     #[test]

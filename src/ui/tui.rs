@@ -14,7 +14,7 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::Modifier,
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
         Block, BorderType, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
@@ -827,10 +827,76 @@ fn truncate_result_lines(result: &str, expand: bool) -> (Vec<String>, Option<usi
     }
 }
 
+/// 给每行的 span 列表前缀一个 `┃ ` (U+2503 HEAVY VERTICAL) 边框 span。
+/// 纯函数：不修改行级样式 / 对齐，仅前缀 span。空输入返回空 Vec。
+///
+/// Prefix every line's span list with a `┃ ` (U+2503 HEAVY VERTICAL) border span.
+/// Pure: does not modify line-level style / alignment, only prepends a span.
+/// Empty input returns empty Vec.
+fn bordered(lines: Vec<Line<'static>>, border: Style) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| {
+            let mut spans = vec![Span::styled("\u{2503} ".to_string(), border)];
+            spans.extend(line.spans);
+            Line {
+                spans,
+                style: line.style,
+                alignment: line.alignment,
+            }
+        })
+        .collect()
+}
+
+/// 软换行后为带边框块的续行重新添加 `┃ ` 前缀。
+/// 状态机：以 `┃` 开头的行 → 更新当前边框样式；空行 → 重置；
+/// 无 `┃` 前缀但当前边框样式存在的非空行 → 续行，添加前缀。
+/// 搜索高亮在调用前已叠加（spans 已含 bg patch），边框 span 不会被 patch。
+///
+/// After soft-wrapping, re-prefix continuation lines of bordered blocks with
+/// `┃ `. State machine: a line starting with `┃` updates the current border
+/// style; an empty line resets it; a non-empty line without `┃` prefix but
+/// with a current border style is a continuation line → prefix it.
+/// Search highlighting runs before this (spans already carry bg patches);
+/// the border span added here is NOT search-patched (clean border look).
+fn apply_border_continuation(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let mut current_border: Option<Style> = None;
+    lines
+        .into_iter()
+        .map(|line| {
+            if let Some(first) = line.spans.first() {
+                if first.content.starts_with('\u{2503}') {
+                    current_border = Some(first.style);
+                    return line;
+                }
+            }
+            if line.spans.is_empty() {
+                current_border = None;
+                return line;
+            }
+            if let Some(bs) = current_border {
+                let mut spans = vec![Span::styled("\u{2503} ".to_string(), bs)];
+                spans.extend(line.spans);
+                Line {
+                    spans,
+                    style: line.style,
+                    alignment: line.alignment,
+                }
+            } else {
+                line
+            }
+        })
+        .collect()
+}
+
 fn render_event(event: &AgentEvent, expand: bool) -> Vec<Line<'static>> {
     match event {
         AgentEvent::User(text) => {
-            let mut v = vec![Line::styled(format!("\u{276f} {text}"), theme::user_msg())];
+            let content: Vec<Line<'static>> = text
+                .split('\n')
+                .map(|line| Line::styled(line.to_string(), theme::msg_text()))
+                .collect();
+            let mut v = bordered(content, theme::border_user());
             v.push(Line::default());
             v
         }
@@ -841,42 +907,45 @@ fn render_event(event: &AgentEvent, expand: bool) -> Vec<Line<'static>> {
         }
         AgentEvent::Agent(text) => {
             let rendered = markdown::render_markdown(text);
-            rendered.into_iter().collect()
+            let lines: Vec<Line<'static>> = rendered.lines.into_iter().collect();
+            let mut v = bordered(lines, theme::border_agent());
+            v.push(Line::default());
+            v
         }
         AgentEvent::ToolCall { name, desc, diff } => {
-            let sty = theme::tool_call();
-            // 有结构化编辑载荷 → 渲染 unified diff（红删 / 绿增 / 暗灰上下文）；
-            // 无载荷 → 退回原纯文本 desc 渲染，行为与之前完全一致。
-            // With a structured edit payload → render a unified diff
-            // (red deletes / green inserts / dim context); without it →
-            // fall back to the original plain-text desc rendering, unchanged.
             if let Some(edit) = diff {
-                let mut v: Vec<Line<'static>> = vec![Line::from(vec![
-                    Span::styled("\u{1f527} ", sty),
-                    Span::styled(format!("{name} \u{2192} \u{7f16}\u{8f91}\u{6587}\u{4ef6}: {}", edit.path), sty),
-                ])];
-                v.extend(diff::unified_diff_lines(edit, expand));
+                let header = Line::from(vec![
+                    Span::styled("\u{1f527} ", theme::tool_call()),
+                    Span::styled(
+                        format!(
+                            "{name} \u{2192} \u{7f16}\u{8f91}\u{6587}\u{4ef6}: {}",
+                            edit.path
+                        ),
+                        theme::tool_call(),
+                    ),
+                ]);
+                let diff_lines = diff::unified_diff_lines(edit, expand);
+                let mut content = vec![header];
+                content.extend(diff_lines);
+                let mut v = bordered(content, theme::border_tool());
                 v.push(Line::default());
                 return v;
             }
-            let mut v: Vec<Line<'static>> = vec![];
-            // 按 \n 拆分为多行：ratatui 的 Line 不识别内嵌换行符，
-            // 若把多行 desc 塞进单个 Span，所有内容会被压成一行，
-            // 超出终端宽度后截断，代码无法阅读（edit_file 的 old/new、
-            // run_bash 的多行命令均受此影响）。
-            // Split desc on \n into separate Lines: ratatui's Line does
-            // not honor embedded newlines, so a multi-line desc in a single
-            // Span gets squashed into one visual row and truncated.
+            let mut content: Vec<Line<'static>> = vec![];
             let mut lines = desc.split('\n');
             if let Some(first) = lines.next() {
-                v.push(Line::from(vec![
-                    Span::styled("\u{1f527} ", sty),
-                    Span::styled(format!("{name}: {first}"), sty),
+                content.push(Line::from(vec![
+                    Span::styled("\u{1f527} ", theme::tool_call()),
+                    Span::styled(format!("{name}: {first}"), theme::tool_call()),
                 ]));
             }
             for line in lines {
-                v.push(Line::from(Span::styled(line.to_string(), sty)));
+                content.push(Line::from(Span::styled(
+                    line.to_string(),
+                    theme::tool_call(),
+                )));
             }
+            let mut v = bordered(content, theme::border_tool());
             v.push(Line::default());
             v
         }
@@ -887,32 +956,30 @@ fn render_event(event: &AgentEvent, expand: bool) -> Vec<Line<'static>> {
             } else {
                 theme::tool_result_err()
             };
-            let mut v = vec![];
-            v.push(Line::from(vec![Span::styled(
+            let mut content = vec![Line::from(vec![Span::styled(
                 format!("{icon} {name}"),
                 sty,
-            )]));
+            )])];
             let (lines, hidden) = truncate_result_lines(result, expand);
             for line in &lines {
-                v.push(Line::from(Span::raw(line.to_string())));
+                content.push(Line::from(Span::raw(line.to_string())));
             }
             if let Some(n) = hidden {
-                v.push(Line::styled(
+                content.push(Line::styled(
                     format!(
                         "  \u{22ef} (\u{5df2}\u{622a}\u{65ad} {n} \u{884c} \u{00b7} Ctrl+E \u{5c55}\u{5f00} / truncated \u{00b7} Ctrl+E to expand)"
                     ),
                     theme::info(),
                 ));
             }
+            let mut v = bordered(content, theme::border_tool());
             v.push(Line::default());
             v
         }
         AgentEvent::TurnFinished { turn, usage } => {
             let mut v = vec![
                 Line::styled(
-                    format!(
-                        "\u{2500}\u{2500}\u{2500} \u{8f6e}\u{6b21} {turn} \u{5b8c}\u{6210} \u{2500}\u{2500}\u{2500}"
-                    ),
+                    format!("\u{8f6e}\u{6b21} {turn} \u{5b8c}\u{6210}"),
                     theme::usage(),
                 ),
                 Line::styled(format!("  {usage}"), theme::usage()),
@@ -929,12 +996,6 @@ fn render_event(event: &AgentEvent, expand: bool) -> Vec<Line<'static>> {
             if text.is_empty() {
                 vec![Line::default()]
             } else {
-                // 按 \n 拆分为多行，避免 ratatui Line 不识别换行符导致
-                // 整段文本挤在一行、超出终端宽度后被截断。
-                // Split on \n into separate Lines: ratatui's Line does not
-                // honor embedded newlines, so a multi-line string in a single
-                // Line gets squashed into one visual row and truncated at the
-                // terminal edge.
                 let mut v: Vec<Line<'static>> = text
                     .split('\n')
                     .map(|line| Line::styled(line.to_owned(), theme::info()))
@@ -944,48 +1005,42 @@ fn render_event(event: &AgentEvent, expand: bool) -> Vec<Line<'static>> {
             }
         }
         AgentEvent::PhaseStart { role } => {
-            let sty = theme::usage();
-            let line = match phase_label(role) {
-                Some((icon, label)) => format!(
-                    "\u{2500}\u{2500}\u{2500} {icon} {label} \u{2500}\u{2500}\u{2500}"
-                ),
-                None => format!("\u{2500}\u{2500}\u{2500} {role} \u{2500}\u{2500}\u{2500}"),
+            let sty = theme::phase_style(role);
+            let label = match phase_label(role) {
+                Some((icon, label)) => format!("{icon} {label}"),
+                None => role.to_string(),
             };
-            vec![Line::styled(line, sty), Line::default()]
+            let content = vec![Line::styled(label, sty)];
+            let mut v = bordered(content, sty);
+            v.push(Line::default());
+            v
         }
         AgentEvent::Reasoning(text) => {
             let line_count = text.lines().count();
             if expand {
-                let mut v: Vec<Line<'static>> = vec![Line::styled(
+                let mut content: Vec<Line<'static>> = vec![Line::styled(
                     "\u{1f4ad} \u{601d}\u{8003}\u{8fc7}\u{7a0b} / Reasoning:",
                     theme::info(),
                 )];
-                // 按 \n 拆分为多行：ratatui 的 Line 不识别内嵌换行符，
-                // 若把多行文本塞进单个 Line，所有内容会被压成一行。
-                // Split on \n into separate Lines: ratatui's Line does not
-                // honor embedded newlines, so a multi-line body in a single
-                // Line gets squashed into one visual row.
                 for line in text.split('\n') {
-                    v.push(Line::styled(line.to_string(), theme::streaming()));
+                    content.push(Line::styled(line.to_string(), theme::streaming()));
                 }
+                let mut v = bordered(content, theme::border_tool());
                 v.push(Line::default());
                 v
             } else {
-                vec![
-                    Line::styled(
-                        format!(
-                            "\u{1f4ad} \u{601d}\u{8003}\u{8fc7}\u{7a0b} ({line_count} \u{884c} \u{00b7} Ctrl+E \u{5c55}\u{5f00} / reasoning \u{00b7} Ctrl+E to expand)"
-                        ),
-                        theme::info(),
+                let content = vec![Line::styled(
+                    format!(
+                        "\u{1f4ad} \u{601d}\u{8003}\u{8fc7}\u{7a0b} ({line_count} \u{884c} \u{00b7} Ctrl+E \u{5c55}\u{5f00} / reasoning \u{00b7} Ctrl+E to expand)"
                     ),
-                    Line::default(),
-                ]
+                    theme::info(),
+                )];
+                let mut v = bordered(content, theme::border_tool());
+                v.push(Line::default());
+                v
             }
         }
         AgentEvent::TodoUpdate { .. } => {
-            // 侧边栏专用：不渲染到消息流（工具调用/结果行已在流中展示）。
-            // Sidebar-only: not rendered in the message stream (the tool call/result
-            // lines already show in-stream).
             vec![]
         }
         _ => vec![],
@@ -1883,7 +1938,7 @@ fn handle_command(
         }
         ReplCommand::Context => {
             let mut out = format!(
-                "─── 上下文 / Context ───\n\
+                "上下文 / Context\n\
                  Provider: {}\n\
                  Model: {}\n\
                  Turn: {} / {}\n\
@@ -1906,7 +1961,7 @@ fn handle_command(
                 state.skill_names.len(),
                 state.messages.len(),
             );
-            out.push_str("─── 消息历史 / Message History ───\n");
+            out.push_str("消息历史 / Message History\n");
             for (i, msg) in state.messages.iter().enumerate() {
                 let line = format_event_for_context(msg);
                 out.push_str(&format!("  {}. {}\n", i + 1, line));
@@ -2706,7 +2761,9 @@ fn draw_selector(f: &mut Frame, state: &mut TuiState) {
 fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let all_lines = state.all_message_lines();
 
-    let block = Block::default().padding(Padding::horizontal(1));
+    let block = Block::default()
+        .padding(Padding::horizontal(1))
+        .style(theme::bg_base());
     let inner = block.inner(area);
     // 存消息内容区，供 handle_mouse_event 命中测试读取屏幕行→行映射。
     // Store the message content area for handle_mouse_event hit-testing.
@@ -2729,6 +2786,13 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
     // ensure the current match is visible, overlay highlights. Must run before
     // computing scroll — a jump rewrites scroll_offset.
     let display_lines = apply_search_draw(state, display_lines, total, base, inner);
+
+    // 边框续行：软换行后为带边框块的续行重新添加 `┃ ` 前缀。
+    // 搜索高亮已在上方叠加（content spans 已含 bg patch），边框 span 不被 patch。
+    // Re-prefix continuation lines of bordered blocks after soft-wrapping.
+    // Search highlighting ran above (content spans already carry bg patches);
+    // border spans added here are NOT search-patched (clean border look).
+    let display_lines = apply_border_continuation(display_lines);
 
     let scroll = base.saturating_sub(state.scroll_offset);
     state.msg_scroll = scroll;
@@ -2846,6 +2910,7 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
                 Block::default()
                     .borders(Borders::TOP)
                     .border_style(theme::border())
+                    .style(theme::bg_panel())
                     .padding(Padding::horizontal(1)),
             );
         f.render_widget(input, area);
@@ -2880,6 +2945,7 @@ fn draw_input(f: &mut Frame, area: Rect, state: &mut TuiState) {
             Block::default()
                 .borders(Borders::TOP)
                 .border_style(theme::border())
+                .style(theme::bg_panel())
                 .padding(Padding::horizontal(1)),
         );
 
@@ -3001,6 +3067,7 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &TuiState) {
     let block = Block::default()
         .borders(Borders::LEFT)
         .border_style(theme::border())
+        .style(theme::bg_panel())
         .padding(Padding::horizontal(1));
 
     let mut lines: Vec<Line> = Vec::new();
@@ -4156,6 +4223,380 @@ mod tests {
         assert!(
             s.messages.is_empty(),
             "TodoUpdate must not enter message history"
+        );
+    }
+
+    // ===== OpenCode 风格 restyle 测试 / OpenCode-style restyle tests =====
+
+    fn joined_spans(line: &Line<'_>) -> String {
+        line.spans.iter().flat_map(|s| s.content.chars()).collect()
+    }
+
+    #[test]
+    fn bordered_prefixes_every_line() {
+        let lines = vec![
+            Line::raw("hello"),
+            Line::raw("world"),
+        ];
+        let out = bordered(lines, theme::border_user());
+        assert_eq!(out.len(), 2);
+        for l in &out {
+            assert!(
+                l.spans.first().unwrap().content.starts_with('\u{2503}'),
+                "every line must start with ┃"
+            );
+        }
+    }
+
+    #[test]
+    fn bordered_preserves_existing_spans() {
+        let s1 = Style::new().fg(ratatui::style::Color::Red);
+        let s2 = Style::new().fg(ratatui::style::Color::Blue);
+        let lines = vec![Line::from(vec![
+            Span::styled("a".to_string(), s1),
+            Span::styled("b".to_string(), s2),
+        ])];
+        let out = bordered(lines, theme::border_user());
+        assert_eq!(out[0].spans.len(), 3, "border span + 2 original spans");
+        assert_eq!(out[0].spans[1].content, "a");
+        assert_eq!(out[0].spans[1].style, s1);
+        assert_eq!(out[0].spans[2].content, "b");
+        assert_eq!(out[0].spans[2].style, s2);
+    }
+
+    #[test]
+    fn bordered_empty_input_returns_empty() {
+        let out = bordered(vec![], theme::border_user());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn phase_start_has_no_divider_chars() {
+        for role in ["investigator", "planner", "builder", "auditor", "verify"] {
+            let ev = AgentEvent::PhaseStart {
+                role: role.to_string(),
+            };
+            let lines = render_event(&ev, false);
+            let all: String = lines.iter().map(joined_spans).collect::<Vec<_>>().join("");
+            assert!(
+                !all.contains('\u{2500}') && !all.contains('\u{2501}'),
+                "PhaseStart for {role} must not contain ─/━ divider chars, got: {all}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase_start_contains_label() {
+        let ev = AgentEvent::PhaseStart {
+            role: "investigator".to_string(),
+        };
+        let lines = render_event(&ev, false);
+        let all: String = lines.iter().map(joined_spans).collect::<Vec<_>>().join("");
+        assert!(
+            all.contains("Investigating"),
+            "PhaseStart must contain the role label, got: {all}"
+        );
+    }
+
+    #[test]
+    fn phase_start_has_role_colored_border() {
+        let ev = AgentEvent::PhaseStart {
+            role: "investigator".to_string(),
+        };
+        let lines = render_event(&ev, false);
+        let border_span = &lines[0].spans[0];
+        assert!(
+            border_span.content.starts_with('\u{2503}'),
+            "phase border must be ┃"
+        );
+        assert_eq!(
+            border_span.style,
+            theme::phase_style("investigator"),
+            "phase border style must match phase_style(role)"
+        );
+    }
+
+    #[test]
+    fn turn_finished_has_no_divider_chars() {
+        let ev = AgentEvent::TurnFinished {
+            turn: 3,
+            usage: "1.2k tok".to_string(),
+        };
+        let lines = render_event(&ev, false);
+        let all: String = lines.iter().map(joined_spans).collect::<Vec<_>>().join("");
+        assert!(
+            !all.contains('\u{2500}') && !all.contains('\u{2501}'),
+            "TurnFinished must not contain ─/━ divider chars, got: {all}"
+        );
+    }
+
+    #[test]
+    fn user_render_starts_with_blue_border() {
+        let ev = AgentEvent::User("hello world".to_string());
+        let lines = render_event(&ev, false);
+        let first = &lines[0];
+        assert!(
+            first.spans[0].content.starts_with('\u{2503}'),
+            "user line must start with ┃ border"
+        );
+        assert_eq!(
+            first.spans[0].style,
+            theme::border_user(),
+            "user border must be border_user (blue)"
+        );
+    }
+
+    #[test]
+    fn user_render_contains_message_text() {
+        let ev = AgentEvent::User("hello world".to_string());
+        let lines = render_event(&ev, false);
+        let all: String = lines.iter().map(joined_spans).collect::<Vec<_>>().join("");
+        assert!(
+            all.contains("hello world"),
+            "user render must contain the message text"
+        );
+    }
+
+    #[test]
+    fn user_render_has_no_old_prefix() {
+        let ev = AgentEvent::User("hello".to_string());
+        let lines = render_event(&ev, false);
+        let first_content: String = lines[0]
+            .spans
+            .iter()
+            .flat_map(|s| s.content.chars())
+            .collect();
+        assert!(
+            !first_content.starts_with('\u{276f}'),
+            "user render must not have the old ❯ prefix"
+        );
+    }
+
+    #[test]
+    fn agent_render_every_content_line_prefixed() {
+        let ev = AgentEvent::Agent("line one\nline two".to_string());
+        let lines = render_event(&ev, false);
+        for l in &lines {
+            if !l.spans.is_empty() {
+                assert!(
+                    l.spans[0].content.starts_with('\u{2503}'),
+                    "every non-empty agent line must start with ┃"
+                );
+                assert_eq!(
+                    l.spans[0].style,
+                    theme::border_agent(),
+                    "agent border must be border_agent (orange)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn toolcall_render_has_tool_border() {
+        let ev = AgentEvent::ToolCall {
+            name: "read_file".to_string(),
+            desc: "reading foo.rs".to_string(),
+            diff: None,
+        };
+        let lines = render_event(&ev, false);
+        for l in &lines {
+            if !l.spans.is_empty() {
+                assert_eq!(
+                    l.spans[0].style,
+                    theme::border_tool(),
+                    "toolcall border must be border_tool (gray)"
+                );
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn toolcall_with_diff_has_tool_border_on_every_line() {
+        use crate::event::FileEdit;
+        let edit = Box::new(FileEdit {
+            path: "foo.rs".to_string(),
+            old: "old\n".to_string(),
+            new: "new\n".to_string(),
+        });
+        let ev = AgentEvent::ToolCall {
+            name: "edit_file".to_string(),
+            desc: String::new(),
+            diff: Some(edit),
+        };
+        let lines = render_event(&ev, false);
+        for l in &lines {
+            if !l.spans.is_empty() {
+                assert_eq!(
+                    l.spans[0].style,
+                    theme::border_tool(),
+                    "toolcall+diff border must be border_tool on every line"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn toolresult_render_has_tool_border() {
+        let ev = AgentEvent::ToolResult {
+            name: "bash".to_string(),
+            result: "ok".to_string(),
+            ok: true,
+        };
+        let lines = render_event(&ev, false);
+        for l in &lines {
+            if !l.spans.is_empty() {
+                assert_eq!(
+                    l.spans[0].style,
+                    theme::border_tool(),
+                    "toolresult border must be border_tool (gray)"
+                );
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn reasoning_render_has_tool_border() {
+        let ev = AgentEvent::Reasoning("think".to_string());
+        let lines = render_event(&ev, false);
+        let first = &lines[0];
+        assert!(
+            !first.spans.is_empty(),
+            "reasoning collapsed must have content"
+        );
+        assert_eq!(
+            first.spans[0].style,
+            theme::border_tool(),
+            "reasoning border must be border_tool"
+        );
+    }
+
+    #[test]
+    fn info_and_error_have_no_border() {
+        let info_ev = AgentEvent::Info("info text".to_string());
+        let info_lines = render_event(&info_ev, false);
+        assert!(
+            !info_lines[0].spans.is_empty(),
+            "info line should have content"
+        );
+        assert!(
+            !info_lines[0].spans[0].content.starts_with('\u{2503}'),
+            "info must NOT have border prefix"
+        );
+
+        let err_ev = AgentEvent::Error("boom".to_string());
+        let err_lines = render_event(&err_ev, false);
+        assert!(
+            !err_lines[0].spans.is_empty(),
+            "error line should have content"
+        );
+        assert!(
+            !err_lines[0].spans[0].content.starts_with('\u{2503}'),
+            "error must NOT have border prefix"
+        );
+    }
+
+    #[test]
+    fn code_block_bg_preserves_is_code_line_equality() {
+        let line = Line::styled("  let x = 1;", theme::code_block());
+        assert_eq!(
+            line.style,
+            theme::code_block(),
+            "code_block line-level style must equal theme::code_block() even with bg"
+        );
+        assert!(
+            theme::code_block().bg.is_some(),
+            "code_block must now carry a bg (panel look)"
+        );
+    }
+
+    #[test]
+    fn apply_border_continuation_prefixes_continuation_lines() {
+        let border = theme::border_user();
+        let lines = vec![
+            Line {
+                spans: vec![
+                    Span::styled("\u{2503} ".to_string(), border),
+                    Span::raw("hello world this is a long line"),
+                ],
+                style: Style::default(),
+                alignment: None,
+            },
+            Line {
+                spans: vec![Span::raw("continuation without border")],
+                style: Style::default(),
+                alignment: None,
+            },
+            Line::default(),
+            Line::raw("non-bordered line"),
+        ];
+        let out = apply_border_continuation(lines);
+        assert!(
+            out[0].spans[0].content.starts_with('\u{2503}'),
+            "first line keeps its border"
+        );
+        assert!(
+            out[1].spans[0].content.starts_with('\u{2503}'),
+            "continuation line gets border prefix"
+        );
+        assert_eq!(
+            out[1].spans[0].style,
+            border,
+            "continuation border style matches the block's border"
+        );
+        assert!(
+            out[2].spans.is_empty(),
+            "empty line stays empty (block separator)"
+        );
+        assert!(
+            !out[3].spans[0].content.starts_with('\u{2503}'),
+            "non-bordered line after empty line does NOT get border"
+        );
+    }
+
+    #[test]
+    fn search_highlight_over_bordered_line_patches_border_consistently() {
+        // 搜索高亮在 apply_border_continuation 之前运行。
+        // 设计决策：第一行的边框 span 被搜索高亮 patch（它存在于高亮期间）；
+        // 续行的边框 span 从第一行拷贝完整样式（含搜索 bg）——一致的 patch。
+        // 结果：边框区与内容区在搜索高亮下颜色一致。
+        let border = theme::border_user();
+        let content_style = theme::msg_text();
+        let lines = vec![
+            Line {
+                spans: vec![
+                    Span::styled("\u{2503} ".to_string(), border),
+                    Span::styled("hello world".to_string(), content_style),
+                ],
+                style: Style::default(),
+                alignment: None,
+            },
+            Line {
+                spans: vec![Span::styled("continuation".to_string(), content_style)],
+                style: Style::default(),
+                alignment: None,
+            },
+        ];
+        let highlighted = highlight_matches(lines, &[0, 1], Some(0));
+        let out = apply_border_continuation(highlighted);
+        assert!(
+            out[0].spans[0].content.starts_with('\u{2503}'),
+            "first line border present"
+        );
+        assert!(
+            out[1].spans[0].content.starts_with('\u{2503}'),
+            "continuation line gets border"
+        );
+        assert_eq!(
+            out[0].spans[0].style.bg,
+            Some(ratatui::style::Color::Yellow),
+            "first line border IS search-patched (current match = Yellow)"
+        );
+        assert_eq!(
+            out[1].spans[0].style.bg,
+            Some(ratatui::style::Color::Yellow),
+            "continuation border copies the same style (consistent patching)"
         );
     }
 }

@@ -529,6 +529,15 @@ struct TuiState {
     input: InputState,
     streaming: String,
     streaming_reasoning: String,
+    /// 已提交的推理行（前向行提交，宽度不变后冻结）。
+    /// Committed reasoning lines (forward commit; frozen once committed).
+    reasoning_committed: Vec<String>,
+    /// `streaming_reasoning` 中已提交到 `reasoning_committed` 的字节偏移。
+    /// Byte offset into `streaming_reasoning` up to which lines are committed.
+    reasoning_consumed: usize,
+    /// 已提交行的正文宽度（变化时重置以重新折行）。
+    /// Body width at which lines were committed (reset on resize for re-wrap).
+    reasoning_wrap_w: usize,
     thinking: bool,
     spinner: usize,
     hitl: Option<HitlState>,
@@ -637,6 +646,9 @@ impl TuiState {
             input,
             streaming: String::new(),
             streaming_reasoning: String::new(),
+            reasoning_committed: Vec::new(),
+            reasoning_consumed: 0,
+            reasoning_wrap_w: 0,
             thinking: false,
             spinner: 0,
             hitl: None,
@@ -679,6 +691,12 @@ impl TuiState {
         if self.thinking {
             self.spinner = (self.spinner + 1) % SPINNER_FRAMES.len();
         }
+    }
+
+    fn reset_reasoning_commit(&mut self) {
+        self.reasoning_committed.clear();
+        self.reasoning_consumed = 0;
+        self.reasoning_wrap_w = 0;
     }
 
     fn all_message_lines(&self) -> Vec<Line<'static>> {
@@ -1523,6 +1541,7 @@ fn handle_key_event(
         state.thinking = false;
         state.streaming.clear();
         state.streaming_reasoning.clear();
+        state.reset_reasoning_commit();
         state.push_event(AgentEvent::Info(
             "\u{26a0} \u{4efb}\u{52a1}\u{5df2}\u{4e2d}\u{65ad} (Esc)".into(),
         ));
@@ -2168,6 +2187,7 @@ fn handle_command(
             state.thinking = true;
             state.streaming.clear();
             state.streaming_reasoning.clear();
+            state.reset_reasoning_commit();
             let _ = action_tx.send(AgentEvent::AgentStarted);
 
             let ctx = Arc::clone(ctx);
@@ -2765,6 +2785,7 @@ fn flush_reasoning(state: &mut TuiState) {
     if !state.streaming_reasoning.is_empty() {
         let text = std::mem::take(&mut state.streaming_reasoning);
         state.push_event(AgentEvent::Reasoning(text));
+        state.reset_reasoning_commit();
     }
 }
 
@@ -2816,6 +2837,7 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
             state.thinking = false;
             state.streaming.clear();
             state.streaming_reasoning.clear();
+            state.reset_reasoning_commit();
             state.reset_scroll();
         }
         AgentEvent::Info(text) => {
@@ -2908,6 +2930,7 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
             }
             state.thinking = false;
             state.streaming_reasoning.clear();
+            state.reset_reasoning_commit();
             state.reset_scroll();
         }
         // User and System events are pushed directly by handle_command —
@@ -3516,6 +3539,66 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
     }
 }
 
+/// 前向行提交：按 `body_w` 从 `reasoning_consumed` 前向扫描，将满行或遇 `\n`
+/// 的内容提交到 `reasoning_committed`，剩余部分留为未提交尾部。宽度变化时
+/// 重置已提交状态以重新折行。已提交行永不改变——只有底部未提交行随 delta 更新。
+///
+/// Forward line-commit: scan from `reasoning_consumed` at width `body_w`, committing
+/// lines that fill up or hit `\n` into `reasoning_committed`; the remainder stays as
+/// an uncommitted partial tail. A width change (resize) resets all commit state.
+/// A committed line never changes — only the bottom partial line updates on new deltas.
+fn commit_reasoning_lines(state: &mut TuiState, body_w: usize) {
+    let body_w = body_w.max(1);
+    if state.reasoning_wrap_w != body_w {
+        state.reasoning_committed.clear();
+        state.reasoning_consumed = 0;
+        state.reasoning_wrap_w = body_w;
+    }
+    let len = state.streaming_reasoning.len();
+    let mut idx = state.reasoning_consumed;
+    let mut line_start = idx;
+    let mut line_w: usize = 0;
+    while idx < len {
+        let c = match state.streaming_reasoning[idx..].chars().next() {
+            Some(c) => c,
+            None => break,
+        };
+        let c_len = c.len_utf8();
+        if c == '\n' {
+            let line = state.streaming_reasoning[line_start..idx].to_string();
+            state.reasoning_committed.push(line);
+            idx += c_len;
+            line_start = idx;
+            line_w = 0;
+        } else {
+            let cw = crate::ui::wrap::char_display_width(c) as usize;
+            if line_w > 0 && line_w + cw > body_w {
+                let line = state.streaming_reasoning[line_start..idx].to_string();
+                state.reasoning_committed.push(line);
+                line_start = idx;
+                line_w = 0;
+            }
+            line_w += cw;
+            idx += c_len;
+        }
+    }
+    state.reasoning_consumed = line_start;
+}
+
+/// 可见窗口：已提交行 + 未提交尾部，取最后 3 行。
+/// Visible window: committed lines + partial tail, take last 3 rows.
+fn reasoning_visible_lines(state: &TuiState) -> Vec<String> {
+    let committed = &state.reasoning_committed;
+    let has_partial = state.reasoning_consumed < state.streaming_reasoning.len();
+    let committed_start = committed.len().saturating_sub(if has_partial { 2 } else { 3 });
+    let mut visible: Vec<String> = Vec::with_capacity(3);
+    visible.extend(committed[committed_start..].iter().cloned());
+    if has_partial {
+        visible.push(state.streaming_reasoning[state.reasoning_consumed..].to_string());
+    }
+    visible
+}
+
 fn draw_streaming(f: &mut Frame, area: Rect, state: &mut TuiState) {
     if !state.thinking {
         // 非思考态：渲染空段落（保持背景一致）。
@@ -3563,45 +3646,21 @@ fn draw_streaming(f: &mut Frame, area: Rect, state: &mut TuiState) {
         }
         Text::from(rendered)
     } else if !state.streaming_reasoning.is_empty() {
-        // 思考阶段：显示推理尾部最多 3 行，首行带 spinner + "思考中:" 前缀，
-        // 后续行缩进对齐到正文起点，便于多行阅读。
-        // Reasoning phase: show up to 3 trailing lines of reasoning. The first
-        // line carries the spinner + "思考中:" prefix; continuation lines are
-        // indented to align with the body start column.
-        // spinner(2) + " "(1) = 3; "思考中: " = 3 CJK*2 + ":"(1) + " "(1) = 8 → total 11
-        let label_w: usize = 8; // "思考中: " 显示宽度
-        let prefix_w = 3 + label_w; // spinner(2) + " "(1) + label(8) = 11
-        let first_w = inner_w.saturating_sub(prefix_w);
-        let cont_w = first_w; // 续行与首行正文起点对齐
-        let (mut lines, truncated) = wrap_tail_lines(
-            &state.streaming_reasoning,
-            first_w.max(1),
-            cont_w.max(1),
-            3,
-            1000,
-        );
-        if lines.is_empty() {
-            lines.push(String::new());
-        }
-        let first_line = if truncated {
-            let avail = first_w.saturating_sub(2).max(1);
-            let tail = tail_by_display_width(&lines[0], avail);
-            format!("…{tail}")
-        } else {
-            lines[0].clone()
-        };
-        let mut rendered: Vec<Line> = Vec::with_capacity(lines.len());
-        rendered.push(Line::from(vec![
-            Span::styled(sp.to_string(), theme::streaming()),
-            Span::raw(" "),
-            Span::styled("\u{601d}\u{8003}\u{4e2d}: ", theme::streaming()),
-            Span::raw(first_line),
-        ]));
-        // 续行缩进：spinner(2) + " "(1) + "思考中: "(8) = 11 列，用空格填充。
-        let indent: String = " ".repeat(prefix_w);
-        for line in lines.into_iter().skip(1) {
-            rendered.push(Line::from(vec![Span::raw(indent.clone()), Span::raw(line)]));
-        }
+        // 统一前缀 spinner + " "：所有行用相同前缀，在任意 spinner 宽度解释下互相对齐。
+        // Uniform spinner + " " prefix: all lines share one prefix so they stay
+        // mutually aligned under any terminal width interpretation of the spinner.
+        let body_w = inner_w.saturating_sub(3);
+        commit_reasoning_lines(state, body_w);
+        let rendered: Vec<Line> = reasoning_visible_lines(state)
+            .into_iter()
+            .map(|line| {
+                Line::from(vec![
+                    Span::styled(sp.to_string(), theme::streaming()),
+                    Span::raw(" "),
+                    Span::raw(line),
+                ])
+            })
+            .collect();
         Text::from(rendered)
     } else {
         // 空思考态：仅 spinner + "思考中..."。
@@ -6012,5 +6071,98 @@ mod tests {
             assert!(!l.contains('\n'));
             assert!(l.chars().all(|c| c == 'a' || c == 'b'));
         }
+    }
+
+    // ===== commit_reasoning_lines / reasoning_visible_lines =====
+
+    #[test]
+    fn commit_incremental_stability() {
+        // 已提交行内容不随后续 delta 改变。
+        // A committed line's content never changes as more deltas arrive.
+        let mut s = tui_state_for_test();
+        s.streaming_reasoning = "abcdef".into();
+        commit_reasoning_lines(&mut s, 5);
+        assert_eq!(s.reasoning_committed, vec!["abcde".to_string()]);
+        let snapshot = s.reasoning_committed[0].clone();
+
+        s.streaming_reasoning.push_str("ghijklmnop");
+        commit_reasoning_lines(&mut s, 5);
+        assert_eq!(s.reasoning_committed[0], snapshot, "committed line must be stable");
+        assert!(s.reasoning_committed.len() >= 2);
+    }
+
+    #[test]
+    fn commit_hard_newline() {
+        // \n 提交当前行（即使未满）。
+        // A \n commits the current line even if not full.
+        let mut s = tui_state_for_test();
+        s.streaming_reasoning = "ab\ncd".into();
+        commit_reasoning_lines(&mut s, 10);
+        assert_eq!(s.reasoning_committed, vec!["ab".to_string()]);
+        assert_eq!(s.reasoning_consumed, 3);
+        let vis = reasoning_visible_lines(&s);
+        assert_eq!(vis, vec!["ab".to_string(), "cd".to_string()]);
+    }
+
+    #[test]
+    fn commit_cjk_double_width() {
+        // 每个 CJK 2 列；body_w=4 → 每行容 2 个 CJK。
+        // Each CJK char is 2 cols; body_w=4 → 2 CJK per line.
+        let mut s = tui_state_for_test();
+        s.streaming_reasoning = "你好世界".into();
+        commit_reasoning_lines(&mut s, 4);
+        assert_eq!(s.reasoning_committed, vec!["你好".to_string()]);
+        let vis = reasoning_visible_lines(&s);
+        assert_eq!(vis, vec!["你好".to_string(), "世界".to_string()]);
+    }
+
+    #[test]
+    fn commit_exactly_full_line_commits_on_next_char() {
+        // 恰好满行时不提交，下一个字符到达才提交。
+        // An exactly-full line is NOT committed until the next char arrives.
+        let mut s = tui_state_for_test();
+        s.streaming_reasoning = "abcde".into();
+        commit_reasoning_lines(&mut s, 5);
+        assert!(s.reasoning_committed.is_empty());
+        assert_eq!(s.reasoning_consumed, 0);
+
+        s.streaming_reasoning.push_str("f");
+        commit_reasoning_lines(&mut s, 5);
+        assert_eq!(s.reasoning_committed, vec!["abcde".to_string()]);
+        assert_eq!(s.reasoning_consumed, 5);
+    }
+
+    #[test]
+    fn commit_resize_rewrap_reset() {
+        // 宽度变化时重置已提交状态，重新折行。
+        // Width change resets commit state for re-wrap.
+        let mut s = tui_state_for_test();
+        s.streaming_reasoning = "abcdef".into();
+        commit_reasoning_lines(&mut s, 3);
+        assert_eq!(s.reasoning_committed, vec!["abc".to_string()]);
+
+        commit_reasoning_lines(&mut s, 10);
+        assert!(s.reasoning_committed.is_empty(), "resize must reset committed");
+        assert_eq!(s.reasoning_consumed, 0);
+        assert_eq!(s.reasoning_wrap_w, 10);
+        let vis = reasoning_visible_lines(&s);
+        assert_eq!(vis, vec!["abcdef".to_string()]);
+    }
+
+    #[test]
+    fn reasoning_visible_window_tail_slicing() {
+        // 已提交行超过 3 时，可见窗口只取最后 3 行（含 partial）。
+        // When committed lines exceed 3, visible window takes last 3 (incl. partial).
+        let mut s = tui_state_for_test();
+        s.streaming_reasoning = "abcdefghijkl".into();
+        commit_reasoning_lines(&mut s, 3);
+        assert_eq!(s.reasoning_committed, vec!["abc", "def", "ghi"]);
+        assert_eq!(s.reasoning_consumed, 9);
+        let vis = reasoning_visible_lines(&s);
+        assert_eq!(
+            vis,
+            vec!["def".to_string(), "ghi".to_string(), "jkl".to_string()]
+        );
+        assert_eq!(vis.len(), 3);
     }
 }

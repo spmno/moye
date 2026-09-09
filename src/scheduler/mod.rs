@@ -9,9 +9,10 @@
 //   - 每个定时任务在独立进程中运行，互不污染主会话状态。
 
 pub mod cron;
+pub mod os_cron;
 pub mod store;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -51,10 +52,21 @@ pub struct RunLog {
 }
 
 /// 调度器配置（对应 agent.toml 的 [scheduler] 小节）。
-#[derive(Debug, Clone, Deserialize, Default)]
+/// 注意：Default 必须手动实现——整个小节缺失时 serde 走 Default::default()，
+/// 派生 Default 会把 max_concurrent 置 0（所有任务永远无法派发）、mode 置空。
+/// Note: Default is hand-implemented — when the whole section is absent serde
+/// falls back to Default::default(), and a derived Default would zero out
+/// max_concurrent (no task could ever dispatch) and blank the mode.
+#[derive(Debug, Clone, Deserialize)]
 pub struct SchedulerConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// 调度模式 / Scheduling mode:
+    ///   "os"      —— 向 OS 调度器注册每分钟心跳（crontab / Windows 任务计划），
+    ///               moye 进程不在时任务照常触发；注册失败自动回退 "process"。
+    ///   "process" —— 进程内循环扫描（moye 退出后任务不再触发）。
+    #[serde(default = "default_mode")]
+    pub mode: String,
     #[serde(default = "default_tick_secs")]
     pub tick_secs: u64,
     #[serde(default = "default_max_concurrent")]
@@ -65,9 +77,23 @@ pub struct SchedulerConfig {
     pub log_retention_days: u32,
 }
 
+fn default_mode() -> String { "os".to_string() }
 fn default_tick_secs() -> u64 { 60 }
 fn default_max_concurrent() -> usize { 2 }
 fn default_log_retention_days() -> u32 { 30 }
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: default_mode(),
+            tick_secs: default_tick_secs(),
+            max_concurrent: default_max_concurrent(),
+            store_path: None,
+            log_retention_days: default_log_retention_days(),
+        }
+    }
+}
 
 /// 解析后的调度器路径信息。
 #[derive(Clone)]
@@ -85,6 +111,22 @@ impl SchedulerPaths {
         });
         let log_path = log_path(&store_path);
         Self { store_path, log_path }
+    }
+
+    /// 心跳锁文件路径（与任务存储同目录），防 OS 心跳重入。
+    /// Heartbeat lock file (next to the task store), prevents overlapping ticks.
+    pub fn tick_lock(&self) -> PathBuf {
+        let mut p = PathBuf::from(&self.store_path);
+        p.set_file_name("scheduler_tick.lock");
+        p
+    }
+
+    /// 心跳自身 stdout/stderr 的追加日志（crontab/schtasks 重定向目标）。
+    /// Append target for the heartbeat's own stdout/stderr (cron/schtasks redirect).
+    pub fn heartbeat_log(&self) -> PathBuf {
+        let mut p = PathBuf::from(&self.store_path);
+        p.set_file_name("scheduler_heartbeat.log");
+        p
     }
 }
 
@@ -162,6 +204,36 @@ impl Scheduler {
             self.execute_task(task).await;
         }
         Ok(())
+    }
+
+    /// 单次 tick：供 OS 心跳（`moye --scheduler-tick`）调用。
+    /// 派发本轮到期任务后阻塞等待其全部完成——进程退出前必须完成记账
+    /// （last_run / run_count / 日志），否则下一分钟心跳会重复触发同一任务。
+    /// 最多等待 MAX_TICK_WAIT，超时退出（子进程不会被杀，但记账可能丢失）。
+    ///
+    /// Single tick for the OS heartbeat (`moye --scheduler-tick`). After
+    /// dispatching due tasks it blocks until they finish — bookkeeping must be
+    /// written before the process exits, otherwise the next minute's heartbeat
+    /// would re-trigger the same task. Waits at most MAX_TICK_WAIT; on timeout
+    /// it exits (children survive, but their bookkeeping may be lost).
+    pub async fn tick_once(&self, lock_path: &Path) -> Result<()> {
+        self.tick().await?;
+        let deadline = std::time::Instant::now() + MAX_TICK_WAIT;
+        loop {
+            if self.running.lock().await.is_empty() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                warn!("[scheduler] tick_once: wait timeout, exiting (children keep running)");
+                return Ok(());
+            }
+            // 续约锁文件 mtime：长任务运行期间，后续心跳看到新鲜锁会安静跳过，
+            // 不会被误判为 stale 锁而重复派发。
+            // Refresh the lock mtime: while a long task runs, later heartbeats
+            // see a fresh lock and skip quietly instead of treating it as stale.
+            std::fs::write(lock_path, std::process::id().to_string()).ok();
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        }
     }
 
     async fn execute_task(&self, task: ScheduledTask) {
@@ -302,6 +374,67 @@ impl TaskManager {
     }
 }
 
+// ── 心跳互斥锁 ──
+// ── Heartbeat mutex ──
+
+/// 心跳锁的 stale 阈值：锁文件 mtime 超过该时长视为上次进程异常退出（被 kill、
+/// 断电等），允许强制接管。正常运行的 tick 会周期性刷新 mtime（见 tick_once）。
+/// Stale threshold for the heartbeat lock: a lock file whose mtime is older
+/// than this is assumed to belong to a dead process (killed, power loss, ...)
+/// and may be taken over. A healthy tick refreshes the mtime (see tick_once).
+pub const TICK_LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// tick_once 等待本轮任务完成的最长时间。
+/// Max time tick_once waits for its dispatched tasks to finish.
+const MAX_TICK_WAIT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// 心跳互斥锁（create_new 原子占位 + mtime stale 回收），防止上一轮 tick
+/// 未结束时本轮重复派发。Drop 时自动释放。
+/// Heartbeat mutex (atomic create_new + mtime-based stale recovery), preventing
+/// a new tick from dispatching while the previous one is still running.
+/// Released automatically on drop.
+pub struct TickLock {
+    path: PathBuf,
+}
+
+impl TickLock {
+    /// 尝试获取锁；锁被占用且未过期时返回 Ok(None)。
+    /// Try to acquire; Ok(None) when a fresh lock is held by another tick.
+    pub fn acquire(path: &Path, stale_after: std::time::Duration) -> Result<Option<Self>> {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let try_create = |path: &Path| -> Option<Self> {
+            let mut f = OpenOptions::new().write(true).create_new(true).open(path).ok()?;
+            write!(f, "{}", std::process::id()).ok();
+            Some(Self { path: path.to_path_buf() })
+        };
+        if let Some(lock) = try_create(path) {
+            return Ok(Some(lock));
+        }
+        // 锁已存在：未过期则放弃；过期（上次进程异常退出）则回收重试一次。
+        // Lock exists: give up when fresh; reclaim + retry once when stale.
+        let stale = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().unwrap_or_default() > stale_after)
+            .unwrap_or(false);
+        if !stale {
+            return Ok(None);
+        }
+        warn!("[scheduler] reclaiming stale tick lock: {}", path.display());
+        std::fs::remove_file(path).ok();
+        Ok(try_create(path))
+    }
+}
+
+impl Drop for TickLock {
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.path).ok();
+    }
+}
+
 // ── helpers ──
 
 fn truncate_summary(s: &str, max: usize) -> String {
@@ -352,4 +485,50 @@ fn short_uuid() -> String {
     let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     let pid = std::process::id() as u128;
     format!("{:08x}", (t ^ (pid << 48)) & 0xFFFFFFFF)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：整个 [scheduler] 小节缺失时走 Default::default()，必须与
+    /// 小节存在但字段缺失时（serde 字段默认值）完全一致。曾经用派生
+    /// Default，max_concurrent=0 导致所有任务永远无法派发。
+    /// Regression: Default::default() (whole section missing) must match the
+    /// serde field defaults (section present, fields missing). A derived
+    /// Default used to zero max_concurrent, silently blocking all dispatch.
+    #[test]
+    fn default_config_matches_serde_defaults() {
+        let d = SchedulerConfig::default();
+        assert_eq!(d.mode, "os");
+        assert_eq!(d.tick_secs, 60);
+        assert_eq!(d.max_concurrent, 2);
+        assert_eq!(d.log_retention_days, 30);
+        assert!(!d.enabled);
+
+        let de: SchedulerConfig = toml::from_str("").unwrap();
+        assert_eq!(de.mode, "os");
+        assert_eq!(de.tick_secs, 60);
+        assert_eq!(de.max_concurrent, 2);
+        assert_eq!(de.log_retention_days, 30);
+        assert!(!de.enabled);
+    }
+
+    /// TickLock：占用时第二个 acquire 返回 None；stale 锁被回收；Drop 释放。
+    #[test]
+    fn tick_lock_exclusion_and_stale_reclaim() {
+        let dir = std::env::temp_dir().join(format!("moye-lock-test-{}", std::process::id()));
+        let lock_path = dir.join("tick.lock");
+        let lock = TickLock::acquire(&lock_path, TICK_LOCK_STALE).unwrap();
+        assert!(lock.is_some());
+        // 未过期：第二个 acquire 失败。
+        assert!(TickLock::acquire(&lock_path, TICK_LOCK_STALE).unwrap().is_none());
+        // stale_after=0 → 任何存在的锁都视为过期，可回收。
+        let reclaimed = TickLock::acquire(&lock_path, std::time::Duration::ZERO).unwrap();
+        assert!(reclaimed.is_some());
+        drop(reclaimed);
+        drop(lock); // 第二个 guard 删文件无副作用（文件已被前一个 Drop 删除）。
+        assert!(!lock_path.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

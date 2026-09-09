@@ -3720,6 +3720,31 @@ fn reasoning_visible_lines(state: &TuiState) -> Vec<String> {
     visible
 }
 
+/// 思考阶段行前缀：仅首行带 spinner，续行用 2 个空格补齐。盲文 spinner 在
+/// 主流终端按 1 列渲染（unicode-width 亦为 1），2 列空白（spinner 1 + 空格 1）
+/// 使续行正文与首行正文起点保持对齐。
+/// Thinking-line prefix: only the first line carries the spinner; continuations
+/// get 2 spaces. Braille spinners render as 1 column in mainstream terminals
+/// (unicode-width agrees), so 2 blank cols (spinner 1 + space 1) keep
+/// continuation bodies aligned with the first line's body.
+fn thinking_lines_with_spinner(sp: &str, lines: Vec<String>) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            if i == 0 {
+                Line::from(vec![
+                    Span::styled(sp.to_string(), theme::streaming()),
+                    Span::raw(" "),
+                    Span::raw(line),
+                ])
+            } else {
+                Line::from(vec![Span::raw("  "), Span::raw(line)])
+            }
+        })
+        .collect()
+}
+
 fn draw_streaming(f: &mut Frame, area: Rect, state: &mut TuiState) {
     if !state.thinking {
         // 非思考态：渲染空段落（保持背景一致）。
@@ -3767,22 +3792,9 @@ fn draw_streaming(f: &mut Frame, area: Rect, state: &mut TuiState) {
         }
         Text::from(rendered)
     } else if !state.streaming_reasoning.is_empty() {
-        // 统一前缀 spinner + " "：所有行用相同前缀，在任意 spinner 宽度解释下互相对齐。
-        // Uniform spinner + " " prefix: all lines share one prefix so they stay
-        // mutually aligned under any terminal width interpretation of the spinner.
         let body_w = inner_w.saturating_sub(3);
         commit_reasoning_lines(state, body_w);
-        let rendered: Vec<Line> = reasoning_visible_lines(state)
-            .into_iter()
-            .map(|line| {
-                Line::from(vec![
-                    Span::styled(sp.to_string(), theme::streaming()),
-                    Span::raw(" "),
-                    Span::raw(line),
-                ])
-            })
-            .collect();
-        Text::from(rendered)
+        Text::from(thinking_lines_with_spinner(sp, reasoning_visible_lines(state)))
     } else {
         // 空思考态：仅 spinner + "思考中..."。
         Text::from(Line::from(vec![
@@ -6285,5 +6297,27 @@ mod tests {
             vec!["def".to_string(), "ghi".to_string(), "jkl".to_string()]
         );
         assert_eq!(vis.len(), 3);
+    }
+
+    #[test]
+    fn thinking_lines_spinner_only_on_first_line() {
+        // 仅首行带 spinner；续行以 2 空格补齐前缀，与首行正文起点对齐。
+        // Only the first line carries the spinner; continuations use a 2-space
+        // prefix aligned to the first line's body start.
+        let out = thinking_lines_with_spinner(
+            "\u{280b}",
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        );
+        let texts: Vec<String> = out.iter().map(joined_spans).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "\u{280b} a".to_string(),
+                "  b".to_string(),
+                "  c".to_string()
+            ]
+        );
+        let single = thinking_lines_with_spinner("\u{280b}", vec!["only".to_string()]);
+        assert_eq!(joined_spans(&single[0]), "\u{280b} only".to_string());
     }
 }

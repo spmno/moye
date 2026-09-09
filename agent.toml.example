@@ -261,3 +261,40 @@ max_retries = 2
 # 每条命令的超时秒数（默认 600）。
 # Per-command timeout in seconds (default 600).
 timeout_secs = 600
+
+# ── 定时任务调度器 / Scheduler ───────────────────────────────────────────
+# 通过 schedule_task 工具管理的定时任务（cron 表达式 + agent prompt）。
+# Scheduled tasks managed via the schedule_task tool (cron expr + agent prompt).
+[scheduler]
+# 是否启用（默认 false）。
+# Enable scheduled tasks (default false).
+enabled = false
+# 调度模式 / Scheduling mode:
+#   "os"      —— 向操作系统调度器注册"每分钟心跳"，moye 进程退出后任务照常触发。
+#                Linux/macOS 写入用户 crontab（标记块，多项目共存）；
+#                Windows 注册任务计划（schtasks 每分钟运行包装 .cmd）。
+#                注册失败时自动回退到 "process"。
+#                手动管理：moye --scheduler-install / --scheduler-uninstall
+#   "process" —— 进程内循环扫描（moye 退出后任务不再触发，历史行为）。
+#   "os"      —— register a per-minute heartbeat with the OS scheduler; tasks
+#                fire even when moye is not running. Linux/macOS: a marked block
+#                in the user crontab (multi-project safe). Windows: a Task
+#                Scheduler entry (schtasks) running a wrapper .cmd every minute
+#                (note: runs only while the user is logged on by default).
+#                Falls back to "process" if OS registration fails.
+#                Manual control: moye --scheduler-install / --scheduler-uninstall
+#   "process" —— in-process loop; tasks stop when moye exits (legacy behavior).
+mode = "os"
+# process 模式的扫描间隔秒数（默认 60；os 模式固定为系统调度的 1 分钟粒度）。
+# Scan interval seconds for process mode (default 60; os mode is fixed at the
+# OS scheduler's 1-minute granularity).
+tick_secs = 60
+# 同时执行的任务上限（默认 2）。
+# Max concurrently executing tasks (default 2).
+max_concurrent = 2
+# 任务存储文件路径（默认 ~/.config/moye/scheduled_tasks.json）。
+# Task store path (default ~/.config/moye/scheduled_tasks.json).
+# store_path = "~/.config/moye/scheduled_tasks.json"
+# 执行日志保留天数（默认 30）。
+# Run-log retention days (default 30).
+log_retention_days = 30

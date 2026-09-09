@@ -50,6 +50,20 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // --scheduler-tick / --scheduler-install / --scheduler-uninstall：
+    // OS 心跳入口（crontab / Windows 任务计划每分钟触发）。必须最先拦截——
+    // 心跳环境没有 TTY，不能启动配置向导；也不走会话日志（每分钟一个文件会撑爆磁盘）。
+    // --scheduler-tick / --scheduler-install / --scheduler-uninstall: OS
+    // heartbeat entry (fired every minute by crontab / Windows Task Scheduler).
+    // Must be intercepted first — no TTY for the setup wizard in a heartbeat
+    // environment, and per-session log files would flood the disk.
+    {
+        let raw_args: Vec<String> = std::env::args().skip(1).collect();
+        if raw_args.iter().any(|a| a.starts_with("--scheduler-")) {
+            return scheduler_cli_entry(&raw_args).await;
+        }
+    }
+
     init_logging();
 
     // --version / -V：打印版本号并退出。必须在配置向导与 .env 加载之前检查——
@@ -180,15 +194,57 @@ async fn main() -> Result<()> {
         // 创建 TaskManager 并注入 registry，供 schedule_task 工具使用。
         let mgr = crate::scheduler::TaskManager::from_config(&config.scheduler);
         ctx.registry.set_scheduler_mgr(mgr.clone());
-        match crate::scheduler::Scheduler::new(config.scheduler.clone()) {
-            Ok(sched) => {
-                info!("[scheduler] enabled, starting background loop");
-                Some(Arc::new(sched).spawn())
+
+        // 进程内循环（mode = "process"，或 os 模式注册失败时的回退）。
+        // In-process loop (mode = "process", or the fallback when OS
+        // registration fails).
+        fn spawn_process_loop(
+            config: &crate::scheduler::SchedulerConfig,
+        ) -> Option<tokio::task::JoinHandle<()>> {
+            match crate::scheduler::Scheduler::new(config.clone()) {
+                Ok(sched) => {
+                    info!("[scheduler] in-process loop started (tick={}s)", config.tick_secs);
+                    Some(Arc::new(sched).spawn())
+                }
+                Err(e) => {
+                    tracing::warn!("[scheduler] failed to initialize: {e}");
+                    None
+                }
             }
-            Err(e) => {
-                tracing::warn!("[scheduler] failed to initialize: {e}");
-                None
+        }
+
+        match config.scheduler.mode.as_str() {
+            // os 模式：向 OS 调度器注册每分钟心跳，moye 退出后任务照常触发。
+            // 幂等——心跳内容未变化时不改写 crontab/任务计划。
+            // os mode: register a per-minute heartbeat with the OS scheduler so
+            // tasks fire even after moye exits. Idempotent — the OS entry is
+            // not rewritten when its content is unchanged.
+            "os" => {
+                let hb = crate::scheduler::os_cron::Heartbeat {
+                    workdir: std::env::current_dir()
+                        .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                    binary: std::env::current_exe()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("moye")),
+                    log_path: crate::scheduler::SchedulerPaths::from_config(&config.scheduler)
+                        .heartbeat_log(),
+                };
+                match hb.install() {
+                    Ok(msg) => {
+                        info!("[scheduler] os mode: {msg}");
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[scheduler] OS heartbeat registration failed: {e}; \
+                             falling back to in-process loop (mode = \"process\")"
+                        );
+                        spawn_process_loop(&config.scheduler)
+                    }
+                }
             }
+            // process 模式：进程内循环（历史行为）。
+            // process mode: in-process loop (legacy behavior).
+            _ => spawn_process_loop(&config.scheduler),
         }
     } else {
         info!("[scheduler] disabled (set [scheduler].enabled = true in agent.toml to enable)");
@@ -221,6 +277,65 @@ async fn main() -> Result<()> {
     }
 
     ui::tui::run_tui(ctx).await
+}
+
+/// OS 心跳 CLI 入口：--scheduler-tick / --scheduler-install / --scheduler-uninstall。
+/// 刻意保持轻量：不初始化日志文件/MCP/沙箱/TUI，只做调度相关动作。
+/// stdout/stderr 由 OS 调度器重定向到 heartbeat 日志（见 os_cron）。
+///
+/// OS heartbeat CLI entry: --scheduler-tick / --scheduler-install /
+/// --scheduler-uninstall. Deliberately lightweight: no session log file, no
+/// MCP/sandbox/TUI init — just scheduler actions. stdout/stderr are redirected
+/// to the heartbeat log by the OS scheduler entry (see os_cron).
+async fn scheduler_cli_entry(args: &[String]) -> Result<()> {
+    // 心跳环境跑交互式配置向导没有意义，直接报错（错误进 heartbeat 日志）。
+    // Running the interactive setup wizard from a heartbeat makes no sense;
+    // fail instead (the error lands in the heartbeat log).
+    if !crate::config::has_config_file() {
+        anyhow::bail!(
+            "no agent.toml or global config found; run moye interactively once to set up"
+        );
+    }
+    // 加载 .env：tick 派生的子进程（moye -p ...）通过环境继承 API Key。
+    // Load .env: children spawned by the tick (moye -p ...) inherit API keys
+    // from this process environment.
+    dotenvy::dotenv().ok();
+    let config = crate::config::init("agent.toml")?;
+
+    let paths = crate::scheduler::SchedulerPaths::from_config(&config.scheduler);
+    let make_heartbeat = || crate::scheduler::os_cron::Heartbeat {
+        workdir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        binary: std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("moye")),
+        log_path: paths.heartbeat_log(),
+    };
+
+    if args.iter().any(|a| a == "--scheduler-install") {
+        let hb = make_heartbeat();
+        println!("{}", hb.install()?);
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--scheduler-uninstall") {
+        let hb = make_heartbeat();
+        println!("{}", hb.uninstall()?);
+        return Ok(());
+    }
+
+    // 默认动作：--scheduler-tick（由 crontab / schtasks 每分钟调用）。
+    // Default action: --scheduler-tick (invoked every minute by crontab / schtasks).
+    let lock_path = paths.tick_lock();
+    let Some(_guard) = crate::scheduler::TickLock::acquire(
+        &lock_path,
+        crate::scheduler::TICK_LOCK_STALE,
+    )?
+    else {
+        // 上一轮 tick 还在跑（任务执行超过一分钟），本轮安静跳过。
+        // The previous tick is still running (task longer than a minute);
+        // skip this round quietly.
+        println!("[scheduler-tick] previous tick still running, skipped");
+        return Ok(());
+    };
+    let sched = crate::scheduler::Scheduler::new(config.scheduler.clone())?;
+    sched.tick_once(&lock_path).await
 }
 
 fn init_logging() {

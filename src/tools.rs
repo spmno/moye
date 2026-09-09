@@ -2040,6 +2040,168 @@ impl PortableTool for TodoWrite {
     }
 }
 
+// ─── schedule_task 工具（定时任务管理）────────────────────────────────
+// ─── schedule_task tool (scheduled task management) ──────────────────
+
+/// `schedule_task` 工具的输入参数：操作类型 + 任务参数。
+/// Input args for the `schedule_task` tool: action type + task parameters.
+#[derive(Deserialize)]
+struct ScheduleTaskArgs {
+    /// 操作类型：add / list / remove / enable / disable / logs。
+    /// Action type: add / list / remove / enable / disable / logs.
+    action: String,
+    /// 任务名称（add 时必填）。
+    /// Task name (required for add).
+    #[serde(default)]
+    name: Option<String>,
+    /// cron 表达式（add 时必填），如 "0 9 * * *"（每天 9 点）。
+    /// Cron expression (required for add), e.g. "0 9 * * *" (daily at 9am).
+    #[serde(default)]
+    cron: Option<String>,
+    /// 任务 prompt（add 时必填），即要执行的 agent 指令。
+    /// Task prompt (required for add), i.e. the agent instruction to execute.
+    #[serde(default)]
+    prompt: Option<String>,
+    /// 任务 ID（remove / enable / disable 时必填）。
+    /// Task ID (required for remove / enable / disable).
+    #[serde(default)]
+    id: Option<String>,
+    /// 最大执行次数（可选，仅 add 时有效）。
+    /// Max execution count (optional, only valid for add).
+    #[serde(default)]
+    max_runs: Option<u64>,
+    /// 日志条数（logs 时可选，默认 10）。
+    /// Log count (optional for logs, default 10).
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// 定时任务管理工具：创建、查看、删除、启用/禁用定时任务，查看执行日志。
+/// Scheduled task management tool: create, list, remove, enable/disable tasks, view logs.
+struct ScheduleTask {
+    scheduler: Arc<crate::scheduler::Scheduler>,
+}
+
+impl PortableTool for ScheduleTask {
+    const NAME: &'static str = "schedule_task";
+    type Error = ToolError;
+    type Args = ScheduleTaskArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        "定时任务管理工具。支持以下操作：\n\
+         - add: 创建定时任务（需提供 name, cron, prompt）\n\
+         - list: 列出所有任务\n\
+         - remove: 删除任务（需提供 id）\n\
+         - enable/disable: 启用/禁用任务（需提供 id）\n\
+         - logs: 查看最近执行日志（可选 limit）\n\n\
+         cron 表达式格式：分 时 日 月 周（如 '0 9 * * *' 表示每天 9 点，'*/15 * * * *' 表示每 15 分钟）"
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "list", "remove", "enable", "disable", "logs"],
+                    "description": "操作类型"
+                },
+                "name": { "type": "string", "description": "任务名称（add 时必填）" },
+                "cron": { "type": "string", "description": "cron 表达式（add 时必填），如 '0 9 * * *'" },
+                "prompt": { "type": "string", "description": "要执行的 agent prompt（add 时必填）" },
+                "id": { "type": "string", "description": "任务 ID（remove/enable/disable 时必填）" },
+                "max_runs": { "type": "number", "description": "最大执行次数（可选，仅 add 时有效）" },
+                "limit": { "type": "number", "description": "日志条数（logs 时可选，默认 10）" }
+            },
+            "required": ["action"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        match args.action.as_str() {
+            "add" => {
+                let name = args.name.ok_or_else(|| ToolError("name is required for add".into()))?;
+                let cron = args.cron.ok_or_else(|| ToolError("cron is required for add".into()))?;
+                let prompt = args.prompt.ok_or_else(|| ToolError("prompt is required for add".into()))?;
+                match self.scheduler.add_task(name, cron, prompt, args.max_runs).await {
+                    Ok(task) => Ok(format!(
+                        "✅ 定时任务已创建\nID: {}\n名称: {}\nCron: {}\n最大执行次数: {}",
+                        task.id, task.name, task.cron,
+                        task.max_runs.map(|n| n.to_string()).unwrap_or_else(|| "无限".into())
+                    )),
+                    Err(e) => Err(ToolError(format!("创建任务失败: {e}"))),
+                }
+            }
+            "list" => {
+                let tasks = self.scheduler.list_tasks().await;
+                if tasks.is_empty() {
+                    Ok("📋 暂无定时任务".to_string())
+                } else {
+                    let mut out = String::from("📋 定时任务列表：\n");
+                    for t in &tasks {
+                        let status = if t.enabled { "✅" } else { "⏸️" };
+                        let last = t.last_run
+                            .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                            .unwrap_or_else(|| "从未".into());
+                        out.push_str(&format!(
+                            "{} [{}] {} (cron: {}, 已执行 {} 次, 上次: {})\n",
+                            status, t.id, t.name, t.cron, t.run_count, last
+                        ));
+                    }
+                    Ok(out)
+                }
+            }
+            "remove" => {
+                let id = args.id.ok_or_else(|| ToolError("id is required for remove".into()))?;
+                match self.scheduler.remove_task(&id).await {
+                    Ok(true) => Ok(format!("✅ 任务 {} 已删除", id)),
+                    Ok(false) => Err(ToolError(format!("任务 {} 不存在", id))),
+                    Err(e) => Err(ToolError(format!("删除失败: {e}"))),
+                }
+            }
+            "enable" => {
+                let id = args.id.ok_or_else(|| ToolError("id is required for enable".into()))?;
+                match self.scheduler.set_enabled(&id, true).await {
+                    Ok(true) => Ok(format!("✅ 任务 {} 已启用", id)),
+                    Ok(false) => Err(ToolError(format!("任务 {} 不存在", id))),
+                    Err(e) => Err(ToolError(format!("启用失败: {e}"))),
+                }
+            }
+            "disable" => {
+                let id = args.id.ok_or_else(|| ToolError("id is required for disable".into()))?;
+                match self.scheduler.set_enabled(&id, false).await {
+                    Ok(true) => Ok(format!("✅ 任务 {} 已禁用", id)),
+                    Ok(false) => Err(ToolError(format!("任务 {} 不存在", id))),
+                    Err(e) => Err(ToolError(format!("禁用失败: {e}"))),
+                }
+            }
+            "logs" => {
+                let limit = args.limit.unwrap_or(10);
+                let logs = self.scheduler.get_logs(limit).await;
+                if logs.is_empty() {
+                    Ok("📊 暂无执行日志".to_string())
+                } else {
+                    let mut out = String::from("📊 最近执行日志：\n");
+                    for l in &logs {
+                        let status = if l.ok { "✅" } else { "❌" };
+                        out.push_str(&format!(
+                            "{} [{}] {} ({} → {}, {})\n",
+                            status, l.task_id, l.task_name,
+                            l.started_at.format("%m-%d %H:%M"),
+                            l.finished_at.format("%H:%M"),
+                            l.output_summary
+                        ));
+                    }
+                    Ok(out)
+                }
+            }
+            other => Err(ToolError(format!("未知操作: {other}，支持 add/list/remove/enable/disable/logs"))),
+        }
+    }
+}
+
 // ─── task 工具（子代理并行扇出）────────────────────────────────────────
 // ─── task tool (parallel subagent fanout) ──────────────────────────────
 
@@ -2183,6 +2345,9 @@ pub struct ToolDeps {
     pub shells: Arc<LazyShell>,
     pub bg: Arc<BackgroundRegistry>,
     pub checkpoints: Arc<crate::checkpoint::CheckpointStore>,
+    /// 调度器（可选，仅当 [scheduler].enabled = true 时有值）。
+    /// Scheduler (optional, only Some when [scheduler].enabled = true).
+    pub scheduler: Option<Arc<crate::scheduler::Scheduler>>,
 }
 
 /// 将内置工具逐一注册到 builder 上（rig 0.41 的 `.tool()` 链式调用）。
@@ -2248,11 +2413,21 @@ where
         builder
     };
 
-    if let Some(task_ctx) = &deps.task_ctx {
+    let builder = if let Some(task_ctx) = &deps.task_ctx {
         builder.tool(TimeoutRetryTool::passthrough(TaskTool::new(
             task_ctx.clone(),
             deps.task_registry.clone(),
         )))
+    } else {
+        builder
+    };
+
+    // schedule_task 仅在调度器启用时注册。
+    // schedule_task is only registered when the scheduler is enabled.
+    if let Some(sched) = &deps.scheduler {
+        builder.tool(TimeoutRetryTool::passthrough(ScheduleTask {
+            scheduler: sched.clone(),
+        }))
     } else {
         builder
     }

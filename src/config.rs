@@ -63,6 +63,10 @@ pub struct Config {
     /// Transport is selected by `command`+`args` (stdio) or `url` (HTTP/SSE).
     #[serde(default)]
     pub mcp: HashMap<String, McpServerConfig>,
+    /// 定时任务调度器配置：`[scheduler]` 小节。
+    /// Scheduler config: `[scheduler]` section.
+    #[serde(default)]
+    pub scheduler: crate::scheduler::SchedulerConfig,
 }
 
 /// `[agents]` 小节：内置角色配置 + 自定义子代理配置。

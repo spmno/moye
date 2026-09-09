@@ -27,6 +27,7 @@ mod prompts;
 mod registry;
 mod reviewer;
 mod sandbox;
+mod scheduler;
 mod seam;
 mod session;
 mod session_log;
@@ -172,6 +173,28 @@ async fn main() -> Result<()> {
         session,
         model_history,
     });
+
+    // 启动定时任务调度器（仅当 [scheduler].enabled = true 时）。
+    // Start the scheduler (only when [scheduler].enabled = true).
+    let _scheduler_handle: Option<tokio::task::JoinHandle<()>> = if config.scheduler.enabled {
+        match crate::scheduler::Scheduler::new(ctx.clone(), config.scheduler.clone()) {
+            Ok(sched) => {
+                info!("[scheduler] enabled, starting background loop");
+                let sched_arc = Arc::new(sched);
+                // 把调度器注入 registry，供 schedule_task 工具使用。
+                // Inject the scheduler into the registry for the schedule_task tool.
+                ctx.registry.set_scheduler(sched_arc.clone());
+                Some(sched_arc.spawn())
+            }
+            Err(e) => {
+                tracing::warn!("[scheduler] failed to initialize: {e}");
+                None
+            }
+        }
+    } else {
+        info!("[scheduler] disabled (set [scheduler].enabled = true in agent.toml to enable)");
+        None
+    };
 
     // 无头模式派发：-p 存在时运行无头路径并退出，不进入 TUI。
     // --continue + -p 允许组合：--continue 恢复上一次会话的上下文（seed_history），

@@ -333,6 +333,36 @@ fn cap_chars(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    // 使用 crate 根的共享 env 互斥锁（避免跨模块 env 竞争）。
+    // Use the crate-root shared env mutex to avoid cross-module env races.
+    use crate::TEST_ENV_MUTEX as ENV_MUTEX;
+
+    // 测试隔离：临时覆盖/移除环境变量，避免外部 AGENT_PROFILE 泄漏到测试中。
+    // Test isolation: temporarily override/remove env vars so external AGENT_PROFILE
+    // does not leak into tests.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvGuard {
+        fn new(key: &'static str, value: Option<&str>) -> Self {
+            let prev = std::env::var(key).ok();
+            match value {
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+            EnvGuard { key, prev }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
     // ── resolve_agent 测试 / resolve_agent tests ──
 
     #[test]
@@ -663,6 +693,8 @@ permissions.edit_file = "deny"
 
     #[test]
     fn resolve_spec_explore_returns_investigator() {
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _g = EnvGuard::new("AGENT_PROFILE", None);
         let reg = registry_with_custom();
         let spec = resolve_spec("explore", &reg).unwrap();
         assert_eq!(spec.name, "investigator");
@@ -671,6 +703,8 @@ permissions.edit_file = "deny"
 
     #[test]
     fn resolve_spec_build_returns_builder() {
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _g = EnvGuard::new("AGENT_PROFILE", None);
         let reg = registry_with_custom();
         let spec = resolve_spec("build", &reg).unwrap();
         assert_eq!(spec.name, "builder");
@@ -679,6 +713,8 @@ permissions.edit_file = "deny"
 
     #[test]
     fn resolve_spec_custom_returns_custom_spec() {
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _g = EnvGuard::new("AGENT_PROFILE", None);
         let reg = registry_with_custom();
         let spec = resolve_spec("researcher", &reg).unwrap();
         assert_eq!(spec.name, "researcher");
@@ -689,6 +725,8 @@ permissions.edit_file = "deny"
 
     #[test]
     fn resolve_spec_unknown_lists_all_valid_names() {
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _g = EnvGuard::new("AGENT_PROFILE", None);
         let reg = registry_with_custom();
         let err = resolve_spec("hacker", &reg).unwrap_err();
         assert!(err.contains("hacker"), "error should mention the bad name");
@@ -700,6 +738,8 @@ permissions.edit_file = "deny"
     #[test]
     fn resolve_spec_built_in_takes_precedence_over_custom() {
         // Even if a custom agent named "explore" exists, the built-in wins.
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _g = EnvGuard::new("AGENT_PROFILE", None);
         use crate::config::Config;
         let toml_str = r#"
 [agent]

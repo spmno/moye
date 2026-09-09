@@ -1086,9 +1086,10 @@ mod tests {
     use super::*;
     use crate::registry::Permission;
     use std::path::PathBuf;
-    use std::sync::Mutex;
 
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    // 使用 crate 根的共享 env 互斥锁（避免跨模块 env 竞争）。
+    // Use the crate-root shared env mutex to avoid cross-module env races.
+    use crate::TEST_ENV_MUTEX as ENV_MUTEX;
 
     /// Test helper: saves the current value of an env var, sets a new one (or
     /// unsets it), and restores the original on Drop. Wraps the edition-2024
@@ -1454,6 +1455,8 @@ patches = [
 
     #[test]
     fn no_profile_section_backward_compat() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = env_guard("AGENT_PROFILE", None);
         // Given: config with no [profile] section.
         // When: parsing with no explicit profile and no AGENT_PROFILE env.
         // Then: behavior identical to direct toml::from_str (backward compat).

@@ -932,7 +932,9 @@ mod tests {
         assert_eq!(context_limit_for_model("glm-5.3-flash"), 1_000_000);
     }
 
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // 使用 crate 根的共享 env 互斥锁（避免跨模块 env 竞争）。
+    // Use the crate-root shared env mutex to avoid cross-module env races.
+    use crate::TEST_ENV_MUTEX as ENV_MUTEX;
 
     #[test]
     fn from_env_accepts_volcanoark_alias() {

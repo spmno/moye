@@ -444,7 +444,9 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    // 使用 crate 根的共享 env 互斥锁（避免跨模块 env 竞争）。
+    // Use the crate-root shared env mutex to avoid cross-module env races.
+    use crate::TEST_ENV_MUTEX as ENV_MUTEX;
 
     /// Test helper: saves the current value of an env var, sets a new one (or
     /// unsets it), and restores the original on Drop. Wraps the edition-2024

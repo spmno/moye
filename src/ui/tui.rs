@@ -3563,29 +3563,46 @@ fn draw_streaming(f: &mut Frame, area: Rect, state: &mut TuiState) {
         }
         Text::from(rendered)
     } else if !state.streaming_reasoning.is_empty() {
-        // 思考阶段：单行显示推理尾部，带 "思考中:" 前缀。
-        // Reasoning phase: single-line tail preview with "思考中:" prefix.
-        // spinner(2) + " "(1) + "思考中: "(3 个 CJK×2 + ":"(1) + " "(1) = 8) ≈ 11 列
-        let prefix_w = 11usize.saturating_sub(2); // spinner 已单独渲染，这里只算 " 思考中: "
-        let avail = inner_w.saturating_sub(3 + prefix_w); // spinner(2)+space(1) + prefix
-        let r = &state.streaming_reasoning;
-        let total_w: usize = r.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
-        let (tail, truncated) = if total_w > avail && avail > 2 {
-            (tail_by_display_width(r, avail.saturating_sub(2)), true)
-        } else {
-            (r.as_str(), false)
-        };
-        let preview = if truncated {
+        // 思考阶段：显示推理尾部最多 3 行，首行带 spinner + "思考中:" 前缀，
+        // 后续行缩进对齐到正文起点，便于多行阅读。
+        // Reasoning phase: show up to 3 trailing lines of reasoning. The first
+        // line carries the spinner + "思考中:" prefix; continuation lines are
+        // indented to align with the body start column.
+        // spinner(2) + " "(1) = 3; "思考中: " = 3 CJK*2 + ":"(1) + " "(1) = 8 → total 11
+        let label_w: usize = 8; // "思考中: " 显示宽度
+        let prefix_w = 3 + label_w; // spinner(2) + " "(1) + label(8) = 11
+        let first_w = inner_w.saturating_sub(prefix_w);
+        let cont_w = first_w; // 续行与首行正文起点对齐
+        let (mut lines, truncated) = wrap_tail_lines(
+            &state.streaming_reasoning,
+            first_w.max(1),
+            cont_w.max(1),
+            3,
+            1000,
+        );
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        let first_line = if truncated {
+            let avail = first_w.saturating_sub(2).max(1);
+            let tail = tail_by_display_width(&lines[0], avail);
             format!("…{tail}")
         } else {
-            tail.to_string()
+            lines[0].clone()
         };
-        Text::from(Line::from(vec![
+        let mut rendered: Vec<Line> = Vec::with_capacity(lines.len());
+        rendered.push(Line::from(vec![
             Span::styled(sp.to_string(), theme::streaming()),
             Span::raw(" "),
             Span::styled("\u{601d}\u{8003}\u{4e2d}: ", theme::streaming()),
-            Span::raw(preview),
-        ]))
+            Span::raw(first_line),
+        ]));
+        // 续行缩进：spinner(2) + " "(1) + "思考中: "(8) = 11 列，用空格填充。
+        let indent: String = " ".repeat(prefix_w);
+        for line in lines.into_iter().skip(1) {
+            rendered.push(Line::from(vec![Span::raw(indent.clone()), Span::raw(line)]));
+        }
+        Text::from(rendered)
     } else {
         // 空思考态：仅 spinner + "思考中..."。
         Text::from(Line::from(vec![

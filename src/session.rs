@@ -145,6 +145,7 @@ impl Session {
 
     /// 返回完整历史（含工具调用/结果）的只读引用。
     /// Returns a read-only reference to the full history (incl. tool calls/results).
+    #[allow(dead_code)] // infrastructure for future phases
     pub fn full_history(&self) -> &[Message] {
         &self.full_history
     }

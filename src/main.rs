@@ -1,5 +1,13 @@
 // 程序入口：日志初始化、上下文构建、TUI 启动。
 // Program entry point: logging initialization, context construction, TUI launch.
+
+// 跨测试模块共享的环境变量互斥锁：所有修改 env 的测试必须先持有此锁，
+// 避免并行执行时 env 操作互相干扰。
+// Cross-test-module env mutex: every env-mutating test must hold this lock to
+// avoid races across parallel tests in different modules.
+#[cfg(test)]
+pub(crate) static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 mod agent_loop;
 mod checkpoint;
 mod cli;

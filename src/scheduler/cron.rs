@@ -49,10 +49,12 @@ impl Field {
         }
     }
 
+    #[allow(dead_code)]
     pub fn min(&self) -> u8 {
         self.values[0]
     }
 
+    #[allow(dead_code)]
     pub fn max(&self) -> u8 {
         *self.values.last().unwrap()
     }

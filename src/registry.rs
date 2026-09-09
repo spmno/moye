@@ -468,13 +468,14 @@ pub struct AgentRegistry {
     /// File checkpoint store — session-shared; EditFile/WriteFile snapshot before writing.
     checkpoints: Arc<crate::checkpoint::CheckpointStore>,
     /// 共享后台 shell 注册表（dev server / watch 模式等长命令）。
+    /// 共享后台 shell 注册表（dev server / watch 模式等长命令）。
     /// Shared background shell registry (long commands like dev server / watch mode).
     /// 一个 `Arc<BackgroundRegistry>` 在 Orchestrator 级别共享，通过 ToolDeps 注入。
     /// One `Arc<BackgroundRegistry>` shared at Orchestrator level, injected via ToolDeps.
     bg: Arc<crate::shell::BackgroundRegistry>,
-    /// 定时任务调度器（可选，延迟设置）。
-    /// Scheduled task scheduler (optional, set after creation).
-    scheduler: Arc<Mutex<Option<Arc<crate::scheduler::Scheduler>>>>,
+    /// 定时任务管理器（可选，启用调度器时设置）。
+    /// Scheduler task manager (optional, set when scheduler is enabled).
+    scheduler_mgr: Arc<Mutex<Option<crate::scheduler::TaskManager>>>,
 }
 
 impl AgentRegistry {
@@ -499,14 +500,14 @@ impl AgentRegistry {
             bg: Arc::new(crate::shell::BackgroundRegistry::new(
                 max_bash_output_chars,
             )),
-            scheduler: Arc::new(Mutex::new(None)),
+            scheduler_mgr: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// 设置调度器（在 main 中 Scheduler 创建后调用）。
-    /// Sets the scheduler (called from main after Scheduler is created).
-    pub fn set_scheduler(&self, sched: Arc<crate::scheduler::Scheduler>) {
-        *self.scheduler.lock().unwrap() = Some(sched);
+    /// 设置调度器任务管理器（在 main 中 Scheduler 创建后调用）。
+    /// Sets the scheduler task manager (called from main after Scheduler is created).
+    pub fn set_scheduler_mgr(&self, mgr: crate::scheduler::TaskManager) {
+        *self.scheduler_mgr.lock().unwrap() = Some(mgr);
     }
 
     /// clone 时共享同一份 Arc（配置与模型覆盖都会同步）。
@@ -524,7 +525,7 @@ impl AgentRegistry {
             subagent_depth: self.subagent_depth.clone(),
             checkpoints: self.checkpoints.clone(),
             bg: self.bg.clone(),
-            scheduler: self.scheduler.clone(),
+            scheduler_mgr: self.scheduler_mgr.clone(),
         }
     }
     /// Overrides the model used by all roles in this session.
@@ -638,11 +639,14 @@ impl AgentRegistry {
         self.bg.clone()
     }
 
-    /// 返回共享的调度器（可选）。
-    /// Returns the shared scheduler (optional).
-    pub fn scheduler(&self) -> Option<Arc<crate::scheduler::Scheduler>> {
-        self.scheduler.lock().unwrap().clone()
+    /// 返回调度器任务管理器（可选）。
+    /// Returns the scheduler task manager (optional).
+    pub fn scheduler_mgr(&self) -> Option<crate::scheduler::TaskManager> {
+        self.scheduler_mgr.lock().unwrap().clone()
     }
+
+    /// 返回共享的文件检查点存储。
+    /// Returns the shared file checkpoint store.
 
     /// 返回共享的文件检查点存储。
     /// Returns the shared file checkpoint store.
@@ -754,7 +758,7 @@ impl AgentRegistry {
                 )),
                 bg: self.bg.clone(),
                 checkpoints: self.checkpoints.clone(),
-                scheduler: self.scheduler(),
+                scheduler_mgr: self.scheduler_mgr(),
             };
             let builder =
                 crate::tools::add_builtin_tools(builder, self.context_config(), &deps);
@@ -1488,13 +1492,6 @@ impl Orchestrator {
     /// Returns the shared file checkpoint store, for the /rewind command to read.
     pub fn checkpoints(&self) -> Arc<crate::checkpoint::CheckpointStore> {
         self.checkpoints.clone()
-    }
-
-    /// 返回 registry 的克隆（廉价克隆，所有 Arc 共享），供调度器等后台组件创建临时 Orchestrator。
-    /// Returns a clone of the registry (cheap, all Arc-shared), used by background
-    /// components like the scheduler to create temporary Orchestrators.
-    pub fn clone_registry(&self) -> AgentRegistry {
-        self.registry.clone()
     }
 
     /// 用 `--continue` 会话的对话历史替换当前历史，让新会话继承上一轮的上下文。

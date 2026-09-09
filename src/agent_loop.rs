@@ -1484,7 +1484,7 @@ fn build_runner_agent_spec(
         )),
         bg: registry.bg(),
         checkpoints: registry.checkpoints(),
-        scheduler: registry.scheduler(),
+        scheduler_mgr: registry.scheduler_mgr(),
     };
     let builder =
         crate::tools::add_builtin_tools(builder, registry.context_config(), &deps)

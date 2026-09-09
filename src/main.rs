@@ -177,14 +177,13 @@ async fn main() -> Result<()> {
     // 启动定时任务调度器（仅当 [scheduler].enabled = true 时）。
     // Start the scheduler (only when [scheduler].enabled = true).
     let _scheduler_handle: Option<tokio::task::JoinHandle<()>> = if config.scheduler.enabled {
-        match crate::scheduler::Scheduler::new(ctx.clone(), config.scheduler.clone()) {
+        // 创建 TaskManager 并注入 registry，供 schedule_task 工具使用。
+        let mgr = crate::scheduler::TaskManager::from_config(&config.scheduler);
+        ctx.registry.set_scheduler_mgr(mgr.clone());
+        match crate::scheduler::Scheduler::new(config.scheduler.clone()) {
             Ok(sched) => {
                 info!("[scheduler] enabled, starting background loop");
-                let sched_arc = Arc::new(sched);
-                // 把调度器注入 registry，供 schedule_task 工具使用。
-                // Inject the scheduler into the registry for the schedule_task tool.
-                ctx.registry.set_scheduler(sched_arc.clone());
-                Some(sched_arc.spawn())
+                Some(Arc::new(sched).spawn())
             }
             Err(e) => {
                 tracing::warn!("[scheduler] failed to initialize: {e}");

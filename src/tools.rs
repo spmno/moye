@@ -2077,9 +2077,9 @@ struct ScheduleTaskArgs {
 }
 
 /// 定时任务管理工具：创建、查看、删除、启用/禁用定时任务，查看执行日志。
-/// Scheduled task management tool: create, list, remove, enable/disable tasks, view logs.
+/// 直接通过 TaskManager 操作 JSON 文件，与 Scheduler 通过文件系统同步。
 struct ScheduleTask {
-    scheduler: Arc<crate::scheduler::Scheduler>,
+    manager: crate::scheduler::TaskManager,
 }
 
 impl PortableTool for ScheduleTask {
@@ -2125,7 +2125,7 @@ impl PortableTool for ScheduleTask {
                 let name = args.name.ok_or_else(|| ToolError("name is required for add".into()))?;
                 let cron = args.cron.ok_or_else(|| ToolError("cron is required for add".into()))?;
                 let prompt = args.prompt.ok_or_else(|| ToolError("prompt is required for add".into()))?;
-                match self.scheduler.add_task(name, cron, prompt, args.max_runs).await {
+                match self.manager.add_task(name, cron, prompt, args.max_runs) {
                     Ok(task) => Ok(format!(
                         "✅ 定时任务已创建\nID: {}\n名称: {}\nCron: {}\n最大执行次数: {}",
                         task.id, task.name, task.cron,
@@ -2135,27 +2135,31 @@ impl PortableTool for ScheduleTask {
                 }
             }
             "list" => {
-                let tasks = self.scheduler.list_tasks().await;
-                if tasks.is_empty() {
-                    Ok("📋 暂无定时任务".to_string())
-                } else {
-                    let mut out = String::from("📋 定时任务列表：\n");
-                    for t in &tasks {
-                        let status = if t.enabled { "✅" } else { "⏸️" };
-                        let last = t.last_run
-                            .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
-                            .unwrap_or_else(|| "从未".into());
-                        out.push_str(&format!(
-                            "{} [{}] {} (cron: {}, 已执行 {} 次, 上次: {})\n",
-                            status, t.id, t.name, t.cron, t.run_count, last
-                        ));
+                match self.manager.list_tasks() {
+                    Ok(tasks) => {
+                        if tasks.is_empty() {
+                            Ok("📋 暂无定时任务".to_string())
+                        } else {
+                            let mut out = String::from("📋 定时任务列表：\n");
+                            for t in &tasks {
+                                let status = if t.enabled { "✅" } else { "⏸️" };
+                                let last = t.last_run
+                                    .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                                    .unwrap_or_else(|| "从未".into());
+                                out.push_str(&format!(
+                                    "{} [{}] {} (cron: {}, 已执行 {} 次, 上次: {})\n",
+                                    status, t.id, t.name, t.cron, t.run_count, last
+                                ));
+                            }
+                            Ok(out)
+                        }
                     }
-                    Ok(out)
+                    Err(e) => Err(ToolError(format!("读取任务列表失败: {e}"))),
                 }
             }
             "remove" => {
                 let id = args.id.ok_or_else(|| ToolError("id is required for remove".into()))?;
-                match self.scheduler.remove_task(&id).await {
+                match self.manager.remove_task(&id) {
                     Ok(true) => Ok(format!("✅ 任务 {} 已删除", id)),
                     Ok(false) => Err(ToolError(format!("任务 {} 不存在", id))),
                     Err(e) => Err(ToolError(format!("删除失败: {e}"))),
@@ -2163,7 +2167,7 @@ impl PortableTool for ScheduleTask {
             }
             "enable" => {
                 let id = args.id.ok_or_else(|| ToolError("id is required for enable".into()))?;
-                match self.scheduler.set_enabled(&id, true).await {
+                match self.manager.set_enabled(&id, true) {
                     Ok(true) => Ok(format!("✅ 任务 {} 已启用", id)),
                     Ok(false) => Err(ToolError(format!("任务 {} 不存在", id))),
                     Err(e) => Err(ToolError(format!("启用失败: {e}"))),
@@ -2171,7 +2175,7 @@ impl PortableTool for ScheduleTask {
             }
             "disable" => {
                 let id = args.id.ok_or_else(|| ToolError("id is required for disable".into()))?;
-                match self.scheduler.set_enabled(&id, false).await {
+                match self.manager.set_enabled(&id, false) {
                     Ok(true) => Ok(format!("✅ 任务 {} 已禁用", id)),
                     Ok(false) => Err(ToolError(format!("任务 {} 不存在", id))),
                     Err(e) => Err(ToolError(format!("禁用失败: {e}"))),
@@ -2179,7 +2183,7 @@ impl PortableTool for ScheduleTask {
             }
             "logs" => {
                 let limit = args.limit.unwrap_or(10);
-                let logs = self.scheduler.get_logs(limit).await;
+                let logs = self.manager.get_logs(limit);
                 if logs.is_empty() {
                     Ok("📊 暂无执行日志".to_string())
                 } else {
@@ -2345,9 +2349,9 @@ pub struct ToolDeps {
     pub shells: Arc<LazyShell>,
     pub bg: Arc<BackgroundRegistry>,
     pub checkpoints: Arc<crate::checkpoint::CheckpointStore>,
-    /// 调度器（可选，仅当 [scheduler].enabled = true 时有值）。
-    /// Scheduler (optional, only Some when [scheduler].enabled = true).
-    pub scheduler: Option<Arc<crate::scheduler::Scheduler>>,
+    /// 调度器任务管理器（可选，仅当 [scheduler].enabled = true 时有值）。
+    /// Scheduler task manager (optional, only Some when [scheduler].enabled = true).
+    pub scheduler_mgr: Option<crate::scheduler::TaskManager>,
 }
 
 /// 将内置工具逐一注册到 builder 上（rig 0.41 的 `.tool()` 链式调用）。
@@ -2424,9 +2428,9 @@ where
 
     // schedule_task 仅在调度器启用时注册。
     // schedule_task is only registered when the scheduler is enabled.
-    if let Some(sched) = &deps.scheduler {
+    if let Some(mgr) = &deps.scheduler_mgr {
         builder.tool(TimeoutRetryTool::passthrough(ScheduleTask {
-            scheduler: sched.clone(),
+            manager: mgr.clone(),
         }))
     } else {
         builder

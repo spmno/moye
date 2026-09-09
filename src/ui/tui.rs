@@ -2980,6 +2980,146 @@ fn input_window(total_lines: u16, cursor_line: u16, max: u16) -> (u16, u16) {
     (height, offset)
 }
 
+/// 返回字符串尾部不超过 `max_width` 显示列的最大后缀切片。
+/// ASCII 计 1 列，非 ASCII（含 CJK）计 2 列。
+/// 不分配，仅返回切片。`max_width == 0` 返回空串；总宽度 ≤ max_width 时返回整个 `s`。
+///
+/// Return the largest suffix of `s` whose display width does not exceed `max_width`.
+/// ASCII counts as 1 column, non-ASCII (incl. CJK) as 2. Allocation-free slice.
+fn tail_by_display_width(s: &str, max_width: usize) -> &str {
+    if max_width == 0 {
+        return "";
+    }
+    let mut w: usize = 0;
+    let mut start = s.len();
+    for (i, c) in s.char_indices().rev() {
+        let cw = if c.is_ascii() { 1 } else { 2 };
+        if w + cw > max_width {
+            break;
+        }
+        w += cw;
+        start = i;
+    }
+    &s[start..]
+}
+
+/// 按显示宽度预折行（硬换行 + 软换行），只返回最后 `max_lines` 行。
+/// 性能：先从尾部截取 `scan_limit` 字节（floor_char_boundary 保护字符边界），
+/// 仅对尾部切片做 wrap，避免对几万字符全量折行。
+/// 首行用 `first_width`（spinner 占位更窄），后续行用 `cont_width`。
+/// 返回 `(lines, truncated)`：lines 长度 ≤ max_lines；truncated 表示是否因
+/// scan_limit 或首行之前有内容而被截断（用于调用方加 `…` 前缀）。
+///
+/// Pre-wrap text by display width (hard + soft newlines), returning only the last
+/// `max_lines` lines. For performance, only the trailing `scan_limit` bytes are
+/// wrapped. First line uses `first_width` (narrower due to spinner), subsequent
+/// lines use `cont_width`. Returns `(lines, truncated)`.
+fn wrap_tail_lines(
+    s: &str,
+    first_width: usize,
+    cont_width: usize,
+    max_lines: usize,
+    scan_limit: usize,
+) -> (Vec<String>, bool) {
+    if max_lines == 0 || s.is_empty() {
+        return (Vec::new(), false);
+    }
+    let first_width = first_width.max(1);
+    let cont_width = cont_width.max(1);
+
+    // 只 wrap 尾部 scan_limit 字节，避免长文本 O(n) 扫描。
+    let truncated_scan = s.len() > scan_limit;
+    let tail_start = if truncated_scan {
+        s.floor_char_boundary(s.len() - scan_limit)
+    } else {
+        0
+    };
+    let tail = &s[tail_start..];
+
+    // 从尾部反向收集行（硬换行 + 软换行），直到收集够 max_lines 行。
+    // 算法：反向逐字符扫描，维护当前行的显示宽度；遇到 \n 或当前行宽度超限时换行。
+    let mut lines_rev: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w: usize = 0;
+    let mut width_remaining = cont_width; // 当前行的剩余宽度（先按续行算，最后会修正）
+    let mut on_first_line_of_tail = true; // 第一行（即最末行）用 cont_width（因为它是续行）
+    let mut soft_break = false; // 上一次是否因软换行断开（用于 truncated 判定）
+
+    for c in tail.chars().rev() {
+        if c == '\n' {
+            // 硬换行：把当前收集的字符反转后作为一行
+            let line: String = cur.chars().rev().collect();
+            lines_rev.push(line);
+            cur = String::new();
+            cur_w = 0;
+            width_remaining = if lines_rev.len() >= max_lines {
+                // 已经够了，跳出
+                break;
+            } else {
+                cont_width
+            };
+            on_first_line_of_tail = false;
+            soft_break = false;
+            continue;
+        }
+        let cw = if c.is_ascii() { 1 } else { 2 };
+        if cur_w + cw > width_remaining {
+            // 软换行
+            let line: String = cur.chars().rev().collect();
+            lines_rev.push(line);
+            if lines_rev.len() >= max_lines {
+                soft_break = true;
+                break;
+            }
+            cur = String::new();
+            cur.push(c);
+            cur_w = cw;
+            width_remaining = cont_width;
+            on_first_line_of_tail = false;
+            soft_break = true;
+        } else {
+            cur.push(c);
+            cur_w += cw;
+            soft_break = false;
+        }
+    }
+    // 处理剩余字符作为最前一行
+    if !cur.is_empty() || (tail.is_empty() && lines_rev.is_empty()) {
+        if !cur.is_empty() {
+            let line: String = cur.chars().rev().collect();
+            lines_rev.push(line);
+        }
+    }
+
+    // lines_rev 是逆序的，反转回正序，并只保留最后 max_lines 行
+    lines_rev.reverse();
+    if lines_rev.len() > max_lines {
+        lines_rev.drain(0..lines_rev.len() - max_lines);
+    }
+
+    // 截断判定：scan 截断，或 soft_break（首行前还有内容），或 tail_start > 0 但
+    // 第一行没在硬换行边界（即我们扫到了 scan_limit 开头但未遇到 \n，说明首行之前还有内容）
+    let truncated = truncated_scan
+        || soft_break
+        || (tail_start > 0
+            && !tail.starts_with('\n')
+            && !(lines_rev.len() == 1 && tail_start == 0));
+
+    // 修正首行宽度：如果首行显示宽度 > first_width，需要再按 first_width 截一次尾
+    if let Some(first) = lines_rev.first() {
+        let fw: usize = first.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+        if fw > first_width {
+            // 从首行尾部截到 first_width 以内
+            let cropped = tail_by_display_width(first, first_width.saturating_sub(2));
+            lines_rev[0] = cropped.to_string();
+        }
+    }
+
+    // 如果因为首行裁剪导致后续行被挤掉，只保留 max_lines 行（裁剪后行数不会变，只是首行变短）
+    let _ = on_first_line_of_tail; // 抑制未用警告
+    (lines_rev, truncated)
+}
+
 fn draw(f: &mut Frame, state: &mut TuiState) {
     let area = f.area();
 
@@ -3358,36 +3498,91 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
 }
 
 fn draw_streaming(f: &mut Frame, area: Rect, state: &mut TuiState) {
-    let content = if state.thinking {
-        let sp = SPINNER_FRAMES[state.spinner];
-        if !state.streaming.is_empty() {
-            format!("{sp} {}", state.streaming)
-        } else if !state.streaming_reasoning.is_empty() {
-            let r = &state.streaming_reasoning;
-            let preview = if r.len() > 80 {
-                let end = r.floor_char_boundary(80);
-                format!("{}...", &r[..end])
-            } else {
-                r.clone()
-            };
-            format!("{sp} \u{601d}\u{8003}\u{4e2d}: {preview}")
-        } else {
-            format!("{sp} \u{601d}\u{8003}\u{4e2d}...")
+    if !state.thinking {
+        // 非思考态：渲染空段落（保持背景一致）。
+        // Non-thinking: render empty paragraph (keeps background consistent).
+        let streaming = Paragraph::new("")
+            .style(theme::streaming())
+            .block(Block::default().padding(Padding::horizontal(1)));
+        f.render_widget(streaming, area);
+        return;
+    }
+
+    let sp = SPINNER_FRAMES[state.spinner];
+    // 左右各 1 列 padding，扣除后为内部可用宽度。
+    // 1 col padding on each side → inner width.
+    let inner_w = (area.width as usize).saturating_sub(2);
+
+    let text: Text = if !state.streaming.is_empty() {
+        // 输出阶段：显示最后 3 行流式内容，首行带 spinner。
+        // Output phase: show last 3 lines of streaming text, first line has spinner.
+        // spinner(盲文 2 列) + 空格(1 列) = 3 列占位。
+        let first_w = inner_w.saturating_sub(3);
+        let cont_w = inner_w;
+        let (mut lines, truncated) =
+            wrap_tail_lines(&state.streaming, first_w.max(1), cont_w.max(1), 3, 1000);
+        if lines.is_empty() {
+            lines.push(String::new());
         }
+        // 首行：若被截断则前缀 "…"（占 2 列），需再截短首行内容。
+        // First line: prefix "…" (2 cols) if truncated → re-crop first line.
+        let first_line = if truncated {
+            let avail = first_w.saturating_sub(2).max(1);
+            let tail = tail_by_display_width(&lines[0], avail);
+            format!("…{tail}")
+        } else {
+            lines[0].clone()
+        };
+        let mut rendered: Vec<Line> = Vec::with_capacity(lines.len());
+        rendered.push(Line::from(vec![
+            Span::styled(sp.to_string(), theme::streaming()),
+            Span::raw(" "),
+            Span::raw(first_line),
+        ]));
+        for line in lines.into_iter().skip(1) {
+            rendered.push(Line::from(Span::raw(line)));
+        }
+        Text::from(rendered)
+    } else if !state.streaming_reasoning.is_empty() {
+        // 思考阶段：单行显示推理尾部，带 "思考中:" 前缀。
+        // Reasoning phase: single-line tail preview with "思考中:" prefix.
+        // spinner(2) + " "(1) + "思考中: "(3 个 CJK×2 + ":"(1) + " "(1) = 8) ≈ 11 列
+        let prefix_w = 11usize.saturating_sub(2); // spinner 已单独渲染，这里只算 " 思考中: "
+        let avail = inner_w.saturating_sub(3 + prefix_w); // spinner(2)+space(1) + prefix
+        let r = &state.streaming_reasoning;
+        let total_w: usize = r.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+        let (tail, truncated) = if total_w > avail && avail > 2 {
+            (tail_by_display_width(r, avail.saturating_sub(2)), true)
+        } else {
+            (r.as_str(), false)
+        };
+        let preview = if truncated {
+            format!("…{tail}")
+        } else {
+            tail.to_string()
+        };
+        Text::from(Line::from(vec![
+            Span::styled(sp.to_string(), theme::streaming()),
+            Span::raw(" "),
+            Span::styled("\u{601d}\u{8003}\u{4e2d}: ", theme::streaming()),
+            Span::raw(preview),
+        ]))
     } else {
-        String::new()
+        // 空思考态：仅 spinner + "思考中..."。
+        Text::from(Line::from(vec![
+            Span::styled(sp.to_string(), theme::streaming()),
+            Span::raw(" \u{601d}\u{8003}\u{4e2d}..."),
+        ]))
     };
 
-    let streaming = Paragraph::new(content)
+    let streaming = Paragraph::new(text)
         .style(theme::streaming())
         .block(
             // 本体透明：无 bg style，坐落于 draw() 预填充的 base bg 上。
-            // Body transparent: no bg style, sits on the base-bg
-            // pre-fill in draw() (spec: input + streaming transparent).
-            Block::default()
-                .padding(Padding::horizontal(1)),
-        )
-        .wrap(Wrap { trim: false });
+            Block::default().padding(Padding::horizontal(1)),
+        );
+    // 不再使用 Paragraph::Wrap：已手动预折行 + 取尾部，避免 Paragraph 从头部开始折行
+    // 导致只能看到开头。No Paragraph::Wrap — we pre-wrapped and took the tail.
 
     f.render_widget(streaming, area);
 }
@@ -5659,5 +5854,127 @@ mod tests {
         let out2 = ac_truncate("模型切换", 4);
         assert_eq!(out2, "模\u{2026}");
         assert_eq!(ac_truncate("anything", 0), "");
+    }
+
+    // ===== tail_by_display_width =====
+
+    #[test]
+    fn tail_by_display_width_short_unchanged() {
+        assert_eq!(tail_by_display_width("hello", 10), "hello");
+        assert_eq!(tail_by_display_width("hi", 2), "hi");
+        assert_eq!(tail_by_display_width("", 5), "");
+    }
+
+    #[test]
+    fn tail_by_display_width_zero_width_returns_empty() {
+        assert_eq!(tail_by_display_width("hello", 0), "");
+    }
+
+    #[test]
+    fn tail_by_display_width_ascii_truncates_tail() {
+        // "abcdefghij" width 10，预算 5 → 应返回尾部 5 字符 "fghij"
+        assert_eq!(tail_by_display_width("abcdefghij", 5), "fghij");
+        // 预算 3 → "hij"
+        assert_eq!(tail_by_display_width("abcdefghij", 3), "hij");
+    }
+
+    #[test]
+    fn tail_by_display_width_cjk_safe() {
+        // "你好世界" 4 个 CJK 各 2 列 = 8 列，预算 4 → 应返回最后 2 个汉字（"世界"）
+        let tail = tail_by_display_width("你好世界", 4);
+        assert_eq!(tail, "世界");
+        assert!(!tail.chars().any(|c| c == '\u{FFFD}'), "must not contain replacement char");
+        // 预算 5：可容下 2 个 CJK（4 列）+ 1 ASCII；但尾部是 CJK，所以还是 "世界"
+        assert_eq!(tail_by_display_width("你好世界", 5), "世界");
+        // 混合："hello你好" ASCII 5 + CJK 4 = 9 列；预算 5 → "o你好"（1+4=5）
+        assert_eq!(tail_by_display_width("hello你好", 5), "o你好");
+    }
+
+    // ===== wrap_tail_lines =====
+
+    #[test]
+    fn wrap_tail_lines_empty_input() {
+        let (lines, truncated) = wrap_tail_lines("", 10, 10, 3, 1000);
+        assert!(lines.is_empty());
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn wrap_tail_lines_short_returns_single_line() {
+        let (lines, truncated) = wrap_tail_lines("hello", 10, 10, 3, 1000);
+        assert_eq!(lines, vec!["hello".to_string()]);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn wrap_tail_lines_returns_last_n_lines_hard_break() {
+        let text = "line1\nline2\nline3\nline4\nline5";
+        let (lines, truncated) = wrap_tail_lines(text, 80, 80, 3, 1000);
+        assert_eq!(lines, vec!["line3", "line4", "line5"]);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn wrap_tail_lines_truncated_flag_when_scan_limited() {
+        // 构造一个超过 scan_limit 的长串，期望 truncated == true
+        let long = "a".repeat(5000);
+        let (lines, truncated) = wrap_tail_lines(&long, 80, 80, 3, 1000);
+        assert!(truncated);
+        assert_eq!(lines.len(), 3);
+        // 每行应是 80 个 'a'
+        for l in &lines {
+            assert_eq!(l.len(), 80);
+            assert!(l.chars().all(|c| c == 'a'));
+        }
+    }
+
+    #[test]
+    fn wrap_tail_lines_short_text_not_truncated() {
+        let (_, truncated) = wrap_tail_lines("short", 80, 80, 3, 1000);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn wrap_tail_lines_first_line_narrower() {
+        // 首行宽度 5，续行 10；文本 "abcdefghijklmnopqrst"（20 个 ASCII）
+        // 从尾部反向扫描：
+        //   最后 10 个字符 "klmnopqrst" 占满续行 → 第3行
+        //   再前 10 个 "abcdefghij" 中 5 个会溢出到首行
+        // 简化验证：首行宽度不超过 first_width + 2（… 前缀位）
+        let (lines, _) = wrap_tail_lines("abcdefghijklmnopqrstuvwxyz", 5, 10, 3, 1000);
+        assert_eq!(lines.len(), 3);
+        let fw: usize = lines[0].chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+        assert!(fw <= 5, "first line width {fw} exceeds first_width 5: {:?}", lines[0]);
+    }
+
+    #[test]
+    fn wrap_tail_lines_cjk_double_width() {
+        // "一二三四五六七八九十" 每个 CJK 2 列，共 20 列；续行宽度 6（3 个 CJK），
+        // 首行宽度 6，max_lines=3 → 应返回最后 3 行，每行 ≤ 3 个 CJK
+        let text = "一二三四五六七八九十";
+        let (lines, _truncated) = wrap_tail_lines(text, 6, 6, 3, 1000);
+        assert_eq!(lines.len(), 3);
+        for (i, line) in lines.iter().enumerate() {
+            let w: usize = line.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+            assert!(w <= 6, "line {i} width {w} > 6: {line:?}");
+        }
+        // 最后一行应是末尾的汉字（"九十"）
+        assert!(lines.last().unwrap().ends_with("十"));
+    }
+
+    #[test]
+    fn wrap_tail_lines_mixed_hard_and_soft_breaks() {
+        // "aaaaa\nbbbbbbbbbbbb"：硬换行 + 软换行
+        // 续行宽度 5，max_lines=3：尾部应是 "bbbbb" "bbbbb" "bb"（从后往前）
+        let text = "aaaaa\nbbbbbbbbbbbb";
+        let (lines, truncated) = wrap_tail_lines(text, 5, 5, 3, 1000);
+        assert_eq!(lines.len(), 3);
+        // 不应被 scan 截断
+        assert!(!truncated);
+        // 所有字符必须是 'a' 或 'b'，且不包含 \n
+        for l in &lines {
+            assert!(!l.contains('\n'));
+            assert!(l.chars().all(|c| c == 'a' || c == 'b'));
+        }
     }
 }

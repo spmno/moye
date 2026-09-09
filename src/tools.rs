@@ -2054,10 +2054,17 @@ struct ScheduleTaskArgs {
     /// Task name (required for add).
     #[serde(default)]
     name: Option<String>,
-    /// cron 表达式（add 时必填），如 "0 9 * * *"（每天 9 点）。
-    /// Cron expression (required for add), e.g. "0 9 * * *" (daily at 9am).
+    /// cron 表达式（周期任务，与 at 二选一）。
+    /// 5 字段：分 时 日 月 周；6 字段：秒 分 时 日 月 周。
+    /// Cron expression (recurring; mutually exclusive with `at`).
+    /// 5 fields: min hour day month weekday; 6 fields: sec min hour day month weekday.
     #[serde(default)]
     cron: Option<String>,
+    /// 一次性执行时间（与 cron 二选一），格式 "YYYY-MM-DD HH:MM[:SS]"（本地时间）或 RFC3339。
+    /// One-shot datetime (mutually exclusive with `cron`), local
+    /// "YYYY-MM-DD HH:MM[:SS]" or RFC3339.
+    #[serde(default)]
+    at: Option<String>,
     /// 任务 prompt（add 时必填），即要执行的 agent 指令。
     /// Task prompt (required for add), i.e. the agent instruction to execute.
     #[serde(default)]
@@ -2090,12 +2097,16 @@ impl PortableTool for ScheduleTask {
 
     fn description(&self) -> String {
         "定时任务管理工具。支持以下操作：\n\
-         - add: 创建定时任务（需提供 name, cron, prompt）\n\
+         - add: 创建定时任务（需提供 name, prompt，以及 cron 或 at 之一）\n\
          - list: 列出所有任务\n\
          - remove: 删除任务（需提供 id）\n\
          - enable/disable: 启用/禁用任务（需提供 id）\n\
          - logs: 查看最近执行日志（可选 limit）\n\n\
-         cron 表达式格式：分 时 日 月 周（如 '0 9 * * *' 表示每天 9 点，'*/15 * * * *' 表示每 15 分钟）"
+         触发方式（二选一）：\n\
+         1) cron 周期任务：5 字段『分 时 日 月 周』（如 '0 9 * * *' 每天 9 点，'*/15 * * * *' 每 15 分钟），\n\
+            或 6 字段『秒 分 时 日 月 周』（如 '30 0 9 * * *' 每天 09:00:30）\n\
+         2) at 一次性任务：指定年月日时分秒（如 '2026-12-25 09:30:00'），执行一次后自动失效\n\n\
+         注意：os 调度模式下系统心跳粒度为 1 分钟，秒级任务在到点后的下一次心跳触发。"
             .to_string()
     }
 
@@ -2109,7 +2120,8 @@ impl PortableTool for ScheduleTask {
                     "description": "操作类型"
                 },
                 "name": { "type": "string", "description": "任务名称（add 时必填）" },
-                "cron": { "type": "string", "description": "cron 表达式（add 时必填），如 '0 9 * * *'" },
+                "cron": { "type": "string", "description": "cron 表达式（周期任务，与 at 二选一）。5 字段『分 时 日 月 周』如 '0 9 * * *'；6 字段『秒 分 时 日 月 周』如 '30 0 9 * * *'" },
+                "at": { "type": "string", "description": "一次性执行时间（与 cron 二选一），格式 'YYYY-MM-DD HH:MM[:SS]'，如 '2026-12-25 09:30:00'" },
                 "prompt": { "type": "string", "description": "要执行的 agent prompt（add 时必填）" },
                 "id": { "type": "string", "description": "任务 ID（remove/enable/disable 时必填）" },
                 "max_runs": { "type": "number", "description": "最大执行次数（可选，仅 add 时有效）" },
@@ -2123,14 +2135,25 @@ impl PortableTool for ScheduleTask {
         match args.action.as_str() {
             "add" => {
                 let name = args.name.ok_or_else(|| ToolError("name is required for add".into()))?;
-                let cron = args.cron.ok_or_else(|| ToolError("cron is required for add".into()))?;
                 let prompt = args.prompt.ok_or_else(|| ToolError("prompt is required for add".into()))?;
-                match self.manager.add_task(name, cron, prompt, args.max_runs) {
-                    Ok(task) => Ok(format!(
-                        "✅ 定时任务已创建\nID: {}\n名称: {}\nCron: {}\n最大执行次数: {}",
-                        task.id, task.name, task.cron,
-                        task.max_runs.map(|n| n.to_string()).unwrap_or_else(|| "无限".into())
-                    )),
+                let at = match &args.at {
+                    Some(s) => Some(crate::scheduler::parse_at(s)
+                        .map_err(|e| ToolError(format!("at 时间解析失败: {e}")))?),
+                    None => None,
+                };
+                match self.manager.add_task(name, args.cron, at, prompt, args.max_runs) {
+                    Ok(task) => {
+                        let trigger = match (&task.cron, &task.at) {
+                            (Some(c), _) => format!("Cron: {c}"),
+                            (None, Some(at)) => format!("At: {}（一次性）", at.format("%Y-%m-%d %H:%M:%S")),
+                            (None, None) => unreachable!(), // add_task 已校验
+                        };
+                        Ok(format!(
+                            "✅ 定时任务已创建\nID: {}\n名称: {}\n{}\n最大执行次数: {}",
+                            task.id, task.name, trigger,
+                            task.max_runs.map(|n| n.to_string()).unwrap_or_else(|| "无限".into())
+                        ))
+                    }
                     Err(e) => Err(ToolError(format!("创建任务失败: {e}"))),
                 }
             }
@@ -2146,9 +2169,14 @@ impl PortableTool for ScheduleTask {
                                 let last = t.last_run
                                     .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
                                     .unwrap_or_else(|| "从未".into());
+                                let trigger = match (&t.cron, &t.at) {
+                                    (Some(c), _) => format!("cron: {c}"),
+                                    (None, Some(at)) => format!("at: {}（一次性）", at.format("%Y-%m-%d %H:%M:%S")),
+                                    (None, None) => "trigger: 未设置".to_string(),
+                                };
                                 out.push_str(&format!(
-                                    "{} [{}] {} (cron: {}, 已执行 {} 次, 上次: {})\n",
-                                    status, t.id, t.name, t.cron, t.run_count, last
+                                    "{} [{}] {} ({}, 已执行 {} 次, 上次: {})\n",
+                                    status, t.id, t.name, trigger, t.run_count, last
                                 ));
                             }
                             Ok(out)

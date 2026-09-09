@@ -1,8 +1,14 @@
-// 简单 5 字段 cron 表达式解析器。
-// Simple 5-field cron expression parser.
+// 简单 cron 表达式解析器：标准 5 字段，或带前导“秒”字段的 6 字段形式。
+// Simple cron expression parser: standard 5 fields, or 6 fields with a
+// leading seconds field.
 //
-// 字段顺序：分(0-59) 时(0-23) 日(1-31) 月(1-12) 周(0-6, 0=周日)
-// 支持：
+// 5 字段：分(0-59) 时(0-23) 日(1-31) 月(1-12) 周(0-6, 0=周日) —— 秒固定为 0
+// 6 字段：秒(0-59) 分 时 日 月 周（Quartz 风格，不含年；指定年份的一次性任务请用 at）
+// 5 fields: min hour day month weekday —— seconds pinned to 0
+// 6 fields: sec min hour day month weekday (Quartz-style, no year; use `at`
+// for one-time tasks pinned to a specific year)
+//
+// 字段语法 / Field syntax:
 //   *           任意值
 //   n           具体值
 //   a-b         范围
@@ -11,12 +17,19 @@
 //   a-b/n       范围+步长
 //
 // 不支持：? L W # 等扩展语法（标准 Unix cron 子集）。
+//
+// 注意：os 调度模式（crontab / schtasks）的心跳粒度为 1 分钟，秒级任务会在
+// 到点后的第一次心跳触发（最大误差 1 分钟）。
+// Note: the OS scheduling mode (crontab / schtasks) heartbeats once per
+// minute, so second-level tasks fire at the first heartbeat at/after the
+// target second (up to 1 minute late).
 
 use anyhow::{bail, Result};
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
 
 #[derive(Debug, Clone)]
 pub struct CronExpr {
+    pub seconds: Field,
     pub minutes: Field,
     pub hours: Field,
     pub days: Field,
@@ -61,18 +74,32 @@ impl Field {
 }
 
 impl CronExpr {
+    /// 解析 cron 表达式：5 字段（分 时 日 月 周）或 6 字段（秒 分 时 日 月 周）。
     pub fn parse(expr: &str) -> Result<Self> {
         let parts: Vec<&str> = expr.split_whitespace().collect();
-        if parts.len() != 5 {
-            bail!("cron 表达式必须有 5 个字段（分 时 日 月 周），got {}", parts.len());
+        match parts.len() {
+            // 5 字段：秒固定为 0（与标准 Unix cron 一致，在整分钟触发）。
+            5 => Ok(CronExpr {
+                seconds: Field { values: vec![0] },
+                minutes: parse_field(parts[0], 0, 59)?,
+                hours: parse_field(parts[1], 0, 23)?,
+                days: parse_field(parts[2], 1, 31)?,
+                months: parse_field(parts[3], 1, 12)?,
+                weekdays: parse_field(parts[4], 0, 6)?,
+            }),
+            // 6 字段：前导秒字段。
+            6 => Ok(CronExpr {
+                seconds: parse_field(parts[0], 0, 59)?,
+                minutes: parse_field(parts[1], 0, 59)?,
+                hours: parse_field(parts[2], 0, 23)?,
+                days: parse_field(parts[3], 1, 31)?,
+                months: parse_field(parts[4], 1, 12)?,
+                weekdays: parse_field(parts[5], 0, 6)?,
+            }),
+            n => bail!(
+                "cron 表达式必须有 5 个字段（分 时 日 月 周）或 6 个字段（秒 分 时 日 月 周），got {n}"
+            ),
         }
-        Ok(CronExpr {
-            minutes: parse_field(parts[0], 0, 59)?,
-            hours: parse_field(parts[1], 0, 23)?,
-            days: parse_field(parts[2], 1, 31)?,
-            months: parse_field(parts[3], 1, 12)?,
-            weekdays: parse_field(parts[4], 0, 6)?,
-        })
     }
 
     /// 判断在 [since, now] 区间内是否有触发点。
@@ -85,16 +112,18 @@ impl CronExpr {
     }
 
     /// 计算 after 之后的下一个触发时间（严格 > after）。
+    /// 分钟以下粒度：只在分钟匹配的那一分钟内扫描秒字段，
+    /// 因此迭代上界与 5 字段形式相同（按分钟步进）。
     pub fn next_after(&self, after: &DateTime<Local>) -> Option<DateTime<Local>> {
-        let mut dt = after.clone() + chrono::Duration::minutes(1);
+        let mut dt = after.clone() + chrono::Duration::seconds(1);
         // 最多向前查找 366 天，避免无限循环。
         for _ in 0..(366 * 24 * 60) {
-            // 重置秒/纳秒到 0。
-            dt = dt.with_second(0)?.with_nanosecond(0)?;
+            // 重置纳秒（秒字段参与匹配，不能清零）。
+            dt = dt.with_nanosecond(0)?;
 
             let month = dt.month() as u8;
             if !self.months.matches(month) {
-                // 跳到下个月 1 号 00:00。
+                // 跳到下个月 1 号 00:00:00。
                 dt = next_month_start(&dt)?;
                 continue;
             }
@@ -106,30 +135,42 @@ impl CronExpr {
             // 若需要 OR 可在此扩展。
             if !self.days.matches(day) || !self.weekdays.matches(wd) {
                 dt = dt + chrono::Duration::days(1);
-                dt = dt.with_hour(0)?.with_minute(0)?;
+                dt = dt.with_hour(0)?.with_minute(0)?.with_second(0)?;
                 continue;
             }
 
             let hour = dt.hour() as u8;
             if !self.hours.matches(hour) {
                 dt = dt + chrono::Duration::hours(1);
-                dt = dt.with_minute(0)?;
+                dt = dt.with_minute(0)?.with_second(0)?;
                 continue;
             }
 
             let minute = dt.minute() as u8;
-            if self.minutes.matches(minute) {
-                return Some(dt);
+            if !self.minutes.matches(minute) {
+                // 跳到下一个允许的分钟。
+                let next_min = self.minutes.next(minute + 1);
+                if next_min > minute {
+                    dt = dt.with_minute(next_min as u32)?.with_second(0)?;
+                } else {
+                    // 下一小时。
+                    dt = dt + chrono::Duration::hours(1);
+                    dt = dt.with_minute(0)?.with_second(0)?;
+                }
+                continue;
             }
 
-            // 跳到下一个允许的分钟。
-            let next_min = self.minutes.next(minute + 1);
-            if next_min > minute {
-                dt = dt.with_minute(next_min as u32)?;
-            } else {
-                // 下一小时。
-                dt = dt + chrono::Duration::hours(1);
-                dt = dt.with_minute(0)?;
+            // 分钟匹配：在该分钟内找 >= 当前秒的最小允许秒。
+            // dt 始终严格递增，因此找到的候选必然 > after。
+            let sec = dt.second() as u8;
+            match self.seconds.values.iter().find(|&&s| s >= sec) {
+                Some(&s) => return dt.with_second(s as u32),
+                None => {
+                    // 本分钟没有可用秒 → 下一分钟 0 秒。
+                    dt = dt + chrono::Duration::minutes(1);
+                    dt = dt.with_second(0)?;
+                    continue;
+                }
             }
         }
         None
@@ -243,6 +284,50 @@ mod tests {
         let n = c.next_after(&t).unwrap();
         assert_eq!(n.hour(), 3);
         assert_eq!(n.minute(), 0);
+    }
+
+    #[test]
+    fn parse_six_fields_with_seconds() {
+        let c = CronExpr::parse("*/20 * * * * *").unwrap();
+        assert_eq!(c.seconds.values, vec![0, 20, 40]);
+        assert_eq!(c.minutes.values.len(), 60);
+        // 5 字段形式秒固定为 0。
+        let c5 = CronExpr::parse("* * * * *").unwrap();
+        assert_eq!(c5.seconds.values, vec![0]);
+    }
+
+    #[test]
+    fn next_after_seconds_within_minute() {
+        let c = CronExpr::parse("*/20 * * * * *").unwrap();
+        let t = Local.with_ymd_and_hms(2025, 1, 1, 10, 0, 5).unwrap();
+        let n = c.next_after(&t).unwrap();
+        assert_eq!((n.hour(), n.minute(), n.second()), (10, 0, 20));
+    }
+
+    #[test]
+    fn next_after_seconds_rolls_to_next_minute() {
+        let c = CronExpr::parse("*/20 * * * * *").unwrap();
+        let t = Local.with_ymd_and_hms(2025, 1, 1, 10, 0, 55).unwrap();
+        let n = c.next_after(&t).unwrap();
+        assert_eq!((n.hour(), n.minute(), n.second()), (10, 1, 0));
+    }
+
+    #[test]
+    fn next_after_five_field_still_lands_on_second_zero() {
+        // 回归：5 字段形式在整分钟（秒=0）触发，即使 after 带着非零秒。
+        let c = CronExpr::parse("* * * * *").unwrap();
+        let t = Local.with_ymd_and_hms(2025, 1, 1, 10, 0, 30).unwrap();
+        let n = c.next_after(&t).unwrap();
+        assert_eq!((n.minute(), n.second()), (1, 0));
+    }
+
+    #[test]
+    fn specific_second_cron() {
+        // 每天 09:30:15。
+        let c = CronExpr::parse("15 30 9 * * *").unwrap();
+        let t = Local.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let n = c.next_after(&t).unwrap();
+        assert_eq!((n.hour(), n.minute(), n.second()), (9, 30, 15));
     }
 
     #[test]

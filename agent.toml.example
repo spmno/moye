@@ -263,8 +263,13 @@ max_retries = 2
 timeout_secs = 600
 
 # ── 定时任务调度器 / Scheduler ───────────────────────────────────────────
-# 通过 schedule_task 工具管理的定时任务（cron 表达式 + agent prompt）。
-# Scheduled tasks managed via the schedule_task tool (cron expr + agent prompt).
+# 通过 schedule_task 工具管理的定时任务，支持两种触发方式：
+#   cron 周期任务：5 字段『分 时 日 月 周』或 6 字段『秒 分 时 日 月 周』
+#   at 一次性任务：指定年月日时分秒（如 "2026-12-25 09:30:00"），执行一次后失效
+# Scheduled tasks managed via the schedule_task tool; two trigger styles:
+#   cron (recurring): 5-field "min hour day month weekday" or 6-field with a
+#                     leading seconds field
+#   at (one-shot): exact "YYYY-MM-DD HH:MM[:SS]", fires once then expires
 [scheduler]
 # 是否启用（默认 false）。
 # Enable scheduled tasks (default false).

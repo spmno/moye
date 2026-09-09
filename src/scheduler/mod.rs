@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
-use anyhow::Result;
-use chrono::{DateTime, Local};
+use anyhow::{bail, Result};
+use chrono::{DateTime, Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -25,12 +25,26 @@ use tracing::{error, info, warn};
 use self::cron::CronExpr;
 use self::store::TaskStore;
 
-/// 单个定时任务。
+/// 单个定时任务。两种触发方式二选一：
+/// - `cron`：周期性触发（5 或 6 字段表达式）
+/// - `at`：一次性触发（年月日时分秒），执行一次后不再触发
+///
+/// A single scheduled task. Exactly one of two trigger styles:
+/// - `cron`: recurring (5- or 6-field expression)
+/// - `at`: one-shot at an exact datetime; never fires again once executed
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduledTask {
     pub id: String,
     pub name: String,
-    pub cron: String,
+    /// cron 表达式（周期性任务）；at 任务为 None。
+    /// Cron expression for recurring tasks; None for at-tasks.
+    /// 旧版 JSON 中该字段为必填字符串，serde(default) 保证向后兼容。
+    #[serde(default)]
+    pub cron: Option<String>,
+    /// 一次性执行时间；cron 任务为 None。
+    /// One-shot execution time; None for cron tasks.
+    #[serde(default)]
+    pub at: Option<DateTime<Local>>,
     pub prompt: String,
     pub created_at: DateTime<Local>,
     pub last_run: Option<DateTime<Local>>,
@@ -182,7 +196,20 @@ impl Scheduler {
             if let Some(max) = task.max_runs {
                 if task.run_count >= max { continue; }
             }
-            let cron = match CronExpr::parse(&task.cron) {
+            // 一次性 at 任务：到点且从未执行过即触发（执行后 last_run 有值，自然失效）。
+            // One-shot at-task: fires when due and never executed before (once
+            // last_run is set it can never fire again).
+            if let Some(at) = task.at {
+                if task.last_run.is_none() && now >= at {
+                    due.push(task.clone());
+                }
+                continue;
+            }
+            let cron_expr = match &task.cron {
+                Some(c) => c,
+                None => continue, // 既无 cron 也无 at 的脏数据，跳过。
+            };
+            let cron = match CronExpr::parse(cron_expr) {
                 Ok(c) => c,
                 Err(e) => { warn!("[scheduler] task {} cron parse error: {e}", task.id); continue; }
             };
@@ -328,11 +355,16 @@ impl TaskManager {
         Self { paths: SchedulerPaths::from_config(config) }
     }
 
-    pub fn add_task(&self, name: String, cron: String, prompt: String, max_runs: Option<u64>) -> Result<ScheduledTask> {
-        CronExpr::parse(&cron)?;
+    pub fn add_task(&self, name: String, cron: Option<String>, at: Option<DateTime<Local>>, prompt: String, max_runs: Option<u64>) -> Result<ScheduledTask> {
+        match (&cron, &at) {
+            (Some(c), None) => { CronExpr::parse(c)?; }
+            (None, Some(_)) => {}
+            (Some(_), Some(_)) => bail!("cron 与 at 只能二选一（周期任务用 cron，一次性任务用 at）"),
+            (None, None) => bail!("必须提供 cron（周期任务）或 at（一次性任务）之一"),
+        }
         let mut store = TaskStore::load(&self.paths.store_path)?;
         let task = ScheduledTask {
-            id: short_uuid(), name, cron, prompt,
+            id: short_uuid(), name, cron, at, prompt,
             created_at: Local::now(), last_run: None,
             enabled: true, max_runs, run_count: 0,
         };
@@ -437,6 +469,28 @@ impl Drop for TickLock {
 
 // ── helpers ──
 
+/// 解析一次性任务时间（年月日时分秒）。支持格式：
+///   "2026-12-25 09:30:00" / "2026-12-25 09:30"（本地时间）
+///   "2026-12-25T09:30:00" / RFC3339（带时区）
+/// Parse a one-shot task datetime (year-month-day hour:minute[:second]).
+/// Accepts local "YYYY-MM-DD HH:MM[:SS]" (also with a T separator) or RFC3339.
+pub fn parse_at(s: &str) -> Result<DateTime<Local>> {
+    let s = s.trim();
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&Local));
+    }
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"] {
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            match Local.from_local_datetime(&ndt).single() {
+                Some(dt) => return Ok(dt),
+                // 本地时间歧义/不存在（DST 跳变），尝试下一个格式或直接报错。
+                None => bail!("本地时间 {s} 不存在或有歧义（可能是夏令时跳变点）"),
+            }
+        }
+    }
+    bail!("无法解析时间 '{s}'，支持格式：YYYY-MM-DD HH:MM[:SS] 或 RFC3339")
+}
+
 fn truncate_summary(s: &str, max: usize) -> String {
     let s = s.trim();
     if s.len() <= max { s.to_string() } else { format!("{}...", &s[..max]) }
@@ -530,5 +584,33 @@ mod tests {
         drop(lock); // 第二个 guard 删文件无副作用（文件已被前一个 Drop 删除）。
         assert!(!lock_path.exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_at_formats() {
+        let dt = parse_at("2026-12-25 09:30:00").unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-12-25 09:30:00");
+        let dt2 = parse_at("2026-12-25 09:30").unwrap();
+        assert_eq!(dt2.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-12-25 09:30:00");
+        let dt3 = parse_at("2026-12-25T09:30:00").unwrap();
+        assert_eq!(dt3.format("%Y-%m-%d %H:%M").to_string(), "2026-12-25 09:30");
+        // RFC3339（带时区）也能解析。
+        assert!(parse_at("2026-12-25T09:30:00+08:00").is_ok());
+        assert!(parse_at("next friday").is_err());
+        assert!(parse_at("2026-13-01 00:00").is_err());
+    }
+
+    #[test]
+    fn scheduled_task_json_backcompat() {
+        // 旧版存储：cron 为必填字符串、无 at 字段，升级后必须仍能反序列化。
+        let old = r#"{"id":"a","name":"t","cron":"0 9 * * *","prompt":"p","created_at":"2026-01-01T00:00:00+08:00","last_run":null,"enabled":true,"max_runs":null,"run_count":0}"#;
+        let t: ScheduledTask = serde_json::from_str(old).unwrap();
+        assert_eq!(t.cron.as_deref(), Some("0 9 * * *"));
+        assert!(t.at.is_none());
+        // 新版 at 任务：cron 为 null。
+        let new = r#"{"id":"b","name":"t2","cron":null,"at":"2026-12-25T09:30:00+08:00","prompt":"p","created_at":"2026-01-01T00:00:00+08:00","last_run":null,"enabled":true,"max_runs":null,"run_count":0}"#;
+        let t2: ScheduledTask = serde_json::from_str(new).unwrap();
+        assert!(t2.cron.is_none());
+        assert!(t2.at.is_some());
     }
 }

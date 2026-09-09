@@ -623,6 +623,44 @@ struct TuiState {
     /// Whether the autocomplete popup was dismissed by Esc. The predicate ANDs
     /// !dismissed — cleared when the buffer changes or a new `/` token starts.
     autocomplete_dismissed: bool,
+    /// 消息渲染版本号：messages 每次变化（push / 首条 System 改写）时 +1，
+    /// 作为 msg_cache 脏键的一部分。
+    /// Message render version: bumped whenever `messages` changes (push / first
+    /// System message rewrite); part of the msg_cache dirty key.
+    msg_version: u64,
+    /// 消息区渲染缓存：避免每帧对全量历史做 markdown 解析 / 语法高亮 / diff /
+    /// 软换行（这些曾导致长会话时输入框卡顿）。
+    /// Message render cache: avoids re-running markdown parse / syntax highlight /
+    /// diff / soft-wrap over the whole history every frame (the cause of input
+    /// lag in long sessions).
+    msg_cache: MsgCache,
+    /// 帧脏标志：状态变化后置 true，run_loop 仅在 dirty 时重绘（空闲时 8fps 的
+    /// tick 不再触发全量重绘）。
+    /// Frame dirty flag: set on any state change; run_loop redraws only when
+    /// dirty (the idle 8fps tick no longer triggers full redraws).
+    dirty: bool,
+}
+
+/// 消息区渲染缓存。key = (msg_version, 内容区宽度, expand_tool_results)。
+/// Message-area render cache. key = (msg_version, content width, expand_tool_results).
+///
+/// 同时保存两份软换行结果：
+/// - `wrapped`：未加边框续行前缀，供搜索路径使用（find_matches 列对齐要求
+///   前缀 span 尚未注入）。
+/// - `rendered`：已应用 apply_border_continuation（跨行状态机，必须在切片前
+///   对全量应用一次），无搜索时直接按可见窗口切片克隆。
+///
+/// Two post-wrap variants are kept:
+/// - `wrapped`: without border-continuation prefixes, used by the search path
+///   (find_matches column alignment requires the prefix spans not yet injected).
+/// - `rendered`: apply_border_continuation already applied (a cross-line state
+///   machine — must run over the full vector once, before slicing); sliced by
+///   visible window when search is inactive.
+#[derive(Default)]
+struct MsgCache {
+    key: Option<(u64, u16, bool)>,
+    wrapped: Vec<Line<'static>>,
+    rendered: Vec<Line<'static>>,
 }
 
 impl TuiState {
@@ -684,7 +722,29 @@ impl TuiState {
             autocomplete_sel: 0,
             autocomplete_area: Rect::new(0, 0, 0, 0),
             autocomplete_dismissed: false,
+            msg_version: 0,
+            msg_cache: MsgCache::default(),
+            // 首帧必须绘制 / First frame must be drawn.
+            dirty: true,
         }
+    }
+
+    /// 确保消息渲染缓存与 (msg_version, width, expand) 对齐；失配时重建。
+    /// Ensure the message render cache matches (msg_version, width, expand);
+    /// rebuild on mismatch.
+    fn ensure_msg_cache(&mut self, width: u16) {
+        let key = (self.msg_version, width, self.expand_tool_results);
+        if self.msg_cache.key == Some(key) {
+            return;
+        }
+        let all_lines = self.all_message_lines();
+        let wrapped = crate::ui::wrap::wrap_lines(&all_lines, width);
+        let rendered = apply_border_continuation(wrapped.clone());
+        self.msg_cache = MsgCache {
+            key: Some(key),
+            wrapped,
+            rendered,
+        };
     }
 
     fn tick(&mut self) {
@@ -712,6 +772,7 @@ impl TuiState {
     fn push_event(&mut self, event: AgentEvent) {
         log_event(&event);
         self.messages.push(event);
+        self.msg_version += 1;
     }
 
     /// 切换模型/供应商后，更新首条 System 消息使其反映当前状态。
@@ -721,8 +782,9 @@ impl TuiState {
     /// The display window's first line is the System message pushed at startup; without
     /// refreshing it, the old model/provider lingers while the sidebar already updated.
     fn refresh_system_header(&mut self) {
-        if let Some(AgentEvent::System(text)) = self.messages.iter_mut().next() {
+        if let Some(AgentEvent::System(text)) = self.messages.first_mut() {
             *text = format!("moye ({}) | model: {}", self.provider, self.model);
+            self.msg_version += 1;
         }
     }
 
@@ -1263,22 +1325,38 @@ async fn run_loop(
     tokio::pin!(ctrl_c);
 
     loop {
+        // 仅在 dirty 时重绘：空闲 tick（120ms）不再触发全量重绘；按键 / 流式
+        // 事件会置 dirty，echo 仍然即时。
+        // Redraw only when dirty: the idle 120ms tick no longer triggers a full
+        // redraw; key / streaming events set dirty, so echo stays immediate.
         if state.needs_full_redraw {
             if let Ok(size) = terminal.size() {
                 let _ = terminal.resize(Rect::new(0, 0, size.width, size.height));
             }
             state.needs_full_redraw = false;
+            state.dirty = true;
         }
-        terminal.draw(|f| draw(f, state))?;
+        if state.dirty {
+            terminal.draw(|f| draw(f, state))?;
+            state.dirty = false;
+        }
 
         tokio::select! {
             Some(Ok(event)) = events.next() => {
                 match event {
-                    crossterm::event::Event::Key(key) => {
+                    // 过滤 Release（kitty 协议 / Windows 下 crossterm 会上报
+                    // Release），避免一次按键重复插入。
+                    // Filter out Release (reported by crossterm under the kitty
+                    // protocol / on Windows) to avoid duplicate insertion.
+                    crossterm::event::Event::Key(key)
+                        if key.kind != crossterm::event::KeyEventKind::Release =>
+                    {
                         handle_key_event(key, state, ctx, action_tx);
+                        state.dirty = true;
                     }
                     crossterm::event::Event::Mouse(mouse) => {
                         handle_mouse_event(mouse, state, ctx, action_tx);
+                        state.dirty = true;
                     }
                     crossterm::event::Event::Paste(text)
                         if !state.thinking && state.hitl.is_none() =>
@@ -1293,18 +1371,43 @@ async fn run_loop(
                             state.input.insert_str(&text);
                             state.autocomplete_dismissed = false;
                         }
+                        state.dirty = true;
                     }
                     _ => {}
                 }
             }
             Some(action) = action_rx.recv() => {
                 handle_action(action, state);
+                state.dirty = true;
             }
             _ = tick.tick() => {
+                let before = state.spinner;
                 state.tick();
+                // 仅 spinner 实际变化（thinking 中）才需要重绘。
+                // Redraw only when the spinner actually advanced (while thinking).
+                if state.spinner != before {
+                    state.dirty = true;
+                }
             }
             _ = &mut ctrl_c => {
                 state.should_quit = true;
+            }
+        }
+
+        // 合并流式突发：把已排队的 action 一次性 drain 完再重绘，
+        // 避免每个 token 一帧（每帧都曾全量重渲染历史）。
+        // Coalesce streaming bursts: drain queued actions before the next draw,
+        // avoiding one frame per token (each frame used to re-render the whole
+        // history).
+        let mut drained = 0;
+        while drained < 256 {
+            match action_rx.try_recv() {
+                Ok(action) => {
+                    handle_action(action, state);
+                    state.dirty = true;
+                    drained += 1;
+                }
+                Err(_) => break,
             }
         }
 
@@ -3441,8 +3544,6 @@ fn draw_selector(f: &mut Frame, state: &mut TuiState) {
 }
 
 fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
-    let all_lines = state.all_message_lines();
-
     let block = Block::default()
         .padding(Padding::horizontal(1))
         .style(theme::bg_base());
@@ -3451,36 +3552,56 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
     // Store the message content area for handle_mouse_event hit-testing.
     state.msg_area = inner;
 
-    // 按内容区宽度软换行：长行拆成多个"显示行"，避免被终端右边缘截断。
-    // 渲染仍用不带 .wrap() 的 Paragraph，因此"1 显示行 == 1 屏幕行"不变量
-    // 成立，选区 / 高亮 / 滚动逻辑无需改动即可正确工作。
-    // Soft-wrap to content width: long lines split into multiple "display lines"
-    // so they aren't clipped at the terminal's right edge. The Paragraph is still
-    // rendered without .wrap(), so the "1 display line == 1 screen row" invariant
-    // holds and the selection / highlight / scroll logic works unchanged.
-    let display_lines = crate::ui::wrap::wrap_lines(&all_lines, inner.width);
-    let total = display_lines.len() as u16;
+    // 渲染缓存：仅当 (msg_version, 宽度, expand) 变化时才重新跑 markdown 解析、
+    // 语法高亮、diff 与软换行；否则直接复用。这是输入框卡顿的主要修复点——
+    // 此前每帧（含每个按键回显）都对全量历史重渲染。
+    // Render cache: re-runs markdown parse / syntax highlight / diff / soft-wrap
+    // only when (msg_version, width, expand) changes; otherwise reuses. This is
+    // the main fix for input lag — previously every frame (including every
+    // keystroke echo) re-rendered the entire history.
+    state.ensure_msg_cache(inner.width);
+    let total = state.msg_cache.rendered.len() as u16;
     let base = total.saturating_sub(inner.height);
 
-    // 搜索：draw 时重算匹配（对齐上方软换行向量）、确保当前匹配可见、叠加高亮。
+    // 搜索：draw 时重算匹配（对齐软换行向量）、确保当前匹配可见、叠加高亮。
     // 须在算 scroll 之前调用——跳转会改写 scroll_offset。
-    // Search: recompute matches at draw (aligned with the wrapped vector above),
+    // Search: recompute matches at draw (aligned with the wrapped vector),
     // ensure the current match is visible, overlay highlights. Must run before
     // computing scroll — a jump rewrites scroll_offset.
-    let display_lines = apply_search_draw(state, display_lines, total, base, inner);
-
-    // 边框续行：软换行后为带边框块的续行重新添加 `┃ ` 前缀。
-    // 搜索高亮已在上方叠加（content spans 已含 bg patch），边框 span 不被 patch。
-    // Re-prefix continuation lines of bordered blocks after soft-wrapping.
-    // Search highlighting ran above (content spans already carry bg patches);
-    // border spans added here are NOT search-patched (clean border look).
-    let display_lines = apply_border_continuation(display_lines);
+    //
+    // 只把"可见窗口"克隆给 Paragraph：长会话下避免每帧克隆全部显示行。
+    // 选区高亮的 逻辑行→屏幕行 公式 inner.y + (logical - scroll) 保持不变。
+    // Only the visible window is cloned for the Paragraph: avoids cloning all
+    // display lines per frame in long sessions. The selection overlay's
+    // logical→screen formula inner.y + (logical - scroll) is unchanged.
+    let visible: Vec<Line<'static>> = if state.search.is_some() {
+        // 搜索路径：在全量"预边框"行上重算匹配并叠加高亮（列对齐要求），
+        // 再补边框续行前缀，最后切可见窗口。搜索模式不常开，全量克隆可接受。
+        // Search path: recompute matches and overlay highlights over the full
+        // pre-border lines (required for column alignment), then re-apply
+        // border-continuation prefixes, then slice the visible window. Search
+        // mode is rare, so the full clone is acceptable.
+        let pre_border = state.msg_cache.wrapped.clone();
+        let searched = apply_search_draw(state, pre_border, total, base, inner);
+        let lines = apply_border_continuation(searched);
+        let scroll = base.saturating_sub(state.scroll_offset);
+        let start = (scroll as usize).min(lines.len());
+        let end = (start + inner.height as usize).min(lines.len());
+        lines[start..end].to_vec()
+    } else {
+        let scroll = base.saturating_sub(state.scroll_offset);
+        let start = (scroll as usize).min(state.msg_cache.rendered.len());
+        let end = (start + inner.height as usize).min(state.msg_cache.rendered.len());
+        state.msg_cache.rendered[start..end].to_vec()
+    };
 
     let scroll = base.saturating_sub(state.scroll_offset);
     state.msg_scroll = scroll;
 
-    let text = Text::from(display_lines);
-    let messages = Paragraph::new(text).scroll((scroll, 0)).block(block);
+    // visible[0] 对应逻辑行 scroll，因此无需 Paragraph::scroll。
+    // visible[0] is logical row `scroll`, so Paragraph::scroll is unnecessary.
+    let text = Text::from(visible);
+    let messages = Paragraph::new(text).block(block);
 
     f.render_widget(messages, area);
 

@@ -741,7 +741,7 @@ impl AgentRegistry {
             let builder = client
                 .agent(&model)
                 .preamble(&preamble)
-                .temperature(crate::providers::Provider::clamp_temperature(0.7))
+                .temperature(crate::providers::Provider::clamp_temperature(0.7, &model))
                 .additional_params(params)
                 .default_max_turns(max_turns);
             // 沙箱以 `Arc<dyn SandboxProvider>` trait 对象注入（todo 4 迁移）——
@@ -781,7 +781,7 @@ impl AgentRegistry {
             let builder = client
                 .agent(&model)
                 .preamble(&preamble)
-                .temperature(crate::providers::Provider::clamp_temperature(0.7))
+                .temperature(crate::providers::Provider::clamp_temperature(0.7, &model))
                 .additional_params(params)
                 .default_max_turns(max_turns);
             let builder = if let Some(v) = effective_max_tokens {
@@ -1025,7 +1025,7 @@ async fn classify_with_llm(
     let agent = client
         .agent(&model)
         .preamble(preamble)
-        .temperature(crate::providers::Provider::clamp_temperature(0.0))
+        .temperature(crate::providers::Provider::clamp_temperature(0.0, &model))
         .additional_params(params)
         .default_max_turns(1)
         .max_tokens(20)

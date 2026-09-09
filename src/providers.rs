@@ -242,9 +242,16 @@ impl Provider {
         }
     }
 
-    /// 将请求的 temperature 限制在供应商允许的范围内。
-    /// Clamp the requested temperature to the range allowed by the provider.
-    pub fn clamp_temperature(desired: f64) -> f64 {
+    /// 将请求的 temperature 限制在供应商与模型允许的范围内。Kimi K3 只接受 1.0，
+    /// 且必须按模型名判断：自定义网关常把裸 "kimi" 映射到 K3（此时 provider 是
+    /// Custom），仅按供应商判断会漏夹导致 400。
+    /// Clamp temperature to what provider and model allow. Kimi K3 accepts only 1.0,
+    /// and the check must be model-aware: custom gateways map bare "kimi" to K3 while
+    /// provider is Custom, so a provider-only check misses it and the request 400s.
+    pub fn clamp_temperature(desired: f64, model: &str) -> f64 {
+        if kimi_k3_family(model) {
+            return 1.0;
+        }
         match Self::from_env() {
             Provider::Moonshot => 1.0,
             _ => desired,
@@ -393,6 +400,15 @@ pub fn provider_additional_params() -> serde_json::Value {
 /// leaving nothing for visible output or tool calls.
 ///
 /// Skip `.max_tokens()` for reasoning models to let them use their default output budget.
+/// Kimi K3 系列（kimi-k3 等）及裸 "kimi" slug：部分网关将 "kimi" 直接映射到
+/// K3，故裸 slug 也按 K3 处理。K3 只接受 temperature=1.0 且属于推理模型。
+/// Kimi K3 family (kimi-k3 etc.) and the bare "kimi" slug — some gateways map
+/// "kimi" straight to K3. K3 accepts only temperature=1.0 and is a reasoning model.
+fn kimi_k3_family(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    lower.contains("kimi-k3") || lower == "kimi"
+}
+
 pub fn is_reasoning_model(model: &str) -> bool {
     let lower = model.to_lowercase();
     // GLM 系列（glm-latest, glm-4.7, glm-5, glm-5.2 等）支持 thinking 模式
@@ -415,14 +431,12 @@ pub fn is_reasoning_model(model: &str) -> bool {
         // 推理阶段耗尽预算导致可见输出被截断成一两个字。
         // Volcengine Doubao Seed series (all variants) emit `reasoning_content`.
         || lower.starts_with("doubao-seed")
-        // Kimi K3+ 系列（kimi-k3 等）及裸 "kimi" slug 支持 thinking 模式，
+        // Kimi K3+ 系列（含裸 "kimi"，见 kimi_k3_family）支持 thinking 模式，
         // 输出 `reasoning_content`，属于推理模型，需要跳过 max_tokens 以避免
         // 推理阶段耗尽预算。
-        // 部分用户网关将 "kimi" 直接映射到 K3，因此裸 "kimi" 也按推理模型处理。
-        // Kimi K3+ series (kimi-k3 etc.) and bare "kimi" slug support thinking mode
-        // and emit `reasoning_content`; skip max_tokens to avoid budget exhaustion.
-        // Some gateways map bare "kimi" to K3, so treat it as reasoning model too.
-        || lower.contains("kimi-k3") || lower == "kimi"
+        // Kimi K3+ series (incl. bare "kimi", see kimi_k3_family) supports thinking
+        // and emits `reasoning_content`; skip max_tokens to avoid budget exhaustion.
+        || kimi_k3_family(model)
 }
 
 /// 对话型 Agent 别名：基于 OpenAI CompletionModel 的 rig Agent（兼容所有供应商）。
@@ -990,5 +1004,48 @@ mod tests {
         assert!(!is_reasoning_model("qwen-plus"));
         assert!(!is_reasoning_model("doubao-1-5-pro-256k"));
         assert!(!is_reasoning_model("claude-3-haiku"));
+    }
+
+    #[test]
+    fn clamp_temperature_forces_one_for_kimi_k3_family_regardless_of_provider() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // 回归：provider=custom（litellm 网关）把裸 "kimi" 映射到 K3 时也必须夹到
+        // 1.0，否则请求被 400 拒绝（temperature=0.7 is not supported）。
+        // Regression: with provider=custom (litellm gateway) mapping bare "kimi" to
+        // K3, temperature must still clamp to 1.0 or the request 400s.
+        unsafe {
+            std::env::set_var("AGENT_PROVIDER", "custom");
+        }
+        assert_eq!(Provider::clamp_temperature(0.7, "kimi-k3"), 1.0);
+        assert_eq!(Provider::clamp_temperature(0.0, "kimi"), 1.0);
+        assert_eq!(Provider::clamp_temperature(0.7, "KIMI-K3-THINKING"), 1.0);
+        unsafe {
+            std::env::remove_var("AGENT_PROVIDER");
+        }
+    }
+
+    #[test]
+    fn clamp_temperature_keeps_desired_for_other_models() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("AGENT_PROVIDER", "custom");
+        }
+        assert_eq!(Provider::clamp_temperature(0.7, "qwen-plus"), 0.7);
+        assert_eq!(Provider::clamp_temperature(0.0, "deepseek-v4-pro"), 0.0);
+        unsafe {
+            std::env::remove_var("AGENT_PROVIDER");
+        }
+    }
+
+    #[test]
+    fn clamp_temperature_moonshot_provider_clamps_any_model() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("AGENT_PROVIDER", "moonshot");
+        }
+        assert_eq!(Provider::clamp_temperature(0.7, "qwen-plus"), 1.0);
+        unsafe {
+            std::env::remove_var("AGENT_PROVIDER");
+        }
     }
 }

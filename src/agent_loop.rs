@@ -19,7 +19,9 @@ use rig_agent::agent::{
     StepEventKind, StreamingResult, ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent,
 };
 use rig_agent::client::AgentClientExt;
+use rig_core::completion::message::{AssistantContent, ToolCall as MessageToolCall, ToolFunction};
 use rig_core::completion::{Message, Usage};
+use rig_core::OneOrMany;
 use crate::providers::CompletionModel as OpenAiModel;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
@@ -530,6 +532,19 @@ impl ContextHook {
         self.waterfall.emit(&WaterfallEvent::AgentRequest {
             message: format!("turn={_turn}"),
         });
+        // 先清洗历史中的非法工具调用参数（截断的流会留下非 JSON 的
+        // `function.arguments`，严格供应商会 400 拒绝）；有改动时本轮请求
+        // 改用清洗后的历史（PatchRequest 非粘性，不动 rig 内部真实历史）。
+        // Sanitize invalid tool-call arguments first (truncated streams leave
+        // non-JSON `function.arguments` that strict providers reject with 400);
+        // when changed, this request uses the cleaned history (PatchRequest is
+        // non-sticky — rig's internal transcript is untouched).
+        let (sanitized_history, sanitized) = sanitize_history_tool_calls(history);
+        let history: &[Message] = if sanitized {
+            &sanitized_history
+        } else {
+            history
+        };
         if let Some(hc) = &self.history_capture {
             *hc.lock().unwrap() = history.to_vec();
         }
@@ -560,6 +575,11 @@ impl ContextHook {
                 let mut patched = history.to_vec();
                 patched.push(Message::system(&reminder));
                 return CompletionCallAction::Patch(RequestPatch::new().history(patched));
+            }
+            if sanitized {
+                return CompletionCallAction::Patch(
+                    RequestPatch::new().history(history.to_vec()),
+                );
             }
             return CompletionCallAction::Continue;
         }
@@ -627,7 +647,10 @@ impl ContextHook {
             .client
             .agent(&self.model)
             .preamble(crate::context::COMPACTION_PREAMBLE)
-            .temperature(0.0)
+            .temperature(crate::providers::Provider::clamp_temperature(
+                0.0,
+                &self.model,
+            ))
             .build();
         let resp = agent
             .runner(prompt)
@@ -649,6 +672,82 @@ impl ContextHook {
             accumulated_input = budget.accumulated_input(),
             "token usage recorded"
         );
+    }
+}
+
+/// 清洗待发送历史中的工具调用参数，返回 (历史, 是否有改动)。rig 流式聚合遇到
+/// 截断/非对象参数时会把原始串保留为 `Value::String`（或 `Value::Null`），重发时
+/// 序列化成非法的 `function.arguments`，严格供应商（如 DashScope code 模型）400
+/// 拒绝整个请求。可解析的字符串还原为 JSON 值，其余替换为空对象 `{}`。
+/// Sanitize tool-call arguments in outbound history. rig's streaming accumulator
+/// keeps truncated/non-object arguments as `Value::String`/`Value::Null`, which
+/// re-serialize into an invalid `function.arguments` and strict providers reject the
+/// whole request with 400. Parseable strings are restored; the rest become `{}`.
+fn sanitize_history_tool_calls(history: &[Message]) -> (Vec<Message>, bool) {
+    let mut changed = false;
+    let sanitized: Vec<Message> = history
+        .iter()
+        .map(|msg| {
+            let Message::Assistant { id, content } = msg else {
+                return msg.clone();
+            };
+            let mut msg_changed = false;
+            let items: Vec<AssistantContent> = content
+                .iter()
+                .map(|item| match item {
+                    AssistantContent::ToolCall(tc) => {
+                        let fixed = sanitize_tool_arguments(&tc.function.arguments);
+                        if fixed == tc.function.arguments {
+                            item.clone()
+                        } else {
+                            msg_changed = true;
+                            AssistantContent::ToolCall(MessageToolCall {
+                                function: ToolFunction {
+                                    arguments: fixed,
+                                    ..tc.function.clone()
+                                },
+                                ..tc.clone()
+                            })
+                        }
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            if !msg_changed {
+                return msg.clone();
+            }
+            changed = true;
+            match OneOrMany::many(items) {
+                Ok(content) => Message::Assistant {
+                    id: id.clone(),
+                    content,
+                },
+                // 原 content 非空，重建不会为空；保底返回原消息。
+                // Original content is non-empty so rebuild cannot be empty.
+                Err(_) => msg.clone(),
+            }
+        })
+        .collect();
+    (sanitized, changed)
+}
+
+fn sanitize_tool_arguments(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return serde_json::json!({});
+            }
+            match serde_json::from_str::<serde_json::Value>(trimmed) {
+                Ok(parsed @ serde_json::Value::Object(_)) => parsed,
+                // 合法 JSON 但非对象（工具参数必须是对象），或截断导致的非法 JSON。
+                // Valid JSON but not an object (tool args must be objects), or
+                // invalid JSON from a truncated stream.
+                _ => serde_json::json!({}),
+            }
+        }
+        serde_json::Value::Null => serde_json::json!({}),
+        other => other.clone(),
     }
 }
 
@@ -1245,6 +1344,16 @@ pub fn is_stream_error(e: &anyhow::Error) -> bool {
     if msg.contains("MaxTurnsError") || msg.contains("max turns limit") {
         return false;
     }
+    // HTTP 4xx 是确定性客户端错误（不支持的参数、非法历史等）：同一请求重试
+    // 必然同样失败，不消耗重试次数。上下文溢出类 400 由调用方先经
+    // is_context_overflow_error 分支拦截，不受影响。
+    // HTTP 4xx are deterministic client errors (unsupported parameter, invalid
+    // history, etc.): retrying the identical request fails identically, so don't
+    // burn retries. Overflow-style 400s are intercepted by the caller's
+    // is_context_overflow_error branch first and stay retryable.
+    if msg.contains("Invalid status code 4") {
+        return false;
+    }
     msg.contains("error decoding response body")
         || msg.contains("SSE error")
         || msg.contains("Reset(StreamId")
@@ -1471,7 +1580,7 @@ fn build_runner_agent_spec(
     let builder = client
         .agent(&model)
         .preamble(&preamble)
-        .temperature(crate::providers::Provider::clamp_temperature(0.7));
+        .temperature(crate::providers::Provider::clamp_temperature(0.7, &model));
     let sandbox_provider: Arc<dyn crate::seam::SandboxProvider> = registry.sandbox();
     let deps = crate::tools::ToolDeps {
         sandbox: sandbox_provider.clone(),
@@ -1515,6 +1624,94 @@ mod tests {
             web_search: Permission::Allow,
             command_rules: Vec::new(),
         }
+    }
+
+    fn assistant_tool_call_msg(arguments: serde_json::Value) -> Message {
+        Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(MessageToolCall {
+                id: "call_1".to_string(),
+                call_id: None,
+                function: ToolFunction {
+                    name: "read_file".to_string(),
+                    arguments,
+                },
+                signature: None,
+                additional_params: None,
+            })),
+        }
+    }
+
+    fn tool_call_arguments(msg: &Message) -> &serde_json::Value {
+        match msg {
+            Message::Assistant { content, .. } => match content.iter().next() {
+                Some(AssistantContent::ToolCall(tc)) => &tc.function.arguments,
+                _ => panic!("expected tool call content"),
+            },
+            _ => panic!("expected assistant message"),
+        }
+    }
+
+    #[test]
+    fn sanitize_repairs_truncated_stream_arguments() {
+        // 流式中断留下的半截 JSON：重发会被严格供应商 400 拒绝，必须替换为空对象。
+        // Truncated-stream partial JSON must be replaced: strict providers 400 on it.
+        let history = vec![assistant_tool_call_msg(serde_json::Value::String(
+            "{\"path\": \"src/".to_string(),
+        ))];
+        let (out, changed) = sanitize_history_tool_calls(&history);
+        assert!(changed);
+        assert_eq!(tool_call_arguments(&out[0]), &serde_json::json!({}));
+    }
+
+    #[test]
+    fn sanitize_restores_stringified_object_arguments() {
+        let history = vec![assistant_tool_call_msg(serde_json::Value::String(
+            "{\"path\":\"src/main.rs\"}".to_string(),
+        ))];
+        let (out, changed) = sanitize_history_tool_calls(&history);
+        assert!(changed);
+        assert_eq!(
+            tool_call_arguments(&out[0]),
+            &serde_json::json!({"path": "src/main.rs"})
+        );
+    }
+
+    #[test]
+    fn sanitize_rewrites_null_arguments_to_empty_object() {
+        let history = vec![assistant_tool_call_msg(serde_json::Value::Null)];
+        let (out, changed) = sanitize_history_tool_calls(&history);
+        assert!(changed);
+        assert_eq!(tool_call_arguments(&out[0]), &serde_json::json!({}));
+    }
+
+    #[test]
+    fn sanitize_leaves_valid_history_untouched() {
+        let history = vec![
+            Message::system("sys"),
+            assistant_tool_call_msg(serde_json::json!({"path": "x"})),
+        ];
+        let (out, changed) = sanitize_history_tool_calls(&history);
+        assert!(!changed);
+        assert_eq!(out, history);
+    }
+
+    #[test]
+    fn stream_error_classifier_rejects_http_4xx() {
+        // litellm 兜底链耗尽时把 400 包装成 429：确定性失败，不应再当 SSE 断连重试。
+        // litellm wraps fallback-chain 400s as 429: deterministic, must not retry.
+        let wrapped = anyhow::anyhow!(
+            "流式错误 / Stream error: CompletionError: HttpError: Invalid status code 429 Too Many Requests"
+        );
+        assert!(!is_stream_error(&wrapped));
+        let bad_request = anyhow::anyhow!(
+            "流式错误 / Stream error: CompletionError: HttpError: Invalid status code 400 Bad Request"
+        );
+        assert!(!is_stream_error(&bad_request));
+        let network = anyhow::anyhow!("流式错误 / Stream error: error decoding response body");
+        assert!(is_stream_error(&network));
+        let idle = anyhow::anyhow!("流式错误 / Stream error: 空闲超时");
+        assert!(is_stream_error(&idle));
     }
 
     #[test]

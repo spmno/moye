@@ -12,6 +12,7 @@ use crate::seam::SandboxProvider;
 use crate::session::Session;
 use crate::{evolution, skills};
 use std::sync::{Arc, Mutex};
+use tracing::warn;
 
 /// 启动时 OS 级沙箱 provider 的选择结果，由 `[sandbox].mode` 决定。
 /// Selection of the OS-level sandbox provider at startup, driven by `[sandbox].mode`.
@@ -365,6 +366,12 @@ impl AppContext {
                     let mut session = self.session.lock().unwrap();
                     let _ = session.append_turn("user", goal);
                     let _ = session.append_turn("agent", &out);
+                    // 持久化完整历史（含工具调用/结果），供 --continue 恢复。
+                    // Persist full history (incl. tool calls/results) for --continue restore.
+                    let full = self.orchestrator.history_snapshot();
+                    if let Err(e) = session.set_full_history(full) {
+                        warn!("failed to persist full history: {e}");
+                    }
                 }
 
                 let summary = format!(

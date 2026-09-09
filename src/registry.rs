@@ -1487,6 +1487,13 @@ impl Orchestrator {
         );
     }
 
+    /// 返回当前对话历史的快照（用于持久化到 session 的 history.json）。
+    /// Returns a snapshot of the current conversation history (for persisting to
+    /// session's history.json).
+    pub fn history_snapshot(&self) -> Vec<Message> {
+        self.history.lock().unwrap().clone()
+    }
+
     pub async fn handle(&self, message: &str, tx: &EventSender) -> anyhow::Result<String> {
         // 开始一个新的任务：递增检查点计数器，使后续 EditFile/WriteFile 的
         // record() 调用能记录到正确的任务 ID 下。

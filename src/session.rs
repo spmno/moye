@@ -4,13 +4,16 @@
 // 每个 session 在 `<memory>/sessions/<id>/` 下持久化：
 //   - `meta.json`          会话元数据（id、创建/更新时间、标题）
 //   - `conversation.jsonl` 本次会话的完整对话轮次（user / agent）
-// `--continue` 启动时加载最新 session，把其中对话重建为 `Vec<Message>`
-// 注入 Orchestrator 历史，从而「继续」上一次的会话。
+//   - `history.json`       完整的 model-visible 消息历史（含工具调用/结果）
+// `--continue` 启动时加载最新 session，优先从 `history.json` 恢复完整历史，
+// 回退到 `conversation.jsonl` 重建简化历史，注入 Orchestrator 历史。
 // Each session persists under `<memory>/sessions/<id>/`:
 //   - `meta.json`          session metadata (id, created/updated, title)
 //   - `conversation.jsonl` the full conversation turns of this session
-// On `--continue` startup, the latest session is loaded and its conversation is
-// rebuilt into `Vec<Message>` and injected into the Orchestrator's history.
+//   - `history.json`       full model-visible message history (incl. tool calls/results)
+// On `--continue` startup, the latest session is loaded; full history is restored
+// from `history.json` (preferred) or rebuilt from `conversation.jsonl` (fallback),
+// then injected into the Orchestrator's history.
 
 use anyhow::Result;
 use rig_core::completion::Message;
@@ -52,11 +55,14 @@ pub struct Session {
     pub meta: SessionMeta,
     dir: PathBuf,
     turns: Vec<SessionTurn>,
+    /// 完整的 model-visible 消息历史（含工具调用/结果等结构化消息）。
+    /// Full model-visible message history (incl. tool calls/results).
+    full_history: Vec<Message>,
 }
 
 impl Session {
-    /// 从会话目录加载（读取 meta.json 与 conversation.jsonl）。
-    /// Load a session from its directory (reads meta.json and conversation.jsonl).
+    /// 从会话目录加载（读取 meta.json、conversation.jsonl 与 history.json）。
+    /// Load a session from its directory (reads meta.json, conversation.jsonl, and history.json).
     pub fn load(dir: &Path) -> Result<Session> {
         let meta: SessionMeta = serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json"))?)?;
         let conv_path = dir.join("conversation.jsonl");
@@ -68,10 +74,20 @@ impl Session {
         } else {
             Vec::new()
         };
+        // 加载完整历史：优先 history.json（含工具调用/结果），回退到 conversation.jsonl。
+        // Load full history: prefer history.json (incl. tool calls/results), fall back to conversation.jsonl.
+        let hist_path = dir.join("history.json");
+        let full_history = if hist_path.exists() {
+            serde_json::from_str::<Vec<Message>>(&std::fs::read_to_string(&hist_path)?)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         Ok(Session {
             meta,
             dir: dir.to_path_buf(),
             turns,
+            full_history,
         })
     }
 
@@ -110,8 +126,14 @@ impl Session {
     }
 
     /// 把对话轮次重建为 model-visible `Vec<Message>`（供 --continue 注入历史）。
+    /// 优先返回完整历史（含工具调用/结果），回退到简化轮次重建。
     /// Rebuilds the turns into a model-visible `Vec<Message>` (for --continue history seeding).
+    /// Returns full history (incl. tool calls/results) when available, falls back to
+    /// simplified turn reconstruction.
     pub fn messages(&self) -> Vec<Message> {
+        if !self.full_history.is_empty() {
+            return self.full_history.clone();
+        }
         self.turns
             .iter()
             .map(|t| match t.role.as_str() {
@@ -119,6 +141,26 @@ impl Session {
                 _ => Message::assistant(t.content.clone()),
             })
             .collect()
+    }
+
+    /// 返回完整历史（含工具调用/结果）的只读引用。
+    /// Returns a read-only reference to the full history (incl. tool calls/results).
+    pub fn full_history(&self) -> &[Message] {
+        &self.full_history
+    }
+
+    /// 替换完整历史并持久化到 `history.json`。
+    /// Replaces the full history and persists it to `history.json`.
+    pub fn set_full_history(&mut self, messages: Vec<Message>) -> Result<()> {
+        self.full_history = messages;
+        let json = serde_json::to_string(&self.full_history)?;
+        std::fs::write(self.dir.join("history.json"), json)?;
+        self.meta.updated_at = now_nanos();
+        std::fs::write(
+            self.dir.join("meta.json"),
+            serde_json::to_string_pretty(&self.meta)?,
+        )?;
+        Ok(())
     }
 }
 

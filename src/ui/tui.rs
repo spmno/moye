@@ -1187,6 +1187,25 @@ pub async fn run_tui(ctx: Arc<AppContext>) -> anyhow::Result<()> {
         "moye ({}) | model: {}",
         state.provider, state.model
     )));
+    // --continue 时显示前序会话轮次，让用户看到恢复的上下文。
+    // On --continue, display prior conversation turns so the user sees the restored context.
+    let prior_turns = {
+        let session = ctx.session.lock().unwrap();
+        session.turns().to_vec()
+    };
+    if !prior_turns.is_empty() {
+        state.push_event(AgentEvent::System(format!(
+            "[--continue] 恢复了 {} 条历史对话 / restored {} prior turns",
+            prior_turns.len(),
+            prior_turns.len()
+        )));
+        for t in &prior_turns {
+            match t.role.as_str() {
+                "user" => state.push_event(AgentEvent::User(t.content.clone())),
+                _ => state.push_event(AgentEvent::Agent(t.content.clone())),
+            }
+        }
+    }
     state.push_event(AgentEvent::Info(
         "Enter \u{53d1}\u{9001}\u{4efb}\u{52a1} | Alt+Enter \u{6362}\u{884c} | /help \u{5e2e}\u{52a9} | Esc \u{4e2d}\u{65ad}\u{4efb}\u{52a1} | Ctrl+C \u{9000}\u{51fa}".into(),
     ));

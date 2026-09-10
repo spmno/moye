@@ -1,6 +1,9 @@
 /target
 memory/
 *.log
+# 项目级配置统一放在 .moye/（含 agent.toml、.env），整体忽略
+.moye/
+# 旧版布局的遗留文件（未迁移时仍保护）
 .env
 agent.toml
 .omo/

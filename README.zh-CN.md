@@ -61,7 +61,7 @@ moye
 │       ├── prompt_evolve.rs  # 提示词进化
 │       ├── self_modify.rs    # 代码自修改（编译验证 + 回退）
 │       └── tool_ext.rs       # 工具扩展（脚手架生成）
-├── agent.toml           # 运行时配置（供应商 / 模型 / 权限 / 记忆 / 沙箱 / profile）
+├── .moye/               # 项目配置（agent.toml + .env，整体被 git 忽略）
 ├── AGENTS.md            # 系统提示词（主 agent）
 ├── prompts/             # 各角色提示词（investigator / planner / builder / auditor）
 ├── docs/                # 文档（架构 / 上下文管理 / 对比 CrewAI）
@@ -124,18 +124,20 @@ cd moye
 
 ### 推荐：`.env` 文件（写一次，无需每次 export）
 
-程序启动时会自动加载项目根目录的 `.env` 文件（若存在），把配置写入进程环境——只需配置一次，之后每次启动自动生效，无需手动 export。显式 export 的变量优先，不会被 `.env` 覆盖。
+程序启动时会自动加载 `.moye/.env` 文件（若存在），把配置写入进程环境——只需配置一次，之后每次启动自动生效，无需手动 export。显式 export 的变量优先，不会被 `.env` 覆盖。
 
 ```bash
 # 首次配置：复制模板并填写你的 key
-cp .env.example .env
-# 编辑 .env：设置 AGENT_PROVIDER 与对应 API Key
+mkdir -p .moye && cp .env.example .moye/.env
+# 编辑 .moye/.env：设置 AGENT_PROVIDER 与对应 API Key
 # 可选供应商：deepseek / bailian / moonshot / volcengine / custom
 
 cargo run   # 之后每次启动自动生效
 ```
 
-`.env` 已被 `.gitignore` 忽略，密钥不会进入 git。
+`.moye/` 已整体被 `.gitignore` 忽略，密钥不会进入 git。
+
+> **迁移说明**：项目配置文件统一放在 `.moye/` 下（`agent.toml` 与 `.env`）。如果你还在使用仓库根目录的旧版 `agent.toml` / `.env`，程序启动时会自动将其移入 `.moye/`（新路径已存在时跳过）。
 
 ### DeepSeek（默认）
 
@@ -146,7 +148,7 @@ export DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxx
 cargo run
 ```
 
-或在 `.env` 中配置：
+或在 `.moye/.env` 中配置：
 
 ```bash
 AGENT_PROVIDER=deepseek
@@ -244,7 +246,7 @@ cargo run
 
 ### 全局配置回退
 
-除项目根的 `agent.toml` 外，程序启动时还会读取 `~/.config/moye/config.toml`（若存在），将其中的 `[provider]` 字段和 `[keys]` 条目作为项目缺失项的回退。优先级：环境变量 > 项目 `agent.toml` > 全局 `config.toml` > 供应商默认。
+除项目 `.moye/agent.toml` 外，程序启动时还会读取 `~/.config/moye/config.toml`（若存在），将其中的 `[provider]` 字段和 `[keys]` 条目作为项目缺失项的回退。优先级：环境变量 > 项目 `.moye/agent.toml` > 全局 `config.toml` > 供应商默认。
 
 ---
 
@@ -349,7 +351,7 @@ Enter 发送任务 | /help 帮助 | Ctrl+C 退出                │   DeepSeek
 
 ---
 
-## 配置文件（agent.toml）
+## 配置文件（.moye/agent.toml）
 
 ```toml
 [provider]
@@ -477,7 +479,7 @@ mode = "auto"
 #   { id = "agents.auditor.permissions", config = { edit_file = "deny" } },
 # ]
 
-# 可选：全局 API key 存储（项目 .env / export 优先，缺失时回退此处）
+# 可选：全局 API key 存储（项目 .moye/.env / export 优先，缺失时回退此处）
 # [keys]
 # DEEPSEEK_API_KEY = "sk-xxx"
 # MOONSHOT_API_KEY = "sk-yyy"

@@ -76,10 +76,12 @@ fn revert(file: &str, backup: &str) {
     let _ = std::fs::remove_file(backup);
 }
 
-/// 判断变更是否为非 trivial：修改了 src/ 下的文件或 agent.toml。
-/// Whether a change is non-trivial: modified a file under src/ or agent.toml.
+/// 判断变更是否为非 trivial：修改了 src/ 下的文件或项目配置文件。
+/// Whether a change is non-trivial: modified a file under src/ or the project config.
 fn is_nontrivial(file: &str) -> bool {
-    file.starts_with("src/") || file == "agent.toml"
+    file.starts_with("src/")
+        || file == crate::config::PROJECT_CONFIG_PATH
+        || file == crate::config::LEGACY_CONFIG_PATH
 }
 
 /// 从文件路径推导 note slug（去扩展名，点替换为短横线）。

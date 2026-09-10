@@ -76,24 +76,34 @@ async fn main() -> Result<()> {
     }
 
     // 统一解析 agent.toml（仅此一处），各模块共享同一份配置。
-    // 若本地 agent.toml 和全局 config.toml 均不存在，启动首次配置向导。
+    // 若项目配置（.moye/agent.toml 或旧版根 agent.toml）和全局 config.toml 均不存在，
+    // 启动首次配置向导。
     // Parse agent.toml once here; all modules share this single config.
-    // If neither local agent.toml nor global config.toml exists, launch the setup wizard.
+    // If neither a project config (.moye/agent.toml or the legacy root agent.toml) nor
+    // the global config.toml exists, launch the setup wizard.
     if !crate::config::has_config_file() {
         crate::ui::setup::run_setup().await?;
     }
 
-    // 加载项目根 .env（若存在）：把供应商/API Key/模型等配置写进 .env 一次，
-    // 之后无需每次启动前 export。已显式 export 的环境变量优先，不会被覆盖。
+    // 旧版布局迁移：把仓库根的 agent.toml / .env 移入 .moye/（新路径已存在则跳过）。
+    // 必须在 .env 加载与 config::init 之前执行。
+    // Legacy-layout migration: move repo-root agent.toml / .env into .moye/ (skipped
+    // when the new path already exists). Must run before .env loading and config::init.
+    crate::config::migrate_legacy_config_files();
+
+    // 加载项目 .env（.moye/.env，旧布局时回退根 .env）：把供应商/API Key/模型等配置
+    // 写进 .env 一次，之后无需每次启动前 export。已显式 export 的环境变量优先，
+    // 不会被覆盖。
     // 必须在 setup 向导之后加载——向导会写入 .env，若在此前加载则进程环境里
-    // 拿不到刚配置的 API Key（例如 ARK_API_KEY），随后构建客户端会报"未设置"。
-    // Loads the project-root .env (if present): provider/API key/model config can be
-    // written to .env once, no need to export before every launch. Explicitly exported
-    // environment variables take precedence and are never overridden.
+    // 拿不到刚配置的 API Key（例如 ARK_API_KEY），随后构建客户端会报“未设置”。
+    // Loads the project .env (.moye/.env, falling back to the legacy root .env):
+    // provider/API key/model config can be written to .env once, no need to export
+    // before every launch. Explicitly exported environment variables take precedence
+    // and are never overridden.
     // Must run after the setup wizard — the wizard writes .env; loading earlier would
     // leave the just-configured API key (e.g. ARK_API_KEY) absent from the process env,
     // and the client would then report it as "not set".
-    let env_file = dotenvy::dotenv().ok();
+    let env_file = crate::config::load_dotenv();
 
     if let Some(path) = env_file {
         info!(
@@ -102,7 +112,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let config = crate::config::init("agent.toml")?;
+    let config = crate::config::init(crate::config::PROJECT_CONFIG_PATH)?;
 
     // `--dump-config`：打印 profile 叠加后的组合配置树到 stdout，然后退出。
     // 用于诊断"实际生效的配置是什么"（含 profile patch 的结果）。
@@ -125,7 +135,7 @@ async fn main() -> Result<()> {
     };
 
     if cli_args.iter().any(|a| a == "--dump-config") {
-        let raw = std::fs::read_to_string("agent.toml")?;
+        let raw = std::fs::read_to_string(crate::config::PROJECT_CONFIG_PATH)?;
         let dump = crate::cli::context::dump_config_to_string(&raw)?;
         println!("{dump}");
         return Ok(());
@@ -291,16 +301,20 @@ async fn scheduler_cli_entry(args: &[String]) -> Result<()> {
     // 心跳环境跑交互式配置向导没有意义，直接报错（错误进 heartbeat 日志）。
     // Running the interactive setup wizard from a heartbeat makes no sense;
     // fail instead (the error lands in the heartbeat log).
+    // 旧版布局迁移（与主入口一致）：心跳可能在旧布局目录中运行。
+    // Legacy-layout migration (same as the main entry): a heartbeat may run in a
+    // directory still using the old layout.
+    crate::config::migrate_legacy_config_files();
     if !crate::config::has_config_file() {
         anyhow::bail!(
-            "no agent.toml or global config found; run moye interactively once to set up"
+            "no .moye/agent.toml or global config found; run moye interactively once to set up"
         );
     }
     // 加载 .env：tick 派生的子进程（moye -p ...）通过环境继承 API Key。
     // Load .env: children spawned by the tick (moye -p ...) inherit API keys
     // from this process environment.
-    dotenvy::dotenv().ok();
-    let config = crate::config::init("agent.toml")?;
+    crate::config::load_dotenv();
+    let config = crate::config::init(crate::config::PROJECT_CONFIG_PATH)?;
 
     let paths = crate::scheduler::SchedulerPaths::from_config(&config.scheduler);
     let make_heartbeat = || crate::scheduler::os_cron::Heartbeat {

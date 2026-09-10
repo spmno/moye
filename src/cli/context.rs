@@ -411,7 +411,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn write_plan_to_config(plan: &str) -> std::io::Result<()> {
-    let path = "agent.toml";
+    let path = crate::config::PROJECT_CONFIG_PATH;
     let content = std::fs::read_to_string(path)?;
     let mut out = String::with_capacity(content.len() + 32);
     let mut in_provider = false;

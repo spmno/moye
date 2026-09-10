@@ -308,8 +308,8 @@ pub fn create_client_with(
     } else {
         provider.api_key_env()
     };
-    // 当前目录优先：env（项目 .env / export）→ 全局 config.toml [keys] 兜底。
-    // Current dir first: env (project .env / export) → global config.toml [keys] fallback.
+    // 当前目录优先：env（项目 .moye/.env / export）→ 全局 config.toml [keys] 兜底。
+    // Current dir first: env (project .moye/.env / export) → global config.toml [keys] fallback.
     let api_key = std::env::var(&api_key_env)
         .ok()
         .or_else(|| {
@@ -317,7 +317,7 @@ pub fn create_client_with(
                 .and_then(|c| c.keys.get(&api_key_env).cloned())
         })
         .ok_or_else(|| anyhow::anyhow!(
-            "{} \u{672a}\u{8bbe}\u{7f6e}\u{3002}\u{8bf7}\u{5728}\u{9879}\u{76ee}\u{6839}\u{76ee}\u{5f55}\u{7684} .env \u{4e2d}\u{914d}\u{7f6e}\u{ff08}\u{53c2}\u{8003} .env.example\u{ff09}\u{6216} export {}",
+            "{} \u{672a}\u{8bbe}\u{7f6e}\u{3002}\u{8bf7}\u{5728}\u{9879}\u{76ee} .moye/.env \u{4e2d}\u{914d}\u{7f6e}\u{ff08}\u{53c2}\u{8003} .env.example\u{ff09}\u{6216} export {}",
             api_key_env,
             api_key_env
         ))?;

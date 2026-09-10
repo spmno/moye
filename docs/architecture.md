@@ -45,7 +45,7 @@
 │  Provider · CompletionModel · PermissionGate · HitlHook      │
 ├─────────────────────────────────────────────────────────────┤
 │  Config & Storage Layer（配置与存储层）                        │
-│  agent.toml · JSONL/SQLite · memory/ · skills/ · logs/      │
+│ .moye/agent.toml · JSONL/SQLite · memory/ · skills/ · logs/ │
 └─────────────────────────────────────────────────────────────┘
 ```
 

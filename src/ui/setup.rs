@@ -437,7 +437,10 @@ fn write_config(state: &SetupState) -> Result<()> {
     };
 
     let content = config::render_agent_toml(provider.slug, model, base_url, api_key_env, plan_str);
-    std::fs::write("agent.toml", &content)?;
+    // 项目配置统一写入 .moye/ 目录（先确保目录存在）。
+    // Project config files are written under .moye/ (create the dir first).
+    std::fs::create_dir_all(config::PROJECT_CONFIG_DIR)?;
+    std::fs::write(config::PROJECT_CONFIG_PATH, &content)?;
 
     let mut env_lines = vec![format!("AGENT_PROVIDER={}", provider.slug)];
     if plan != ApiPlan::Standard && provider.slug != "custom" {
@@ -451,9 +454,9 @@ fn write_config(state: &SetupState) -> Result<()> {
     } else {
         env_lines.push(format!("{}={}", provider.api_key_env, state.api_key));
     }
-    std::fs::write(".env", env_lines.join("\n") + "\n")?;
+    std::fs::write(config::PROJECT_ENV_PATH, env_lines.join("\n") + "\n")?;
 
-    eprintln!("[setup] Configuration written: agent.toml + .env");
+    eprintln!("[setup] Configuration written: .moye/agent.toml + .moye/.env");
     eprintln!(
         "[setup] Provider: {} | Plan: {} | Model: {}",
         provider.label,
@@ -527,7 +530,7 @@ fn draw(f: &mut Frame, state: &mut SetupState) {
                     )),
                     Line::from(""),
                     Line::from(Span::styled(
-                        "The key will be stored in .env (git-ignored).",
+                        "The key will be stored in .moye/.env (git-ignored).",
                         theme::selector_dim(),
                     )),
                     Line::from(""),

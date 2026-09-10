@@ -52,9 +52,9 @@ pub struct Config {
     #[serde(default)]
     pub profile: ProfileSection,
     /// 全局 API key 存储：`[keys]` section，键为环境变量名（如 `DEEPSEEK_API_KEY`），
-    /// 值为 key 本身。当前目录 `.env`/export 优先，缺失时回退此处。
+    /// 值为 key 本身。当前目录 `.moye/.env`/export 优先，缺失时回退此处。
     /// Global API key store: `[keys]` section, keyed by env var name (e.g. `DEEPSEEK_API_KEY`),
-    /// valued as the key itself. The project `.env`/export takes priority; this is the fallback.
+    /// valued as the key itself. The project `.moye/.env`/export takes priority; this is the fallback.
     #[serde(default)]
     pub keys: HashMap<String, String>,
     /// MCP 服务器配置：`[mcp.<name>]` 小节，每个小节定义一个 MCP 服务器连接。
@@ -510,16 +510,99 @@ fn default_verify_timeout_secs() -> u64 {
 
 static CONFIG: OnceLock<Arc<Config>> = OnceLock::new();
 
-/// 启动时调用一次：加载项目 `agent.toml`，再用全局 `~/.config/moye/config.toml`
+// ── 项目配置文件路径 ─────────────────────────────────────────────────────
+// 项目级配置文件统一放在当前目录的 `.moye/` 下，与全局配置目录
+// `~/.config/moye/` 对称，便于统一管理；`.moye/` 整体在 .gitignore 中，
+// 一条规则即可覆盖所有本地配置与密钥。
+// Project-level config files live under `.moye/` in the current directory,
+// mirroring the global `~/.config/moye/` directory. `.moye/` is git-ignored
+// as a whole, so one rule covers every local config file and secret.
+
+/// 项目级配置目录：本地配置文件（agent.toml / .env）统一放在此目录下。
+/// Project config directory: local config files (agent.toml / .env) live here.
+pub const PROJECT_CONFIG_DIR: &str = ".moye";
+/// 项目级配置文件路径（`.moye/agent.toml`）。
+/// Project config file path (`.moye/agent.toml`).
+pub const PROJECT_CONFIG_PATH: &str = ".moye/agent.toml";
+/// 项目级环境变量文件路径（`.moye/.env`）。
+/// Project env-file path (`.moye/.env`).
+pub const PROJECT_ENV_PATH: &str = ".moye/.env";
+/// 旧版布局：仓库根的 `agent.toml`。仅用于自动迁移与存在性检测。
+/// Legacy layout: repo-root `agent.toml`. Only used for auto-migration and checks.
+pub const LEGACY_CONFIG_PATH: &str = "agent.toml";
+/// 旧版布局：仓库根的 `.env`。仅用于自动迁移与存在性检测。
+/// Legacy layout: repo-root `.env`. Only used for auto-migration and checks.
+pub const LEGACY_ENV_PATH: &str = ".env";
+
+/// 把旧版布局（仓库根的 `agent.toml` / `.env`）迁移到 `.moye/` 下。
+/// 新路径已存在时不动旧文件（新布局优先）。启动早期调用一次。
+/// Migrate the legacy layout (repo-root `agent.toml` / `.env`) into `.moye/`.
+/// When the new path already exists the legacy file is left untouched (the new
+/// layout wins). Call once early at startup.
+pub fn migrate_legacy_config_files() {
+    migrate_legacy_file(LEGACY_CONFIG_PATH, PROJECT_CONFIG_PATH);
+    migrate_legacy_file(LEGACY_ENV_PATH, PROJECT_ENV_PATH);
+}
+
+fn migrate_legacy_file(legacy: &str, new: &str) {
+    let legacy_p = std::path::Path::new(legacy);
+    let new_p = std::path::Path::new(new);
+    if !legacy_p.exists() || new_p.exists() {
+        return;
+    }
+    if let Some(parent) = new_p.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        eprintln!("[config] 创建 {PROJECT_CONFIG_DIR}/ 失败: {e}；跳过迁移 {legacy}");
+        return;
+    }
+    match std::fs::rename(legacy_p, new_p) {
+        Ok(()) => eprintln!("[config] 已迁移 {legacy} → {new}"),
+        Err(_) => {
+            // rename 失败（如跨设备）时退回复制 + 删除，保留文件权限。
+            // Fall back to copy + remove when rename fails (e.g. cross-device);
+            // fs::copy preserves file permissions.
+            match std::fs::copy(legacy_p, new_p) {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(legacy_p);
+                    eprintln!("[config] 已迁移 {legacy} → {new}");
+                }
+                Err(e) => {
+                    eprintln!("[config] 迁移 {legacy} → {new} 失败: {e}（保留原文件）")
+                }
+            }
+        }
+    }
+}
+
+/// 加载项目 `.env` 到进程环境：优先 `.moye/.env`，不存在时回退仓库根 `.env`
+/// （旧布局，未被迁移时的兜底）。已显式 export 的环境变量优先，不会被覆盖
+/// （dotenvy 语义）。返回实际加载的文件路径；两者都不存在时返回 None。
+/// Load the project `.env` into the process environment: prefers `.moye/.env`,
+/// falls back to the repo-root `.env` (legacy layout). Explicitly exported
+/// variables take precedence and are never overridden (dotenvy semantics).
+/// Returns the loaded path, or None when neither file exists.
+pub fn load_dotenv() -> Option<PathBuf> {
+    let new = std::path::Path::new(PROJECT_ENV_PATH);
+    if new.exists() {
+        // from_path 返回 Result<()>，成功时手动返回路径。
+        // from_path returns Result<()>; return the path manually on success.
+        dotenvy::from_path(new).ok().map(|_| new.to_path_buf())
+    } else {
+        dotenvy::dotenv().ok()
+    }
+}
+
+/// 启动时调用一次：加载项目 `.moye/agent.toml`，再用全局 `~/.config/moye/config.toml`
 /// 作为 fallback 填充项目中缺失的 `[provider]` 字段，最后缓存并返回共享 Arc。
-/// 合并优先级：环境变量 > 项目 agent.toml > 全局 config.toml > 供应商默认。
-/// Call once at startup: loads the project `agent.toml`, then fills in any missing
+/// 合并优先级：环境变量 > 项目 .moye/agent.toml > 全局 config.toml > 供应商默认。
+/// Call once at startup: loads the project `.moye/agent.toml`, then fills in any missing
 /// `[provider]` fields from the global `~/.config/moye/config.toml` as a fallback,
 /// before caching and returning the shared Arc.
-/// Precedence: env vars > project agent.toml > global config.toml > provider default.
+/// Precedence: env vars > project .moye/agent.toml > global config.toml > provider default.
 ///
-/// 如果 `agent.toml` 不存在，先从全局配置 + 默认模板自动生成一个，再继续加载。
-/// If `agent.toml` doesn't exist, auto-generate one from the global config + default
+/// 如果 `.moye/agent.toml` 不存在，先从全局配置 + 默认模板自动生成一个，再继续加载。
+/// If `.moye/agent.toml` doesn't exist, auto-generate one from the global config + default
 /// template first, then proceed to load it.
 pub fn init(path: &str) -> anyhow::Result<Arc<Config>> {
     // agent.toml 不存在时，从全局配置自动生成一个（含全部小节 + 合理默认值）。
@@ -541,12 +624,14 @@ pub fn init(path: &str) -> anyhow::Result<Arc<Config>> {
     Ok(CONFIG.get_or_init(|| cfg).clone())
 }
 
-/// 检查本地 `agent.toml` 或全局 `~/.config/moye/config.toml` 是否存在。
-/// 任一存在即跳过 setup 向导。
-/// Checks if a local `agent.toml` or global `~/.config/moye/config.toml` exists.
+/// 检查项目配置（`.moye/agent.toml`，或旧版根目录 `agent.toml`）或全局
+/// `~/.config/moye/config.toml` 是否存在。任一存在即跳过 setup 向导。
+/// Checks if a project config (`.moye/agent.toml`, or the legacy repo-root
+/// `agent.toml`) or the global `~/.config/moye/config.toml` exists.
 /// Either being present skips the setup wizard.
 pub fn has_config_file() -> bool {
-    std::path::Path::new("agent.toml").exists()
+    std::path::Path::new(PROJECT_CONFIG_PATH).exists()
+        || std::path::Path::new(LEGACY_CONFIG_PATH).exists()
         || global_config_path().map(|p| p.exists()).unwrap_or(false)
 }
 
@@ -625,9 +710,9 @@ pub fn default_model_for_provider_plan(provider: &str, plan: &str) -> &'static s
     }
 }
 
-/// 当项目根目录没有 `agent.toml` 时，从全局配置 `~/.config/moye/config.toml`
+/// 当项目 `.moye/agent.toml` 不存在时，从全局配置 `~/.config/moye/config.toml`
 /// 的 `[provider]` 信息 + 合理默认值自动生成一个完整的 `agent.toml`。
-/// When the project root has no `agent.toml`, auto-generate a complete one from
+/// When the project `.moye/agent.toml` doesn't exist, auto-generate a complete one from
 /// the global config's `[provider]` info + sensible defaults.
 ///
 /// 生成的文件包含全部小节（provider / agent / context / agents.* / memory /
@@ -677,6 +762,16 @@ fn generate_agent_toml(path: &str) -> anyhow::Result<()> {
         api_key_env.as_deref(),
         plan.as_deref(),
     );
+    // 目标路径带子目录（如 `.moye/agent.toml`）时先创建目录；
+    // 裸文件名（父目录为空，测试用例常见）跳过。
+    // Create the parent dir when the target path has one (e.g. `.moye/agent.toml`);
+    // skip for bare filenames (empty parent, common in tests).
+    if let Some(parent) = std::path::Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::write(path, &content)?;
     eprintln!(
         "[config] agent.toml 不存在，已从全局配置自动生成: {path}\n\
@@ -708,8 +803,8 @@ pub(crate) fn render_agent_toml(
     format!(
         r#"# Agent 运行配置（首次配置向导生成）。
 # Generated by first-time setup wizard.
-# 可按需修改各参数。agent.toml 已在 .gitignore 中，不会被提交。
-# Edit as needed. agent.toml is git-ignored and won't be committed.
+# 可按需修改各参数。.moye/ 目录已在 .gitignore 中，不会被提交。
+# Edit as needed. The whole .moye/ directory is git-ignored and won't be committed.
 
 [provider]
 {provider_section}
@@ -821,12 +916,12 @@ pub fn config() -> Option<&'static Config> {
 
 // ── persist_authorized_dir ─────────────────────────────────────────────────
 
-/// 将一个授权目录持久化到 `agent.toml` 的 `[sandbox].authorized_dirs` 数组。
+/// 将一个授权目录持久化到 `.moye/agent.toml` 的 `[sandbox].authorized_dirs` 数组。
 /// 持久化采用字符串级编辑——不通过 toml crate 重新序列化，保留文件中的注释和格式。
 ///
 /// 此函数仅影响**未来会话**的配置加载；当前会话的授权已在 agent_loop 中通过
 /// `sandbox.authorize_tool` 完成。不热加载——运行中的配置不变。
-/// Persist an authorized directory to `agent.toml`'s `[sandbox].authorized_dirs`.
+/// Persist an authorized directory to `.moye/agent.toml`'s `[sandbox].authorized_dirs`.
 /// Uses string-level editing — no toml re-serialization, preserving comments and
 /// formatting elsewhere in the file.
 ///
@@ -834,7 +929,7 @@ pub fn config() -> Option<&'static Config> {
 /// authorization was already applied via `sandbox.authorize_tool` in agent_loop.
 /// No hot-reload — the running config is unchanged.
 pub fn persist_authorized_dir(dir: &str) -> anyhow::Result<()> {
-    persist_authorized_dir_to(dir, "agent.toml")
+    persist_authorized_dir_to(dir, PROJECT_CONFIG_PATH)
 }
 
 /// 可测试变体：写入显式路径的配置文件。

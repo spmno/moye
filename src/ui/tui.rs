@@ -2787,20 +2787,21 @@ fn finalize_switch(
     }
     if api_key.is_some() {
         state.push_event(AgentEvent::Info(format!(
-            "API key 已保存到 .env（{api_key_env}），本次会话已生效。"
+            "API key 已保存到 .moye/.env（{api_key_env}），本次会话已生效。"
         )));
     } else if std::env::var(api_key_env).is_err() {
         state.push_event(AgentEvent::Info(format!(
-            "⚠ 未检测到 {api_key_env}。请在项目根 .env 中添加 `{api_key_env}=<你的 key>` 后重启 moye。"
+            "⚠ 未检测到 {api_key_env}。请在项目 .moye/.env 中添加 `{api_key_env}=<你的 key>` 后重启 moye。"
         )));
     }
 }
 
-/// 把 API key 写入项目根 `.env`：更新或新增 `<KEY_ENV>=<key>` 行，不触碰其他行。
-/// Writes the API key to the project-root `.env`: updates or adds the `<KEY_ENV>=<key>`
+/// 把 API key 写入项目 `.moye/.env`：更新或新增 `<KEY_ENV>=<key>` 行，不触碰其他行。
+/// Writes the API key to the project `.moye/.env`: updates or adds the `<KEY_ENV>=<key>`
 /// line, leaving every other line untouched.
 fn persist_key_to_env(key_env: &str, key: &str) -> std::io::Result<()> {
-    let path = ".env";
+    let path = crate::config::PROJECT_ENV_PATH;
+    std::fs::create_dir_all(crate::config::PROJECT_CONFIG_DIR)?;
     let existing = std::fs::read_to_string(path).unwrap_or_default();
     let mut out = String::new();
     let mut written = false;
@@ -2823,16 +2824,17 @@ fn persist_key_to_env(key_env: &str, key: &str) -> std::io::Result<()> {
     std::fs::write(path, out)
 }
 
-/// 把切换结果写入项目根 `.env`：更新 AGENT_PROVIDER / AGENT_PLAN / AGENT_BASE_URL 行，
+/// 把切换结果写入项目 `.moye/.env`：更新 AGENT_PROVIDER / AGENT_PLAN / AGENT_BASE_URL 行，
 /// 不触碰任何 API key 行。文件不存在时创建。
-/// Persists the switch to the project-root `.env`: updates AGENT_PROVIDER /
+/// Persists the switch to the project `.moye/.env`: updates AGENT_PROVIDER /
 /// AGENT_PLAN / AGENT_BASE_URL lines, never touches API-key lines. Creates the file if missing.
 fn persist_switch_to_env(
     provider: &str,
     plan: crate::providers::ApiPlan,
     base_url: Option<&str>,
 ) -> std::io::Result<()> {
-    let path = ".env";
+    let path = crate::config::PROJECT_ENV_PATH;
+    std::fs::create_dir_all(crate::config::PROJECT_CONFIG_DIR)?;
     let existing = std::fs::read_to_string(path).unwrap_or_default();
     let mut keys: Vec<(&str, Option<String>)> = vec![("AGENT_PROVIDER", Some(provider.to_string()))];
     let plan_val = if provider != "custom" && plan != crate::providers::ApiPlan::Standard {

@@ -61,7 +61,7 @@ moye
 │       ├── prompt_evolve.rs  # Prompt evolution
 │       ├── self_modify.rs    # Code self-modification (compile verification + rollback)
 │       └── tool_ext.rs       # Tool extension (scaffold generation)
-├── agent.toml           # Runtime config (provider / model / permissions / memory / sandbox / profile)
+├── .moye/               # Project config (agent.toml + .env, git-ignored as a whole)
 ├── AGENTS.md            # System prompt (main agent)
 ├── prompts/             # Role prompts (investigator / planner / builder / auditor)
 ├── docs/                # Documentation (architecture / context management / CrewAI comparison)
@@ -124,18 +124,20 @@ Set `AGENT_PROVIDER` to select a provider. API keys are read from provider-speci
 
 ### Recommended: `.env` file
 
-The program auto-loads a `.env` file from the project root at startup (if present), so you configure once and every launch picks it up. No manual export needed. Explicitly exported variables take precedence and are never overridden.
+The program auto-loads `.moye/.env` at startup (if present), so you configure once and every launch picks it up. No manual export needed. Explicitly exported variables take precedence and are never overridden.
 
 ```bash
 # First-time setup: copy the template and fill in your key
-cp .env.example .env
-# Edit .env: set AGENT_PROVIDER and the corresponding API Key
+mkdir -p .moye && cp .env.example .moye/.env
+# Edit .moye/.env: set AGENT_PROVIDER and the corresponding API Key
 # Available providers: deepseek / bailian / moonshot / volcengine / custom
 
 cargo run   # Auto-loaded on every subsequent launch
 ```
 
-`.env` is gitignored; secrets never enter git.
+`.moye/` is gitignored as a whole; secrets never enter git.
+
+> **Migration**: project config files live under `.moye/` (`agent.toml` and `.env`). If you still have a legacy repo-root `agent.toml` or `.env`, the program moves it into `.moye/` automatically at startup (skipped when the new path already exists).
 
 ### DeepSeek (Default)
 
@@ -146,7 +148,7 @@ export DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxx
 cargo run
 ```
 
-or configure in `.env`:
+or configure in `.moye/.env`:
 
 ```bash
 AGENT_PROVIDER=deepseek
@@ -244,7 +246,7 @@ cargo run
 
 ### Global Config Fallback
 
-In addition to the project-root `agent.toml`, the program also reads `~/.config/moye/config.toml` at startup (if present), using its `[provider]` fields and `[keys]` entries as fallback for anything missing in the project config. Precedence: env vars > project `agent.toml` > global `config.toml` > provider defaults.
+In addition to the project `.moye/agent.toml`, the program also reads `~/.config/moye/config.toml` at startup (if present), using its `[provider]` fields and `[keys]` entries as fallback for anything missing in the project config. Precedence: env vars > project `.moye/agent.toml` > global `config.toml` > provider defaults.
 
 ---
 
@@ -349,7 +351,7 @@ Type a task for the Agent to complete. It will plan and execute autonomously. St
 
 ---
 
-## Configuration (agent.toml)
+## Configuration (.moye/agent.toml)
 
 ```toml
 [provider]
@@ -477,7 +479,7 @@ rule_escalation_threshold = 3
 #   { id = "agents.auditor.permissions", config = { edit_file = "deny" } },
 # ]
 
-# Optional: global API key store (project .env / export takes priority; fallback here)
+# Optional: global API key store (project .moye/.env / export takes priority; fallback here)
 # [keys]
 # DEEPSEEK_API_KEY = "sk-xxx"
 # MOONSHOT_API_KEY = "sk-yyy"

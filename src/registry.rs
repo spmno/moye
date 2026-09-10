@@ -1010,8 +1010,8 @@ async fn classify_with_llm(
 
     let preamble = "你是一个意图分类器。根据用户当前消息（结合最近的对话上下文）判断意图，只回复一个英文词：\n\
                     - implement: 要求修改、创建、删除代码或文件\n\
-                    - investigate: 要求查看、分析、理解代码\n\
-                    - chat: 聊天、问答、闲聊\n\
+                    - investigate: 需要跨多个文件系统性探索代码库才能回答的复杂问题\n\
+                    - chat: 聊天、问答、闲聊；包括用一两条只读命令或常识就能回答的简单事实问题\n\
                     只回复一个词，不要任何解释。";
 
     let history_ctx = recent_history_text(history, 10);

@@ -4,7 +4,7 @@
 // All providers use the OpenAI-compatible interface; Bailian, Moonshot Kimi, and Volcengine Ark connect via custom base URLs.
 use anyhow::Result;
 pub use rig_core::providers::openai;
-use tracing::info;
+use tracing::{info, warn};
 
 /// 全应用统一使用的 HTTP 客户端类型（带可选的原始 HTTP 跟踪，见 http_trace 模块）。
 /// The HTTP client type used app-wide (with optional raw HTTP tracing, see the http_trace module).
@@ -109,17 +109,46 @@ impl Provider {
     }
 
     /// 解析当前套餐：AGENT_PLAN 环境变量优先，其次 agent.toml 的
-    /// `[provider].plan`；均缺失时默认 Standard。
+    /// `[provider].plan`；均缺失时默认 Standard。最后按当前生效供应商校验：
+    /// 供应商不支持该套餐（如 DeepSeek 仅有按量付费）时回退 Standard。
     /// Resolves the active plan: AGENT_PLAN env var wins, then
-    /// `[provider].plan` from agent.toml; defaults to Standard.
+    /// `[provider].plan` from agent.toml; defaults to Standard. The result is then
+    /// validated against the active provider: an unsupported plan (e.g. Agent Plan
+    /// on DeepSeek, which is Standard-only) falls back to Standard.
     pub fn plan_from_env() -> ApiPlan {
-        if let Ok(raw) = std::env::var("AGENT_PLAN") {
-            return ApiPlan::parse(&raw);
+        let provider = Provider::from_env();
+        let plan = if let Ok(raw) = std::env::var("AGENT_PLAN") {
+            ApiPlan::parse(&raw)
+        } else if let Some(raw) = crate::config::config().and_then(|c| c.provider.plan.clone()) {
+            ApiPlan::parse(&raw)
+        } else {
+            ApiPlan::Standard
+        };
+        // 典型场景：`.moye/.env` 的 AGENT_PROVIDER 覆盖了 agent.toml 的 provider，
+        // 而 agent.toml 仍残留旧供应商的 `plan = "agent"`。若不校验，DeepSeek、
+        // OpenAI 等仅支持按量付费的供应商会被解析成 "Agent Plan"，侧栏 / 日志
+        // 误报 `plan=agent`，且会挑到与 key 不匹配的套餐端点。
+        // Typical case: the AGENT_PROVIDER in `.moye/.env` overrides agent.toml's
+        // provider while a stale `plan = "agent"` from the previous provider remains.
+        // Without this check, Standard-only providers (e.g. DeepSeek, OpenAI) would
+        // be reported as "Agent Plan" and would pick a mismatched plan endpoint/key.
+        Self::clamp_plan(provider, plan)
+    }
+
+    /// 把请求的套餐收敛到供应商实际支持的套餐；不支持时回退 Standard。
+    /// Tighten a requested plan to one the provider actually supports; falls back
+    /// to Standard when the provider has no such plan.
+    pub fn clamp_plan(provider: Provider, plan: ApiPlan) -> ApiPlan {
+        if provider.supported_plans().contains(&plan) {
+            plan
+        } else {
+            warn!(
+                "[provider] {:?} 不支持套餐 '{}'，回退按量付费 / unsupported plan, falling back to standard",
+                provider,
+                plan.slug(),
+            );
+            ApiPlan::Standard
         }
-        if let Some(raw) = crate::config::config().and_then(|c| c.provider.plan.clone()) {
-            return ApiPlan::parse(&raw);
-        }
-        ApiPlan::Standard
     }
 
     /// 给定套餐对应的 base URL。Standard 使用厂商默认；Coding/Agent 使用套餐专属端点。
@@ -414,11 +443,14 @@ pub fn is_reasoning_model(model: &str) -> bool {
     // GLM 系列（glm-latest, glm-4.7, glm-5, glm-5.2 等）支持 thinking 模式
     // GLM series supports thinking mode
     lower.contains("glm-")
-        // DeepSeek V4 系列（deepseek-v4-pro / deepseek-v4-flash）thinking 默认开启，
+        // DeepSeek V4 系列（deepseek-v4-pro / deepseek-flash）thinking 默认开启，
         // 输出 `reasoning_content` 字段，属于推理模型。
+        // 旧 slug `deepseek-v4-flash` 保留兼容。
         // DeepSeek V4 series (pro/flash) has thinking enabled by default and
         // emits `reasoning_content`, so it is a reasoning model.
+        // The legacy `deepseek-v4-flash` slug is kept for compatibility.
         || lower.starts_with("deepseek-v4")
+        || lower.starts_with("deepseek-flash")
         // OpenAI o 系列（o1, o3, o4）/ OpenAI o-series
         || lower.starts_with("o1") || lower.starts_with("o3") || lower.starts_with("o4")
         // GPT-5+ 系列 / GPT-5+ series
@@ -475,8 +507,8 @@ pub fn provider_models_for_plan(provider: Provider, plan: ApiPlan) -> Vec<ModelI
                 desc: "DeepSeek V4 Pro · 尝鲜版，1M 上下文",
             },
             ModelInfo {
-                slug: "deepseek-v4-flash".into(),
-                desc: "DeepSeek V4 Flash · 快速，1M 上下文",
+                slug: "deepseek-flash".into(),
+                desc: "DeepSeek Flash · 快速，1M 上下文",
             },
             ModelInfo {
                 slug: "kimi-k3".into(),
@@ -633,8 +665,8 @@ pub fn provider_models_for_plan(provider: Provider, plan: ApiPlan) -> Vec<ModelI
                 desc: "DeepSeek V4 Pro · 旗舰推理，1M 上下文",
             },
             ModelInfo {
-                slug: "deepseek-v4-flash".into(),
-                desc: "DeepSeek V4 Flash · 快速经济，1M 上下文",
+                slug: "deepseek-flash".into(),
+                desc: "DeepSeek Flash · 快速经济，1M 上下文",
             },
         ],
         (Provider::OpenAI, _) => vec![
@@ -731,9 +763,13 @@ pub fn context_limit_for_model(model: &str) -> usize {
     if lower.contains("kimi") {
         return 256_000;
     }
-    // DeepSeek V4 系列支持 1M 上下文窗口。
-    // DeepSeek V4 series supports a 1M context window.
-    if lower.contains("deepseek-v4-pro") || lower.contains("deepseek-v4-flash") {
+    // DeepSeek V4 系列（deepseek-v4-pro / deepseek-flash，含旧 slug）支持 1M 上下文窗口。
+    // DeepSeek V4 series (deepseek-v4-pro / deepseek-flash, incl. legacy slug)
+    // supports a 1M context window.
+    if lower.contains("deepseek-v4-pro")
+        || lower.contains("deepseek-flash")
+        || lower.contains("deepseek-v4-flash")
+    {
         return 1_000_000;
     }
     if lower.contains("deepseek") {
@@ -790,6 +826,45 @@ pub fn context_limit_for_model(model: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_plan_rejects_unsupported_plan() {
+        // DeepSeek 仅有按量付费：残留的 Agent/Coding 套餐必须回退 Standard。
+        // DeepSeek is Standard-only: a stale Agent/Coding plan must fall back to Standard.
+        assert_eq!(
+            Provider::clamp_plan(Provider::DeepSeek, ApiPlan::Agent),
+            ApiPlan::Standard
+        );
+        assert_eq!(
+            Provider::clamp_plan(Provider::DeepSeek, ApiPlan::Coding),
+            ApiPlan::Standard
+        );
+        assert_eq!(
+            Provider::clamp_plan(Provider::OpenAI, ApiPlan::Agent),
+            ApiPlan::Standard
+        );
+    }
+
+    #[test]
+    fn clamp_plan_keeps_supported_plan() {
+        // 支持的套餐原样保留 / A supported plan is preserved.
+        assert_eq!(
+            Provider::clamp_plan(Provider::Volcengine, ApiPlan::Agent),
+            ApiPlan::Agent
+        );
+        assert_eq!(
+            Provider::clamp_plan(Provider::Volcengine, ApiPlan::Coding),
+            ApiPlan::Coding
+        );
+        assert_eq!(
+            Provider::clamp_plan(Provider::Moonshot, ApiPlan::Coding),
+            ApiPlan::Coding
+        );
+        assert_eq!(
+            Provider::clamp_plan(Provider::DeepSeek, ApiPlan::Standard),
+            ApiPlan::Standard
+        );
+    }
 
     #[test]
     fn deepseek_provider_context_limit() {
@@ -857,6 +932,9 @@ mod tests {
     #[test]
     fn context_limit_for_deepseek_v4_model() {
         assert_eq!(context_limit_for_model("deepseek-v4-pro"), 1_000_000);
+        assert_eq!(context_limit_for_model("deepseek-flash"), 1_000_000);
+        // 旧 slug 仍识别为 1M 上下文。
+        // The legacy slug still resolves to a 1M context window.
         assert_eq!(context_limit_for_model("deepseek-v4-flash"), 1_000_000);
     }
 
@@ -931,7 +1009,7 @@ mod tests {
         let models = provider_models_for_plan(Provider::DeepSeek, ApiPlan::Standard);
         let slugs: Vec<_> = models.iter().map(|model| model.slug.as_str()).collect();
 
-        assert_eq!(slugs, ["deepseek-v4-pro", "deepseek-v4-flash"],);
+        assert_eq!(slugs, ["deepseek-v4-pro", "deepseek-flash"],);
     }
 
     #[test]
@@ -973,6 +1051,9 @@ mod tests {
         // DeepSeek V4 series (pro/flash) has thinking enabled by default and emits
         // reasoning_content, so it is a reasoning model.
         assert!(is_reasoning_model("deepseek-v4-pro"));
+        assert!(is_reasoning_model("deepseek-flash"));
+        // 旧 slug 仍识别为推理模型。
+        // The legacy slug is still detected as a reasoning model.
         assert!(is_reasoning_model("deepseek-v4-flash"));
         assert!(is_reasoning_model("DEEPSEEK-V4-PRO"));
         assert!(is_reasoning_model("o1-mini"));

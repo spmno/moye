@@ -153,7 +153,7 @@ mod tests {
                 ..Default::default()
             },
             SelectorItem {
-                label: "deepseek-v4-flash".into(),
+                label: "deepseek-flash".into(),
                 detail: "快速".into(),
                 ..Default::default()
             },
@@ -208,7 +208,7 @@ mod tests {
         let mut s = SelectorState::new("t".into(), models(), true);
         s.move_cursor(1);
         let sel = s.selection().unwrap();
-        assert_eq!(sel.label, "deepseek-v4-flash");
+        assert_eq!(sel.label, "deepseek-flash");
     }
 
     #[test]

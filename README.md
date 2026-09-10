@@ -159,7 +159,7 @@ DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxx
 |------|-----|
 | Env Var | `DEEPSEEK_API_KEY` |
 | Base URL | `https://api.deepseek.com/v1` |
-| Model ID | `deepseek-v4-pro` / `deepseek-v4-flash` |
+| Model ID | `deepseek-v4-pro` / `deepseek-flash` |
 
 Get API Key: https://platform.deepseek.com/api_keys
 
@@ -366,7 +366,7 @@ provider = "deepseek"
 
 [agent]
 # Default model (must match provider)
-# DeepSeek: deepseek-v4-pro / deepseek-v4-flash
+# DeepSeek: deepseek-v4-pro / deepseek-flash
 # Bailian:  kimi/kimi-k3 / qwen-plus / qwen-max
 # Moonshot: kimi-k3 / kimi-k2.7-code-highspeed
 # Volcengine: doubao-1-5-pro-256k / doubao-1-5-lite-32k / deepseek-r1-250120
@@ -475,7 +475,7 @@ rule_escalation_threshold = 3
 # [profile.fast]
 # name = "fast"
 # patches = [
-#   { id = "agent", config = { default_model = "deepseek-v4-flash", max_turns = 5 } },
+#   { id = "agent", config = { default_model = "deepseek-flash", max_turns = 5 } },
 #   { id = "agents.auditor.permissions", config = { edit_file = "deny" } },
 # ]
 
@@ -614,7 +614,7 @@ active = "fast"
 [profile.fast]
 name = "fast"
 patches = [
-  { id = "agent", config = { default_model = "deepseek-v4-flash", max_turns = 5 } },
+  { id = "agent", config = { default_model = "deepseek-flash", max_turns = 5 } },
   { id = "sandbox", config = { mode = "landlock", authorized_dirs = [] } },
 ]
 

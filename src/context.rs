@@ -70,12 +70,12 @@ pub struct ContextConfig {
 
     /// SSE 流式空闲超时（秒）：两个 SSE 事件之间允许的最大间隔。
     /// 超过此间隔无数据时视为连接断开，触发自动重试。
-    /// 推理模型（glm / deepseek-v4 / doubao-seed 等）思考阶段可能长时间不产出事件，
+    /// 推理模型（glm / deepseek / doubao-seed 等）思考阶段可能长时间不产出事件，
     /// 120 秒过短会导致误判断连；300 秒（5 分钟）是更安全的默认值。
     /// 设为 0 可禁用空闲超时（不推荐——真正的断连将无法被检测）。
     /// SSE stream idle timeout (seconds): max gap between two SSE events.
     /// When no data arrives within this interval the connection is treated as
-    /// dropped and auto-retry kicks in. Reasoning models (glm / deepseek-v4 /
+    /// dropped and auto-retry kicks in. Reasoning models (glm / deepseek /
     /// doubao-seed etc.) may go silent for minutes during thinking; 120s is too
     /// short and causes false-positive disconnects. 300s (5 min) is a safer default.
     /// Set to 0 to disable the idle timeout (not recommended — real drops go undetected).

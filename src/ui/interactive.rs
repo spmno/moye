@@ -65,7 +65,7 @@ impl InteractiveState {
                 // signals and job control work within the PTY.
                 let _ = libc::setsid();
                 // Acquire the slave as the controlling terminal.
-                let _ = libc::ioctl(slave_raw, libc::TIOCSCTTY, 0i32);
+                let _ = libc::ioctl(slave_raw, libc::TIOCSCTTY as libc::c_ulong, 0i32);
                 // Redirect stdin/stdout/stderr → slave.
                 if libc::dup2(slave_raw, 0) < 0 {
                     return Err(io::Error::last_os_error());
@@ -124,7 +124,7 @@ impl InteractiveState {
                 break;
             } else {
                 // n < 0: EAGAIN/EWOULDBLOCK → no more data right now.
-                let errno = unsafe { *libc::__errno_location() };
+                let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
                     break;
                 }
@@ -199,7 +199,7 @@ impl InteractiveState {
                 )
             };
             if n < 0 {
-                let errno = unsafe { *libc::__errno_location() };
+                let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 if errno == libc::EINTR {
                     continue;
                 }
@@ -238,8 +238,8 @@ fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     };
     if ret != 0 {

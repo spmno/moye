@@ -3,6 +3,7 @@
 // clipboard copy, text selection.
 pub mod clipboard;
 pub mod diff;
+pub mod interactive;
 pub mod markdown;
 pub mod selection;
 pub mod selector;

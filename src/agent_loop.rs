@@ -540,6 +540,7 @@ impl ContextHook {
     async fn handle_completion_call(
         &self,
         history: &[Message],
+        prompt: &Message,
         _turn: usize,
     ) -> CompletionCallAction {
         // todo 11: fire-and-forget AgentRequest 事件（空注册表为 no-op）。
@@ -561,7 +562,12 @@ impl ContextHook {
             history
         };
         if let Some(hc) = &self.history_capture {
-            *hc.lock().unwrap() = history.to_vec();
+            // 补上当前 prompt（工具循环里就是上一轮的 tool 结果）。rig 的
+            // CompletionCall.history 不含当前 prompt，只捕获它会得到一条以未应答
+            // assistant tool_call 结尾的历史，重新注入新 runner 时被 400 拒绝。
+            let mut full = history.to_vec();
+            full.push(prompt.clone());
+            *hc.lock().unwrap() = full;
         }
         if let Some(tc) = &self.turn_capture {
             *tc.lock().unwrap() = _turn;
@@ -772,7 +778,8 @@ impl AgentHook for ContextHook {
         _ctx: &HookContext,
         event: CompletionCall<'_>,
     ) -> CompletionCallAction {
-        self.handle_completion_call(event.history, event.turn).await
+        self.handle_completion_call(event.history, event.prompt, event.turn)
+            .await
     }
 
     async fn on_model_turn_finished(
@@ -1176,7 +1183,9 @@ async fn run_autonomous_inner(
             task_ctx.clone(),
             todo_ctx.clone(),
         )?;
-        let prior_history = captured_history.lock().unwrap().clone();
+        let prior_history = crate::context::repair_orphan_tool_calls(
+            captured_history.lock().unwrap().clone(),
+        );
         let mut runner = agent
             .runner(&prompt)
             .max_turns(max_turns_remaining)
@@ -1886,20 +1895,60 @@ mod tests {
         .with_history_capture(history_arc.clone(), turn_arc.clone());
 
         let history = vec![Message::user("hello"), Message::assistant("hi there")];
+        let prompt = Message::user("latest tool result");
 
         // When: handle_completion_call runs at turn 2 with this history.
-        let action = hook.handle_completion_call(&history, 2).await;
+        let action = hook.handle_completion_call(&history, &prompt, 2).await;
 
-        // Then: the shared Arcs capture the history and turn verbatim, and a
+        // Then: the shared Arcs capture history + prompt and the turn, and a
         // small history yields Continue (no compaction, no turn reminder).
         let captured = history_arc.lock().unwrap().clone();
-        assert_eq!(captured.len(), 2);
+        assert_eq!(captured.len(), 3);
         assert!(matches!(captured[0], Message::User { .. }));
         assert!(matches!(captured[1], Message::Assistant { .. }));
+        assert_eq!(captured[2], prompt);
         assert_eq!(*turn_arc.lock().unwrap(), 2);
         assert!(
             matches!(action, CompletionCallAction::Continue),
             "small history must not trigger compaction or a turn reminder"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_hook_captures_prompt_so_history_has_no_orphan_tool_call() {
+        // rig's CompletionCall.history excludes the current prompt; in the tool
+        // loop that prompt is the latest tool result. Capturing only `history`
+        // yields a transcript ending in an unanswered assistant tool_call, which
+        // providers reject when the history is re-seeded. The hook must capture
+        // history + prompt so the transcript stays complete.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let history_arc: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
+        let turn_arc: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let hook = ContextHook::new(
+            128_000,
+            ContextConfig::default(),
+            dummy_client(),
+            "test-model".to_string(),
+            tx,
+            30,
+            Arc::new(crate::events::WaterfallRegistry::new()),
+        )
+        .with_history_capture(history_arc.clone(), turn_arc.clone());
+
+        let history = vec![
+            Message::user("goal"),
+            assistant_tool_call_msg(serde_json::json!({"command": "ls"})),
+        ];
+        let prompt = Message::tool_result("call_1", "output");
+
+        let _ = hook.handle_completion_call(&history, &prompt, 2).await;
+
+        let captured = history_arc.lock().unwrap().clone();
+        assert_eq!(captured.len(), 3, "capture must include the prompt");
+        assert_eq!(
+            crate::context::repair_orphan_tool_calls(captured.clone()),
+            captured,
+            "captured history must be orphan-free"
         );
     }
 
@@ -1935,7 +1984,9 @@ mod tests {
         .with_history_capture(history_arc.clone(), turn_arc.clone());
 
         let history = vec![Message::user("hello")];
-        let _ = hook.handle_completion_call(&history, 1).await;
+        let _ = hook
+            .handle_completion_call(&history, &Message::user("prompt"), 1)
+            .await;
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,

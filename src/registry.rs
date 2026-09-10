@@ -1498,6 +1498,7 @@ impl Orchestrator {
     /// Replaces the current history with a resumed session's conversation, so the
     /// new session inherits prior context (`--continue`).
     pub fn seed_history(&self, messages: Vec<Message>) {
+        let messages = crate::context::repair_orphan_tool_calls(messages);
         let mut history = self.history.lock().unwrap();
         *history = messages;
         info!(

@@ -713,6 +713,119 @@ fn find_turn_starts(history: &[Message]) -> Vec<usize> {
     starts
 }
 
+// ─── 孤儿工具调用修复 ─────────────────────────────────────────────────────────
+// ─── Orphaned Tool-Call Repair ───────────────────────────────────────────────
+
+/// 为缺少对应 tool 结果的孤儿 `tool_calls` 补一条占位 tool 结果。
+///
+/// OpenAI 兼容供应商（含 DeepSeek / vLLM）要求 assistant `tool_calls` 后必须紧跟
+/// 匹配的 tool 消息，否则请求 400。rig 的 `CompletionCall.history` 只含当前 prompt
+/// 之前的历史，而工具循环里当前 prompt 正是上一轮的 tool 结果，所以捕获下来的
+/// 历史会以未应答的 assistant tool_call 结尾；把它重新注入新 runner（重试 / 新任务
+/// / SDD 子代理 / --continue）即触发 400。无孤儿时原样返回。
+pub fn repair_orphan_tool_calls(history: Vec<Message>) -> Vec<Message> {
+    if !has_orphan_tool_calls(&history) {
+        return history;
+    }
+    let mut out: Vec<Message> = Vec::with_capacity(history.len() + 1);
+    let mut pending: Vec<String> = Vec::new();
+    for msg in history {
+        match &msg {
+            Message::Assistant { content, .. } => {
+                // 新一轮 assistant 开始 → 上一轮未应答的调用到此为止。
+                push_synthetic_tool_results(&mut out, &mut pending);
+                for item in content.iter() {
+                    if let AssistantContent::ToolCall(tc) = item {
+                        pending.push(tc.id.clone());
+                    }
+                }
+                out.push(msg);
+            }
+            Message::User { content } => {
+                for item in content.iter() {
+                    if let UserContent::ToolResult(tr) = item {
+                        remove_pending(&mut pending, tr);
+                    }
+                }
+                out.push(msg);
+            }
+            Message::System { .. } => {
+                push_synthetic_tool_results(&mut out, &mut pending);
+                out.push(msg);
+            }
+        }
+    }
+    push_synthetic_tool_results(&mut out, &mut pending);
+    out
+}
+
+fn has_orphan_tool_calls(history: &[Message]) -> bool {
+    let mut pending: Vec<&str> = Vec::new();
+    for msg in history {
+        match msg {
+            Message::Assistant { content, .. } => {
+                if !pending.is_empty() {
+                    return true;
+                }
+                for item in content.iter() {
+                    if let AssistantContent::ToolCall(tc) = item {
+                        pending.push(tc.id.as_str());
+                    }
+                }
+            }
+            Message::User { content } => {
+                for item in content.iter() {
+                    if let UserContent::ToolResult(tr) = item {
+                        let matched = [Some(tr.id.as_str()), tr.call_id.as_deref()]
+                            .into_iter()
+                            .flatten()
+                            .find_map(|id| pending.iter().position(|p| *p == id));
+                        if let Some(pos) = matched {
+                            pending.remove(pos);
+                        }
+                    }
+                }
+            }
+            Message::System { .. } => {
+                if !pending.is_empty() {
+                    return true;
+                }
+            }
+        }
+    }
+    !pending.is_empty()
+}
+
+fn remove_pending(pending: &mut Vec<String>, tr: &ToolResult) {
+    let matched = [Some(tr.id.as_str()), tr.call_id.as_deref()]
+        .into_iter()
+        .flatten()
+        .find_map(|id| pending.iter().position(|p| p.as_str() == id));
+    if let Some(pos) = matched {
+        pending.remove(pos);
+    }
+}
+
+fn push_synthetic_tool_results(out: &mut Vec<Message>, pending: &mut Vec<String>) {
+    if pending.is_empty() {
+        return;
+    }
+    let items: Vec<UserContent> = pending
+        .drain(..)
+        .map(|id| {
+            UserContent::ToolResult(ToolResult {
+                id,
+                call_id: None,
+                content: OneOrMany::one(ToolResultContent::text(
+                    "[tool result unavailable — the previous turn was interrupted before this tool ran]",
+                )),
+            })
+        })
+        .collect();
+    let content = OneOrMany::many(items).expect("non-empty: pending tool calls exist");
+    out.push(Message::User { content });
+}
+
 // ─── 截断工具 ─────────────────────────────────────────────────────────────────
 // ─── Truncation Utilities ───────────────────────────────────────────────────────
 
@@ -1085,5 +1198,89 @@ microcompact_protected_results = 5
         let cfg: ContextConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.max_output_tokens, 0);
         assert_eq!(cfg.keep_recent_turns, 2);
+    }
+
+    // ── repair_orphan_tool_calls ──
+
+    fn assistant_tool_call(id: &str) -> Message {
+        Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::tool_call(
+                id.to_string(),
+                "run_bash".to_string(),
+                serde_json::json!({"command": "ls"}),
+            )),
+        }
+    }
+
+    fn tool_result_ids(msg: &Message) -> Vec<String> {
+        match msg {
+            Message::User { content } => content
+                .iter()
+                .filter_map(|c| match c {
+                    UserContent::ToolResult(tr) => Some(tr.id.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn repair_appends_result_for_trailing_orphan() {
+        let history = vec![Message::user("goal"), assistant_tool_call("call_1")];
+        let repaired = repair_orphan_tool_calls(history);
+        assert_eq!(repaired.len(), 3);
+        assert_eq!(tool_result_ids(&repaired[2]), vec!["call_1".to_string()]);
+    }
+
+    #[test]
+    fn repair_leaves_complete_history_unchanged() {
+        let history = vec![
+            Message::user("goal"),
+            assistant_tool_call("call_1"),
+            Message::tool_result("call_1", "output"),
+        ];
+        assert_eq!(repair_orphan_tool_calls(history.clone()), history);
+    }
+
+    #[test]
+    fn repair_fills_only_missing_parallel_result() {
+        let history = vec![
+            Message::user("goal"),
+            Message::Assistant {
+                id: None,
+                content: OneOrMany::many(vec![
+                    AssistantContent::tool_call(
+                        "c1".to_string(),
+                        "a".to_string(),
+                        serde_json::json!({}),
+                    ),
+                    AssistantContent::tool_call(
+                        "c2".to_string(),
+                        "b".to_string(),
+                        serde_json::json!({}),
+                    ),
+                ])
+                .expect("two tool calls"),
+            },
+            Message::tool_result("c1", "r1"),
+        ];
+        let repaired = repair_orphan_tool_calls(history);
+        assert_eq!(repaired.len(), 4);
+        assert_eq!(tool_result_ids(&repaired[3]), vec!["c2".to_string()]);
+    }
+
+    #[test]
+    fn repair_inserts_result_before_next_assistant() {
+        let history = vec![
+            Message::user("goal"),
+            assistant_tool_call("c1"),
+            Message::assistant("next turn"),
+        ];
+        let repaired = repair_orphan_tool_calls(history);
+        assert_eq!(repaired.len(), 4);
+        assert_eq!(tool_result_ids(&repaired[2]), vec!["c1".to_string()]);
+        assert!(matches!(repaired[3], Message::Assistant { .. }));
     }
 }

@@ -106,9 +106,11 @@ pub enum AgentEvent {
         responder: oneshot::Sender<HitlDecision>,
         allow_always: bool,
     },
-    /// 暂停 TUI 以运行交互式命令（如 sudo），完成后恢复 TUI 并返回输出。
-    /// Suspend the TUI to run an interactive command (e.g., sudo), resume after completion
-    /// and return the captured stdout+stderr to the agent loop.
+    /// 在 TUI 内嵌入 PTY 运行交互式命令（如 sudo），输出实时渲染在 TUI 面板中，
+    /// 完成后返回输出给 agent loop。不再离开备用屏幕。
+    /// Run an interactive command (e.g., sudo) in an embedded PTY within the
+    /// TUI. Output is rendered live in a TUI panel; the alternate screen is
+    /// never left. Returns the accumulated output to the agent loop on finish.
     SuspendTui {
         command: String,
         responder: oneshot::Sender<String>,

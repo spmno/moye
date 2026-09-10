@@ -29,6 +29,7 @@ use crate::cli::context::AppContext;
 use crate::cli::repl::ReplCommand;
 use crate::event::{AgentEvent, EventReceiver, EventSender, HitlDecision, TodoItem, TodoStatus};
 use crate::ui::clipboard;
+use crate::ui::interactive::InteractiveState;
 use crate::ui::selection::Selection;
 use crate::ui::selector::{SelectorItem, SelectorState};
 use crate::ui::{diff, markdown, theme};
@@ -541,6 +542,10 @@ struct TuiState {
     thinking: bool,
     spinner: usize,
     hitl: Option<HitlState>,
+    /// 内嵌交互式终端（PTY）。非 None 时键盘输入转发到 PTY，输出渲染为全屏面板。
+    /// In-TUI interactive terminal (PTY). When Some, keyboard input is forwarded
+    /// to the PTY and output is rendered as a full-screen panel.
+    interactive: Option<InteractiveState>,
     scroll_offset: u16,
     /// 用户是否手动上翻了消息区。为 true 时，新事件不会自动跳到底部。
     /// Whether the user has manually scrolled up the message area. When true, new events do NOT auto-jump to the bottom.
@@ -690,6 +695,7 @@ impl TuiState {
             thinking: false,
             spinner: 0,
             hitl: None,
+            interactive: None,
             scroll_offset: 0,
             user_scrolled: false,
             should_quit: false,
@@ -1388,6 +1394,27 @@ async fn run_loop(
                 if state.spinner != before {
                     state.dirty = true;
                 }
+                // 轮询内嵌交互式终端：排空 PTY 输出 + 检查子进程退出。
+                // Poll in-TUI interactive terminal: drain PTY output + check exit.
+                if state.interactive.is_some() {
+                    let interactive = state.interactive.as_mut().unwrap();
+                    let new_data = interactive.poll_output();
+                    let exited = interactive.check_exit();
+                    if new_data || exited {
+                        state.dirty = true;
+                    }
+                    if exited {
+                        let output = std::mem::take(&mut interactive.output);
+                        let code = interactive.exit_code.unwrap_or(-1);
+                        if let Some(resp) = interactive.responder.take() {
+                            let _ = resp.send(format!("exit={code}\n{output}"));
+                        }
+                        state.interactive = None;
+                        state.push_event(AgentEvent::Info(format!(
+                            "\u{2705} \u{4ea4}\u{4e92}\u{5f0f}\u{547d}\u{4ee4}\u{5b8c}\u{6210} (exit={code}) / interactive command finished"
+                        )));
+                    }
+                }
             }
             _ = &mut ctrl_c => {
                 state.should_quit = true;
@@ -1427,6 +1454,32 @@ fn handle_key_event(
     ctx: &Arc<AppContext>,
     action_tx: &EventSender,
 ) {
+    // Interactive terminal mode: forward all keystrokes to the PTY.
+    // Esc kills the child and returns to normal TUI mode.
+    // 交互式终端模式：所有按键转发到 PTY。Esc 中止命令并返回正常 TUI 模式。
+    if state.interactive.is_some() {
+        if key.code == KeyCode::Esc {
+            let interactive = state.interactive.as_mut().unwrap();
+            interactive.kill();
+            let output = std::mem::take(&mut interactive.output);
+            let code = interactive.exit_code.unwrap_or(-1);
+            if let Some(resp) = interactive.responder.take() {
+                let _ = resp.send(format!("exit={code}\n{output}"));
+            }
+            state.interactive = None;
+            state.push_event(AgentEvent::Info(
+                "\u{23f9} \u{4ea4}\u{4e92}\u{5f0f}\u{547d}\u{4ee4}\u{5df2}\u{4e2d}\u{65ad} / interactive command aborted".into(),
+            ));
+            return;
+        }
+        let bytes = crate::ui::interactive::key_to_bytes(key);
+        if !bytes.is_empty() {
+            if let Some(interactive) = state.interactive.as_mut() {
+                interactive.write_input(&bytes);
+            }
+        }
+        return;
+    }
     if state.hitl.is_some() {
         let allow_always = state.hitl.as_ref().map_or(false, |h| h.allow_always);
         match key.code {
@@ -2973,48 +3026,29 @@ fn handle_action(event: AgentEvent, state: &mut TuiState) {
             }
         }
         AgentEvent::SuspendTui { command, responder } => {
-            let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
-            let _ = disable_raw_mode();
-
-            println!("\n--- \u{4ea4}\u{4e92}\u{5f0f}\u{547d}\u{4ee4} / Interactive command ---");
-            println!("$ {}\n", command);
-
-            let out = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&command)
-                .output();
-
-            let output = match out {
-                Ok(out) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let msg = format!(
-                        "exit={}\nstdout:\n{}\nstderr:\n{}",
-                        out.status.code().unwrap_or(-1),
-                        stdout,
-                        stderr
-                    );
-                    println!("\n{}", msg);
-                    msg
+            // In-TUI interactive terminal: spawn the command in a PTY and
+            // render output inside the TUI. No alternate-screen
+            // leave/restore, no raw-mode toggle — the user stays in the TUI
+            // the entire time. Keyboard input is forwarded to the PTY;
+            // output is polled in the tick handler and rendered by
+            // draw_interactive.
+            // TUI 内交互式终端：在 PTY 中运行命令并在 TUI 内渲染输出。
+            // 不离开备用屏幕、不切换 raw mode——用户始终留在 TUI 中。
+            // 键盘输入转发到 PTY；输出在 tick 中轮询并由 draw_interactive 渲染。
+            match InteractiveState::spawn(&command) {
+                Ok(mut interactive) => {
+                    interactive.responder = Some(responder);
+                    state.interactive = Some(interactive);
+                    state.push_event(AgentEvent::Info(format!(
+                        "\u{1f501} \u{4ea4}\u{4e92}\u{5f0f}\u{7ec8}\u{7aef} / interactive terminal: {command}"
+                    )));
                 }
                 Err(e) => {
-                    let msg = format!("Error: {}", e);
-                    println!("\n{}", msg);
-                    msg
+                    let msg = format!("Failed to spawn interactive terminal: {e}");
+                    state.push_event(AgentEvent::Info(msg.clone()));
+                    let _ = responder.send(msg);
                 }
-            };
-
-            println!(
-                "\n--- \u{6309} Enter \u{8fd4}\u{56de} TUI / Press Enter to return to TUI ---"
-            );
-            let mut input = String::new();
-            let _ = std::io::stdin().read_line(&mut input);
-
-            let _ = enable_raw_mode();
-            let _ = execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture);
-
-            state.needs_full_redraw = true;
-            let _ = responder.send(output);
+            }
         }
         AgentEvent::AgentStarted => {
             state.thinking = true;
@@ -3267,7 +3301,86 @@ fn wrap_tail_lines(
     (lines_rev, truncated)
 }
 
+/// Full-screen interactive terminal overlay. Renders PTY output with
+/// auto-scroll-to-bottom and a status bar.
+/// 全屏交互式终端覆盖层。渲染 PTY 输出，自动滚到底部，底部状态栏。
+fn draw_interactive(f: &mut Frame, state: &mut TuiState) {
+    let area = f.area();
+    let interactive = match state.interactive.as_ref() {
+        Some(i) => i,
+        None => return,
+    };
+
+    f.render_widget(Clear, area);
+
+    // Truncate long commands for the title bar.
+    let max_title = area.width.saturating_sub(4) as usize;
+    let cmd_display = if interactive.command.len() > max_title {
+        format!("{}…", &interactive.command[..max_title.saturating_sub(1)])
+    } else {
+        interactive.command.clone()
+    };
+    let title = format!(" \u{1f4bb} {cmd_display} ");
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_alignment(Alignment::Left)
+        .border_style(theme::border_user())
+        .style(theme::bg_base());
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Split inner into output area + 1-line status bar.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    // ── Output area ──
+    let lines: Vec<Line> = if interactive.output.is_empty() {
+        vec![Line::from(
+            "\u{23f3} \u{7b49}\u{5f85}\u{8f93}\u{51fa}… / waiting for output…"
+        )
+        .style(theme::meta_info())]
+    } else {
+        interactive
+            .output
+            .lines()
+            .map(|l| Line::from(l.to_string()))
+            .collect()
+    };
+
+    let visible_h = chunks[0].height as usize;
+    let total = lines.len();
+    let scroll = total.saturating_sub(visible_h) as u16;
+
+    f.render_widget(
+        Paragraph::new(lines).style(theme::bg_base()).scroll((scroll, 0)),
+        chunks[0],
+    );
+
+    // ── Status bar ──
+    let status_text = if let Some(code) = interactive.exit_code {
+        format!(" exit={code} \u{2014} Esc \u{8fd4}\u{56de} / Esc to return ")
+    } else {
+        "\u{270f}\u{fe0f} \u{8f93}\u{5165}\u{4ea4}\u{4e92} \u{00b7} Esc \u{4e2d}\u{65ad} \u{00b7} Ctrl+C SIGINT / type to interact \u{00b7} Esc to abort \u{00b7} Ctrl+C sends SIGINT".to_string()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(status_text).style(theme::meta_info()))
+            .style(theme::bg_base()),
+        chunks[1],
+    );
+}
+
 fn draw(f: &mut Frame, state: &mut TuiState) {
+    // Interactive terminal overlay: takes over the full screen.
+    // 交互式终端覆盖层：占据全屏。
+    if state.interactive.is_some() {
+        draw_interactive(f, state);
+        return;
+    }
     let area = f.area();
 
     let h_chunks = Layout::default()

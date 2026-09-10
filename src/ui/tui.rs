@@ -4275,7 +4275,7 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &mut TuiState) {
 
 fn hitl_hint(allow_always: bool) -> &'static str {
     if allow_always {
-        "[y] \u{5141}\u{8bb8}\u{4e00}\u{6b21}  [n] \u{62d2}\u{7edd}  [a] \u{603b}\u{662f}\u{6388}\u{6743}"
+        "[y] \u{5141}\u{8bb8}\u{4e00}\u{6b21}  [n] \u{62d2}\u{7edd}  [a] \u{603b}\u{662f}\u{6388}\u{6743}\u{6b64}\u{76ee}\u{5f55}"
     } else {
         "[y] \u{5141}\u{8bb8}  [n] \u{62d2}\u{7edd}"
     }

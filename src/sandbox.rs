@@ -459,7 +459,10 @@ impl SimpleSandbox {
             return;
         }
         let resolved = self.resolve_path(dir);
-        let canon = self.canonicalize_safe(&resolved);
+        // 与 is_within_sandbox 一致：词法规范化后入库，保证含 .. 的路径也能匹配。
+        // Mirror is_within_sandbox: store lexically normalized so paths with ..
+        // still match.
+        let canon = lexical_normalize(&self.canonicalize_safe(&resolved));
         self.authorized.lock().unwrap().insert(canon);
         self.auth_version.fetch_add(1, Ordering::Relaxed);
     }
@@ -549,10 +552,59 @@ impl SimpleSandbox {
     fn authorize_path(&self, path: &str) {
         let resolved = self.resolve_path(path);
         if let Some(parent) = resolved.parent() {
-            let canon = self.canonicalize_safe(parent);
+            let canon = lexical_normalize(&self.canonicalize_safe(parent));
             self.authorized.lock().unwrap().insert(canon);
             self.auth_version.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// 收集该工具调用涉及的、当前仍在沙箱外的所有路径的父目录（去重，保持顺序）。
+    /// 用于 [a] 总是授权时把**所有**越界目录持久化到配置——而不是只持久化
+    /// 第一个，避免重启后其他目录再次弹窗。
+    /// 注意：必须在 `authorize_tool` 之前调用，授权后这些路径已通过检查，返回为空。
+    /// Collects the deduplicated parent directories of all paths in this tool call
+    /// that are still outside the sandbox (order preserved). Used to persist EVERY
+    /// offending directory on "always authorize" — not just the first — so the
+    /// others don't prompt again after a restart.
+    /// Note: must be called BEFORE `authorize_tool`; afterwards the paths pass the
+    /// check and nothing is collected.
+    pub fn outside_parent_dirs(&self, tool_name: &str, args: &str) -> Vec<String> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<String> = Vec::new();
+        match tool_name {
+            "read_file" | "edit_file" | "write_file" | "run_file" => {
+                if let Some(p) = parsed.get("path").and_then(|v| v.as_str()) {
+                    paths.push(p.to_string());
+                }
+            }
+            "run_bash" => {
+                if let Some(c) = parsed.get("command").and_then(|v| v.as_str()) {
+                    paths.extend(extract_paths_from_command(c));
+                }
+            }
+            _ => {}
+        }
+        let mut dirs: Vec<String> = Vec::new();
+        for p in paths {
+            if self.check_path(&p).is_err() {
+                // 与 extract_dir_from_sandbox_err 一致：取父目录。
+                // Mirrors extract_dir_from_sandbox_err: take the parent directory.
+                let expanded = expand_tilde(&p);
+                let dir = Path::new(&expanded)
+                    .parent()
+                    .map(|d| d.to_string_lossy().to_string())
+                    .unwrap_or(expanded);
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+        dirs
     }
 
     /// 将路径解析为绝对路径（相对于项目根目录）。
@@ -571,20 +623,20 @@ impl SimpleSandbox {
     /// Checks whether a path is within the sandbox (under root or an authorized directory).
     fn is_within_sandbox(&self, path: &Path) -> bool {
         let canon = self.canonicalize_safe(path);
-        // 规范化失败时（canon == path），原始路径可能仍含 .. 组件，
-        // starts_with 会因字面前缀匹配而误判为沙箱内。
-        // 保守处理：规范化失败且路径含 .. 时视为逃逸。
-        // When canonicalization fails (canon == path), the raw path may still
-        // contain .. components, and starts_with gives a false positive because
-        // the literal prefix matches before .. is resolved. Conservative fix:
-        // treat unresolved .. as an escape attempt.
-        if canon.as_path() == path
-            && path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return false;
-        }
+        // canonicalize 失败时（目标尚不存在）canon 可能仍含 `.`/`..` 组件。
+        // 之前在这里对含 .. 的路径直接 return false（防止 starts_with 被字面前缀
+        // 欺骗），但它放在授权检查之前——导致这类路径的“总是授权”永远无效，
+        // 用户被无限重复弹窗。现在改为词法规范化（纯字面消除 . / ..，不访问
+        // 文件系统）后再比较：规范化后 .. 已消除，字面前缀欺骗不成立，安全语义
+        // 不变（`/root/sub/../../etc` → `/etc`，仍被正确拒绝）。
+        // When canonicalization fails (target doesn't exist yet), canon may still
+        // contain `.`/`..`. Previously such paths were rejected outright BEFORE the
+        // authorized-dirs check (to prevent literal-prefix spoofing) — which made
+        // "always authorize" useless for them, re-prompting forever. Now we
+        // lexically normalize (syntactic elimination of . / .., no fs access) first;
+        // after normalization no prefix spoofing is possible, so the security
+        // semantics are unchanged (`/root/sub/../../etc` → `/etc`, still rejected).
+        let canon = lexical_normalize(&canon);
         // 项目根目录及其子目录
         // Project root and its subdirectories
         if canon.starts_with(&self.root) {
@@ -680,6 +732,32 @@ pub fn expand_tilde(path: &str) -> String {
         return format!("{home}/{rest}");
     }
     path.to_string()
+}
+
+/// 词法规范化路径：纯字面消除 `.` 与 `..` 组件，不访问文件系统。
+/// 根目录处的 `..` 被忽略（与大多数 shell 的语义一致）。
+/// 用于 canonicalize 失败（路径尚不存在）时的确定性比较：
+/// 规范化后 `..` 已消除，`starts_with` 前缀判断不会被字面前缀欺骗。
+/// Lexically normalize a path: eliminate `.` and `..` components purely
+/// syntactically, without touching the filesystem. `..` at the root is ignored
+/// (matching common shell semantics). Used for deterministic comparison when
+/// canonicalize fails (path doesn't exist yet): after normalization no `..`
+/// remains, so `starts_with` prefix checks can't be spoofed literally.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // 根目录处 pop 为 no-op（PathBuf::pop 对 "/" 返回 false 且不变）。
+                // pop() at the root is a no-op (returns false, path unchanged).
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// 从 bash 命令中提取所有路径类 token。
@@ -1238,6 +1316,75 @@ mod tests {
         // ../something 应解析到项目根目录之外
         // ../something should resolve outside the project root
         assert!(sb.check_path("../something").is_err());
+    }
+
+    /// 词法规范化：消除 . / ..，根处的 .. 被忽略，不访问文件系统。
+    /// Lexical normalization: eliminates . / ..; .. at root is ignored; no fs access.
+    #[test]
+    fn lexical_normalize_works() {
+        assert_eq!(
+            lexical_normalize(Path::new("/a/b/../../c")),
+            PathBuf::from("/c")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("/a/./b")),
+            PathBuf::from("/a/b")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("/../../etc/passwd")),
+            PathBuf::from("/etc/passwd")
+        );
+        // 无 .. 时原样返回（路径相等）
+        // Without .. the path is unchanged
+        assert_eq!(
+            lexical_normalize(Path::new("/a/b/c")),
+            PathBuf::from("/a/b/c")
+        );
+    }
+
+    /// 回归测试：含 .. 且目标不存在的越界路径，按 [a] 授权后必须不再被拒绝。
+    /// 修复前 is_within_sandbox 的 .. 逃逸规则在授权检查之前短路，授权永不生效，
+    /// 用户被同一目录无限重复弹窗。
+    /// Regression: an out-of-sandbox path with .. whose target doesn't exist must
+    /// be accepted after authorization. Before the fix, the .. escape rule
+    /// short-circuited before the authorized-dirs check, so authorization never
+    /// took effect and the same directory re-prompted forever.
+    #[test]
+    fn authorize_dotdot_path_sticks() {
+        let sb = Sandbox::new();
+        let p = "../definitely-not-existing-dir-moye-test/file.txt";
+        // 授权前被拒（逃逸到项目根之外）
+        // Rejected before authorization (escapes the project root)
+        assert!(sb.check_path(p).is_err());
+        sb.authorize_path(p);
+        // 授权后同一路径及其同目录兄弟文件都应通过
+        // After authorization the same path and siblings pass
+        assert!(sb.check_path(p).is_ok());
+        assert!(sb.check_path("../definitely-not-existing-dir-moye-test/other.txt").is_ok());
+    }
+
+    /// 授权 "/" 后，含 .. 的字面路径（规范化失败时）也应放行。
+    /// After authorizing "/", even .. paths that fail canonicalization are allowed.
+    #[test]
+    fn authorized_root_covers_dotdot_paths() {
+        let sb = Sandbox::new();
+        sb.authorize("/");
+        assert!(sb.check_path("/tmp/../../nonexistent-moye-test-xyz/file.txt").is_ok());
+    }
+
+    /// outside_parent_dirs 应收集所有越界父目录（去重），且跳过已授权路径。
+    /// outside_parent_dirs collects every out-of-sandbox parent dir (deduped),
+    /// skipping already-authorized paths.
+    #[test]
+    fn outside_parent_dirs_collects_all() {
+        let sb = Sandbox::new();
+        let args = serde_json::json!({"command": "cat /etc/a.conf /etc/b.conf && ls src/"}).to_string();
+        let dirs = sb.outside_parent_dirs("run_bash", &args);
+        assert_eq!(dirs, vec!["/etc".to_string()]);
+        // 授权后返回空
+        // Empty after authorization
+        sb.authorize_tool("run_bash", &args);
+        assert!(sb.outside_parent_dirs("run_bash", &args).is_empty());
     }
 
     /// bash 命令中的沙箱外路径应被检测。

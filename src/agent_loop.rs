@@ -268,21 +268,36 @@ impl AgentHook for HitlHook {
                         )));
                     }
                     HitlDecision::Always => {
+                        // 先收集本次调用涉及的全部越界父目录（authorize_tool 之后
+                        // 这些路径已通过检查，outside_parent_dirs 会返回空），
+                        // 逐个持久化——只持久化第一个会让其他目录重启后再次弹窗。
+                        // Collect all out-of-sandbox parent dirs BEFORE authorize_tool
+                        // (afterwards they pass the check and nothing collects), then
+                        // persist each — persisting only the first would re-prompt
+                        // for the others after a restart.
+                        let mut dirs = self.sandbox.outside_parent_dirs(tool_name, args);
+                        if dirs.is_empty() {
+                            dirs.push(extract_dir_from_sandbox_err(&sandbox_err));
+                        }
                         self.sandbox.authorize_tool(tool_name, args);
-                        let persist_dir = extract_dir_from_sandbox_err(&sandbox_err);
-                        match crate::config::persist_authorized_dir(&persist_dir) {
-                            Ok(()) => {
-                                let _ = self.tx.send(AgentEvent::Info(format!(
-                                    "  [\u{6c99}\u{7bb1}] \u{5df2}\u{6388}\u{6743}\u{5e76}\u{6301}\u{4e45}\u{5316}\u{76ee}\u{5f55}: {persist_dir}"
-                                )));
-                            }
-                            Err(e) => {
-                                warn!("Failed to persist authorized dir {persist_dir}: {e}");
-                                let _ = self.tx.send(AgentEvent::Info(format!(
-                                    "  [\u{6c99}\u{7bb1}] \u{5df2}\u{6388}\u{6743}\u{8bbf}\u{95ee}(\u{6301}\u{4e45}\u{5316}\u{5931}\u{8d25}): {persist_dir}"
-                                )));
+                        let mut failed: Vec<String> = Vec::new();
+                        for d in &dirs {
+                            if let Err(e) = crate::config::persist_authorized_dir(d) {
+                                warn!("Failed to persist authorized dir {d}: {e}");
+                                failed.push(d.clone());
                             }
                         }
+                        let joined = dirs.join(", ");
+                        let _ = self.tx.send(AgentEvent::Info(if failed.is_empty() {
+                            format!(
+                                "  [\u{6c99}\u{7bb1}] \u{5df2}\u{6388}\u{6743}\u{5e76}\u{6301}\u{4e45}\u{5316}\u{76ee}\u{5f55}: {joined}"
+                            )
+                        } else {
+                            format!(
+                                "  [\u{6c99}\u{7bb1}] \u{5df2}\u{6388}\u{6743}\u{8bbf}\u{95ee}\u{ff1b}\u{6301}\u{4e45}\u{5316}\u{5931}\u{8d25}: {} \u{ff08}\u{5df2}\u{6301}\u{4e45}\u{5316}: {joined}\u{ff09}",
+                                failed.join(", ")
+                            )
+                        }));
                     }
                     HitlDecision::Deny => {
                         let _ = self.tx.send(AgentEvent::Info(

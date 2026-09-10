@@ -1514,12 +1514,29 @@ impl Orchestrator {
         self.history.lock().unwrap().clone()
     }
 
+    /// 清空共享 todo 列表；若之前非空，发出空的 `TodoUpdate` 事件让 TUI
+    /// 侧边栏同步清空。在新任务开始时调用，避免上一个任务的清单残留。
+    /// Clears the shared todo list; if it was non-empty, emits an empty
+    /// `TodoUpdate` event so the TUI sidebar clears as well. Called at the
+    /// start of a new task so no stale checklist from the last task remains.
+    fn reset_todo_store(&self, tx: &EventSender) {
+        let mut store = self.todo_store.lock().unwrap();
+        if !store.is_empty() {
+            store.clear();
+            let _ = tx.send(crate::event::AgentEvent::TodoUpdate { todos: Vec::new() });
+        }
+    }
+
     pub async fn handle(&self, message: &str, tx: &EventSender) -> anyhow::Result<String> {
         // 开始一个新的任务：递增检查点计数器，使后续 EditFile/WriteFile 的
         // record() 调用能记录到正确的任务 ID 下。
         // Begin a new task: increment the checkpoint counter so subsequent
         // EditFile/WriteFile record() calls land under the correct task ID.
         self.checkpoints.begin_task();
+        // 新任务开始时清空上一个任务遗留的 todo 列表（含 TUI 侧边栏）。
+        // At the start of a new task, clear todos left over from the previous
+        // task (including the TUI sidebar).
+        self.reset_todo_store(tx);
         // 把 todo_store + 当前 tx 注入 registry，使后续 build() / build_runner_agent()
         // 构造的 TodoWrite 工具共享同一份 store 并能发出 TodoUpdate 事件。
         // Inject the todo_store + current tx into the registry so that subsequent
@@ -3233,6 +3250,51 @@ max_turns = 10
         assert!(
             registry.todo_ctx_for_role(Role::Auditor).is_none(),
             "Auditor must NOT get todo_write tool"
+        );
+    }
+
+    // ── todo 清空（新任务开始）tests ──
+
+    /// 新任务开始时，上一个任务遗留的 todo 必须被清空，且 TUI 收到空 TodoUpdate。
+    /// Starting a new task must clear todos left over from the previous task
+    /// and send an empty TodoUpdate to the TUI.
+    #[test]
+    fn new_task_clears_previous_todos() {
+        let registry = make_registry_with_todo_ctx();
+        let orch = Orchestrator::new(registry);
+        // 模拟上一个任务留下的清单 / simulate leftovers from the previous task.
+        orch.todo_store.lock().unwrap().push(crate::event::TodoItem {
+            id: "t1".into(),
+            content: "leftover".into(),
+            status: crate::event::TodoStatus::InProgress,
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        orch.reset_todo_store(&tx);
+        assert!(
+            orch.todo_store.lock().unwrap().is_empty(),
+            "todo store must be empty after reset"
+        );
+        match rx.try_recv() {
+            Ok(AgentEvent::TodoUpdate { todos }) => {
+                assert!(todos.is_empty(), "TUI must receive an empty todo list")
+            }
+            Ok(_) => panic!("expected TodoUpdate event, got a different AgentEvent"),
+            Err(e) => panic!("expected TodoUpdate event, but channel was empty: {e}"),
+        }
+    }
+
+    /// 列表本就为空时重复清空是幂等的，且不发多余事件。
+    /// Resetting an already-empty list is idempotent and emits no event.
+    #[test]
+    fn new_task_with_empty_todos_emits_no_event() {
+        let registry = make_registry_with_todo_ctx();
+        let orch = Orchestrator::new(registry);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        orch.reset_todo_store(&tx);
+        assert!(orch.todo_store.lock().unwrap().is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "no TodoUpdate expected when the store was already empty"
         );
     }
 

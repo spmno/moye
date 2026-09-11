@@ -2395,13 +2395,11 @@ pub struct ToolDeps {
 /// Tool bodies are unchanged — `call()` only gains a 300s timeout safety net (0 retries,
 /// avoiding double-execution of state-changing tools). The pre/post layer is handled
 /// independently by `HitlHook` (rig hook).
-pub fn add_builtin_tools<M>(
-    builder: rig_agent::agent::AgentBuilder<M, rig_agent::agent::NoToolConfig>,
+pub fn add_builtin_tools(
+    builder: rig_agent::agent::AgentBuilder<rig_agent::agent::NoToolConfig>,
     config: &crate::context::ContextConfig,
     deps: &ToolDeps,
-) -> rig_agent::agent::AgentBuilder<M, rig_agent::agent::WithBuilderTools>
-where
-    M: rig_core::completion::CompletionModel,
+) -> rig_agent::agent::AgentBuilder<rig_agent::agent::WithBuilderTools>
 {
     use pipeline::TimeoutRetryTool;
     let builder = builder

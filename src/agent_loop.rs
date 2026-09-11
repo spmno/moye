@@ -21,8 +21,6 @@ use rig_agent::agent::{
 use rig_agent::client::AgentClientExt;
 use rig_core::completion::message::{AssistantContent, ToolCall as MessageToolCall, ToolFunction};
 use rig_core::completion::{Message, Usage};
-use rig_core::OneOrMany;
-use crate::providers::CompletionModel as OpenAiModel;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
@@ -738,14 +736,9 @@ fn sanitize_history_tool_calls(history: &[Message]) -> (Vec<Message>, bool) {
                 return msg.clone();
             }
             changed = true;
-            match OneOrMany::many(items) {
-                Ok(content) => Message::Assistant {
-                    id: id.clone(),
-                    content,
-                },
-                // 原 content 非空，重建不会为空；保底返回原消息。
-                // Original content is non-empty so rebuild cannot be empty.
-                Err(_) => msg.clone(),
+            Message::Assistant {
+                id: id.clone(),
+                content: items,
             }
         })
         .collect();
@@ -1409,8 +1402,8 @@ pub fn is_context_overflow_error(e: &anyhow::Error) -> bool {
 /// When the model puts all content in the reasoning channel (content field is empty),
 /// 用累积的 reasoning 内容作为输出回退，避免下游收到空计划。
 /// the accumulated reasoning content is used as output fallback, avoiding empty plans downstream.
-pub async fn consume_stream<R>(
-    mut stream: StreamingResult<R>,
+pub async fn consume_stream(
+    mut stream: StreamingResult,
     hitl_waiting: Option<Arc<AtomicBool>>,
     idle_timeout: Duration,
     tx: &EventSender,
@@ -1562,7 +1555,7 @@ fn build_runner_agent_spec(
     spec: &crate::registry::AgentSpec,
     task_ctx: Option<crate::subagent::SubagentCtx>,
     todo_ctx: Option<crate::tools::TodoContext>,
-) -> anyhow::Result<Agent<OpenAiModel>> {
+) -> anyhow::Result<Agent> {
     let client = registry.create_client()?;
     // preamble：文件优先；内置角色有内嵌回退，自定义子代理无。
     // Preamble: file first; built-in roles have embedded fallback, custom don't.
@@ -1653,16 +1646,7 @@ mod tests {
     fn assistant_tool_call_msg(arguments: serde_json::Value) -> Message {
         Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(MessageToolCall {
-                id: "call_1".to_string(),
-                call_id: None,
-                function: ToolFunction {
-                    name: "read_file".to_string(),
-                    arguments,
-                },
-                signature: None,
-                additional_params: None,
-            })),
+            content: vec![AssistantContent::tool_call("call_1", "read_file", arguments)],
         }
     }
 
@@ -1939,7 +1923,7 @@ mod tests {
             Message::user("goal"),
             assistant_tool_call_msg(serde_json::json!({"command": "ls"})),
         ];
-        let prompt = Message::tool_result("call_1", "output");
+        let prompt = Message::tool_result("call_1", "tool", "output");
 
         let _ = hook.handle_completion_call(&history, &prompt, 2).await;
 

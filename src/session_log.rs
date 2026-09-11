@@ -9,9 +9,10 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use rig_core::OneOrMany;
 use rig_core::completion::Message;
-use rig_core::completion::message::AssistantContent;
+use rig_core::completion::message::{
+    AssistantContent, ProviderCallId, ToolCallId, ToolResultContent, UserContent,
+};
 use serde::{Deserialize, Serialize};
 
 /// 一个 model-visible / 元数据事件的不可变记录。追加即不可变（append-only）。
@@ -134,21 +135,26 @@ fn project_message(event: &SessionEvent) -> Option<Message> {
             arguments,
         } => Some(Message::Assistant {
             id: Some(id.clone()),
-            content: OneOrMany::one(AssistantContent::tool_call(
+            content: vec![AssistantContent::tool_call(
                 id.clone(),
                 name.clone(),
                 arguments.clone(),
-            )),
+            )],
         }),
         SessionEvent::ToolResult {
             id,
             call_id,
             content,
-        } => Some(Message::tool_result_with_call_id(
-            id.clone(),
-            call_id.clone(),
-            content.clone(),
-        )),
+        } => Some(Message::User {
+            // 旧日志未记录被执行工具的名字；0.42 的 ToolResult.name 必填，
+            // 用占位名——OpenAI 兼容 wire 只按 call id 关联，不读 name。
+            content: vec![UserContent::tool_result_for(
+                ToolCallId::new_or_mint(id.clone()),
+                call_id.clone().and_then(ProviderCallId::new),
+                "unknown",
+                vec![ToolResultContent::text(content.clone())],
+            )],
+        }),
         // 流式增量与请求级元数据不参与 history 重建。
         SessionEvent::AssistantChunk { .. }
         | SessionEvent::RequestHeader { .. }
@@ -255,14 +261,21 @@ mod tests {
             // Assistant message carrying the tool call; id mirrors the call id.
             Message::Assistant {
                 id: Some("c1".to_string()),
-                content: OneOrMany::one(AssistantContent::tool_call(
+                content: vec![AssistantContent::tool_call(
                     "c1",
                     "read_file",
                     serde_json::json!({"path":"x"}),
-                )),
+                )],
             },
             // User message carrying the tool result, correlated by call_id.
-            Message::tool_result_with_call_id("r1", Some("c1".to_string()), "file contents"),
+            Message::User {
+                content: vec![UserContent::tool_result_for(
+                    ToolCallId::new_or_mint("r1"),
+                    ProviderCallId::new("c1"),
+                    "unknown",
+                    vec![ToolResultContent::text("file contents")],
+                )],
+            },
             Message::assistant("done"),
         ];
         assert_eq!(log.derive_messages(), expected);

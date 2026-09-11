@@ -14,10 +14,6 @@ pub type HttpClient = crate::http_trace::TracingHttpClient;
 /// OpenAI-compatible CompletionsClient (H fixed to the tracing client).
 pub type CompletionsClient = openai::CompletionsClient<HttpClient>;
 
-/// OpenAI 兼容 CompletionModel（H 与 CompletionsClient 一致）。
-/// OpenAI-compatible CompletionModel (H matches CompletionsClient).
-pub type CompletionModel = openai::CompletionModel<HttpClient>;
-
 /// 供应商类型。
 /// Provider type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -473,7 +469,7 @@ pub fn is_reasoning_model(model: &str) -> bool {
 
 /// 对话型 Agent 别名：基于 OpenAI CompletionModel 的 rig Agent（兼容所有供应商）。
 /// Chat Agent alias: a rig Agent based on OpenAI CompletionModel (compatible with all providers).
-pub type ChatAgent = rig_agent::agent::Agent<CompletionModel>;
+pub type ChatAgent = rig_agent::agent::Agent;
 
 /// 模型目录条目：slug + 面向用户的中文说明。
 /// Model catalog entry: slug + user-facing Chinese description.

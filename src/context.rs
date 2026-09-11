@@ -15,7 +15,6 @@
 // 5. truncate_lines / truncate_at_char_boundary — 工具输出截断。
 //    truncate_lines / truncate_at_char_boundary — tool output truncation.
 
-use rig_core::OneOrMany;
 use rig_core::completion::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
 use rig_core::completion::{Message, Usage};
 use serde::Deserialize;
@@ -287,8 +286,8 @@ pub fn extract_text(msg: &Message) -> String {
                             match rc {
                                 ReasoningContent::Text { text, .. } => parts.push(text.clone()),
                                 ReasoningContent::Summary(s) => parts.push(s.clone()),
+                                // rig 0.42 移除了 #[non_exhaustive]，变体集已穷尽。
                                 ReasoningContent::Encrypted(_) | ReasoningContent::Redacted { .. } => {}
-                            _ => {}
                             }
                         }
                     }
@@ -499,7 +498,7 @@ pub fn microcompact(history: &[Message], protected_results: usize) -> Vec<Messag
             for item in content.iter() {
                 if let AssistantContent::ToolCall(tc) = item {
                     tool_call_info.insert(
-                        tc.id.clone(),
+                        tc.id.as_str().to_string(),
                         (tc.function.name.clone(), tc.function.arguments.to_string()),
                     );
                 }
@@ -559,9 +558,11 @@ pub fn microcompact(history: &[Message], protected_results: usize) -> Vec<Messag
                             // 查找对应的 ToolCall 获取工具名和参数。
                             // Find matching ToolCall for tool name and args.
                             let (tool_name, tool_args) = tool_call_info
-                                .get(&tr.id)
+                                .get(tr.call.as_str())
                                 .or_else(|| {
-                                    tr.call_id.as_ref().and_then(|cid| tool_call_info.get(cid))
+                                    tr.provider
+                                        .as_ref()
+                                        .and_then(|p| tool_call_info.get(p.call_id.as_str()))
                                 })
                                 .cloned()
                                 .unwrap_or(("unknown".to_string(), "{}".to_string()));
@@ -584,9 +585,10 @@ pub fn microcompact(history: &[Message], protected_results: usize) -> Vec<Messag
                             let summary =
                                 summarize_tool_result(&tool_name, &tool_args, &text_content);
                             new_items.push(UserContent::ToolResult(ToolResult {
-                                id: tr.id.clone(),
-                                call_id: tr.call_id.clone(),
-                                content: OneOrMany::one(ToolResultContent::text(summary)),
+                                call: tr.call.clone(),
+                                provider: tr.provider.clone(),
+                                name: tr.name.clone(),
+                                content: vec![ToolResultContent::text(summary)],
                             }));
                         }
                     } else {
@@ -594,10 +596,8 @@ pub fn microcompact(history: &[Message], protected_results: usize) -> Vec<Messag
                     }
                 }
 
-                let new_content = OneOrMany::many(new_items)
-                    .expect("non-empty: original message had at least one content item");
                 result.push(Message::User {
-                    content: new_content,
+                    content: new_items,
                 });
             }
             _ => result.push(msg.clone()),
@@ -732,7 +732,9 @@ pub fn repair_orphan_tool_calls(history: Vec<Message>) -> Vec<Message> {
         return history;
     }
     let mut out: Vec<Message> = Vec::with_capacity(history.len() + 1);
-    let mut pending: Vec<String> = Vec::new();
+    // (tool_call id, tool name)——合成占位结果时 name 字段必填（Gemini/Ollama
+    // wire 按 name 回放）。
+    let mut pending: Vec<(String, String)> = Vec::new();
     for msg in history {
         match &msg {
             Message::Assistant { content, .. } => {
@@ -740,14 +742,14 @@ pub fn repair_orphan_tool_calls(history: Vec<Message>) -> Vec<Message> {
                 push_synthetic_tool_results(&mut out, &mut pending);
                 for item in content.iter() {
                     if let AssistantContent::ToolCall(tc) = item {
-                        pending.push(tc.id.clone());
+                        pending.push((tc.id.as_str().to_string(), tc.function.name.clone()));
                     }
                 }
                 out.push(msg);
             }
             Message::User { content } => {
                 // 统计本条消息里的孤儿 tool result（id/call_id 无匹配的前置
-                // tool_call）。没有孤儿时原样保留，避免重建改变 OneOrMany 结构。
+                // tool_call）。没有孤儿时原样保留，避免无谓的消息重建。
                 let orphan_count = content
                     .iter()
                     .filter(|item| match item {
@@ -780,16 +782,11 @@ pub fn repair_orphan_tool_calls(history: Vec<Message>) -> Vec<Message> {
                         other => kept.push(other.clone()),
                     }
                 }
-                // 整条消息都是孤儿 result → 连消息一起丢弃（OneOrMany 不允许为空）。
+                // 整条消息都是孤儿 result → 连消息一起丢弃（空 content 无意义）。
                 if kept.is_empty() {
                     continue;
                 }
-                let content = if kept.len() == 1 {
-                    OneOrMany::one(kept.into_iter().next().expect("len checked"))
-                } else {
-                    OneOrMany::many(kept).expect("non-empty: len > 1")
-                };
-                out.push(Message::User { content });
+                out.push(Message::User { content: kept });
             }
             Message::System { .. } => {
                 push_synthetic_tool_results(&mut out, &mut pending);
@@ -818,10 +815,13 @@ fn has_orphan_tool_calls(history: &[Message]) -> bool {
             Message::User { content } => {
                 for item in content.iter() {
                     if let UserContent::ToolResult(tr) = item {
-                        let matched = [Some(tr.id.as_str()), tr.call_id.as_deref()]
-                            .into_iter()
-                            .flatten()
-                            .find_map(|id| pending.iter().position(|p| *p == id));
+                        let matched = [
+                            Some(tr.call.as_str()),
+                            tr.provider.as_ref().map(|p| p.call_id.as_str()),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .find_map(|id| pending.iter().position(|p| *p == id));
                         if let Some(pos) = matched {
                             pending.remove(pos);
                         } else {
@@ -841,20 +841,26 @@ fn has_orphan_tool_calls(history: &[Message]) -> bool {
     !pending.is_empty()
 }
 
-/// tool result 的 `id`/`call_id` 是否命中 pending 中的某个 tool_call。
-fn pending_matches(pending: &[String], tr: &ToolResult) -> bool {
-    [Some(tr.id.as_str()), tr.call_id.as_deref()]
-        .into_iter()
-        .flatten()
-        .any(|id| pending.iter().any(|p| p.as_str() == id))
+/// tool result 的 `call`/`provider.call_id` 是否命中 pending 中的某个 tool_call。
+fn pending_matches(pending: &[(String, String)], tr: &ToolResult) -> bool {
+    [
+        Some(tr.call.as_str()),
+        tr.provider.as_ref().map(|p| p.call_id.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|id| pending.iter().any(|p| p.0 == id))
 }
 
 /// 从 pending 中移除与 tool result 匹配的 tool_call，返回是否命中。
-fn remove_pending(pending: &mut Vec<String>, tr: &ToolResult) -> bool {
-    let matched = [Some(tr.id.as_str()), tr.call_id.as_deref()]
-        .into_iter()
-        .flatten()
-        .find_map(|id| pending.iter().position(|p| p.as_str() == id));
+fn remove_pending(pending: &mut Vec<(String, String)>, tr: &ToolResult) -> bool {
+    let matched = [
+        Some(tr.call.as_str()),
+        tr.provider.as_ref().map(|p| p.call_id.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|id| pending.iter().position(|p| p.0 == id));
     if let Some(pos) = matched {
         pending.remove(pos);
         true
@@ -863,24 +869,23 @@ fn remove_pending(pending: &mut Vec<String>, tr: &ToolResult) -> bool {
     }
 }
 
-fn push_synthetic_tool_results(out: &mut Vec<Message>, pending: &mut Vec<String>) {
+fn push_synthetic_tool_results(out: &mut Vec<Message>, pending: &mut Vec<(String, String)>) {
     if pending.is_empty() {
         return;
     }
     let items: Vec<UserContent> = pending
         .drain(..)
-        .map(|id| {
-            UserContent::ToolResult(ToolResult {
+        .map(|(id, name)| {
+            UserContent::tool_result(
                 id,
-                call_id: None,
-                content: OneOrMany::one(ToolResultContent::text(
+                name,
+                vec![ToolResultContent::text(
                     "[tool result unavailable — the previous turn was interrupted before this tool ran]",
-                )),
-            })
+                )],
+            )
         })
         .collect();
-    let content = OneOrMany::many(items).expect("non-empty: pending tool calls exist");
-    out.push(Message::User { content });
+    out.push(Message::User { content: items });
 }
 
 // ─── 截断工具 ─────────────────────────────────────────────────────────────────
@@ -1055,8 +1060,8 @@ mod tests {
         // User → Assistant(tool_call) → User(tool_result) → Assistant(text) → User(next turn)
         let msgs = vec![
             Message::user("do task 1"),
-            Message::assistant_with_id("m1".into(), "calling tool"),
-            Message::tool_result("t1", "result 1"),
+            Message::Assistant { id: Some("m1".into()), content: vec![AssistantContent::text("calling tool")] },
+            Message::tool_result("t1", "tool", "result 1"),
             Message::assistant("task 1 done"),
             Message::user("do task 2"),
             Message::assistant("task 2 done"),
@@ -1089,16 +1094,16 @@ mod tests {
             "fn hello() {}\nfn world() {}\npub fn foo() {}\nstruct Bar {}\n".repeat(20);
         let msgs = vec![
             Message::user("do task 1"),
-            Message::assistant_with_id("m1".into(), "calling tool 1"),
-            Message::tool_result("t1", &long_content),
-            Message::assistant_with_id("m2".into(), "calling tool 2"),
-            Message::tool_result("t2", &long_content),
-            Message::assistant_with_id("m3".into(), "calling tool 3"),
-            Message::tool_result("t3", &long_content),
-            Message::assistant_with_id("m4".into(), "calling tool 4"),
-            Message::tool_result("t4", "result 4 protected"),
-            Message::assistant_with_id("m5".into(), "calling tool 5"),
-            Message::tool_result("t5", "result 5 protected"),
+            Message::Assistant { id: Some("m1".into()), content: vec![AssistantContent::text("calling tool 1")] },
+            Message::tool_result("t1", "tool", &long_content),
+            Message::Assistant { id: Some("m2".into()), content: vec![AssistantContent::text("calling tool 2")] },
+            Message::tool_result("t2", "tool", &long_content),
+            Message::Assistant { id: Some("m3".into()), content: vec![AssistantContent::text("calling tool 3")] },
+            Message::tool_result("t3", "tool", &long_content),
+            Message::Assistant { id: Some("m4".into()), content: vec![AssistantContent::text("calling tool 4")] },
+            Message::tool_result("t4", "tool", "result 4 protected"),
+            Message::Assistant { id: Some("m5".into()), content: vec![AssistantContent::text("calling tool 5")] },
+            Message::tool_result("t5", "tool", "result 5 protected"),
         ];
         let compacted = microcompact(&msgs, 2);
         // Same length.
@@ -1127,8 +1132,8 @@ mod tests {
         // 2 tool results, protect 5 → nothing should be cleared.
         let msgs = vec![
             Message::user("do task"),
-            Message::assistant_with_id("m1".into(), "calling tool"),
-            Message::tool_result("t1", "result 1"),
+            Message::Assistant { id: Some("m1".into()), content: vec![AssistantContent::text("calling tool")] },
+            Message::tool_result("t1", "tool", "result 1"),
             Message::assistant("done"),
         ];
         let compacted = microcompact(&msgs, 5);
@@ -1155,12 +1160,12 @@ mod tests {
         let long_content = "fn alpha() {}\nfn beta() {}\n".repeat(20);
         let msgs = vec![
             Message::user("start"),
-            Message::assistant_with_id("m1".into(), "call tool"),
-            Message::tool_result("t1", &long_content),
-            Message::assistant_with_id("m2".into(), "call tool 2"),
-            Message::tool_result("t2", &long_content),
-            Message::assistant_with_id("m3".into(), "call tool 3"),
-            Message::tool_result("t3", "protected result 3"),
+            Message::Assistant { id: Some("m1".into()), content: vec![AssistantContent::text("call tool")] },
+            Message::tool_result("t1", "tool", &long_content),
+            Message::Assistant { id: Some("m2".into()), content: vec![AssistantContent::text("call tool 2")] },
+            Message::tool_result("t2", "tool", &long_content),
+            Message::Assistant { id: Some("m3".into()), content: vec![AssistantContent::text("call tool 3")] },
+            Message::tool_result("t3", "tool", "protected result 3"),
         ];
         let compacted = microcompact(&msgs, 1);
         // First two tool results summarized, last one preserved.
@@ -1262,11 +1267,11 @@ microcompact_protected_results = 5
     fn assistant_tool_call(id: &str) -> Message {
         Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::tool_call(
+            content: vec![AssistantContent::tool_call(
                 id.to_string(),
                 "run_bash".to_string(),
                 serde_json::json!({"command": "ls"}),
-            )),
+            )],
         }
     }
 
@@ -1275,7 +1280,7 @@ microcompact_protected_results = 5
             Message::User { content } => content
                 .iter()
                 .filter_map(|c| match c {
-                    UserContent::ToolResult(tr) => Some(tr.id.clone()),
+                    UserContent::ToolResult(tr) => Some(tr.call.as_str().to_string()),
                     _ => None,
                 })
                 .collect(),
@@ -1296,7 +1301,7 @@ microcompact_protected_results = 5
         let history = vec![
             Message::user("goal"),
             assistant_tool_call("call_1"),
-            Message::tool_result("call_1", "output"),
+            Message::tool_result("call_1", "tool", "output"),
         ];
         assert_eq!(repair_orphan_tool_calls(history.clone()), history);
     }
@@ -1307,7 +1312,7 @@ microcompact_protected_results = 5
             Message::user("goal"),
             Message::Assistant {
                 id: None,
-                content: OneOrMany::many(vec![
+                content: vec![
                     AssistantContent::tool_call(
                         "c1".to_string(),
                         "a".to_string(),
@@ -1318,10 +1323,9 @@ microcompact_protected_results = 5
                         "b".to_string(),
                         serde_json::json!({}),
                     ),
-                ])
-                .expect("two tool calls"),
+                ],
             },
-            Message::tool_result("c1", "r1"),
+            Message::tool_result("c1", "tool", "r1"),
         ];
         let repaired = repair_orphan_tool_calls(history);
         assert_eq!(repaired.len(), 4);
@@ -1346,7 +1350,7 @@ microcompact_protected_results = 5
         // 反应式截断把 assistant tool_call 切掉后，残留的 tool result 是孤儿：
         // 整条消息都是孤儿 result → 连消息一起移除。
         let history = vec![
-            Message::tool_result("c_gone", "stale output"),
+            Message::tool_result("c_gone", "tool", "stale output"),
             Message::user("goal"),
         ];
         assert!(
@@ -1364,15 +1368,10 @@ microcompact_protected_results = 5
         // ToolResult + Text 混合的 User 消息：只摘除孤儿 ToolResult，保留 Text。
         let history = vec![
             Message::User {
-                content: OneOrMany::many(vec![
-                    UserContent::ToolResult(ToolResult {
-                        id: "c_gone".to_string(),
-                        call_id: None,
-                        content: OneOrMany::one(ToolResultContent::text("stale")),
-                    }),
+                content: vec![
+                    UserContent::tool_result("c_gone", "tool", vec![ToolResultContent::text("stale")]),
                     UserContent::text("keep me"),
-                ])
-                .expect("two items"),
+                ],
             },
             Message::user("goal"),
         ];
@@ -1395,19 +1394,10 @@ microcompact_protected_results = 5
             Message::user("goal"),
             assistant_tool_call("c1"),
             Message::User {
-                content: OneOrMany::many(vec![
-                    UserContent::ToolResult(ToolResult {
-                        id: "c1".to_string(),
-                        call_id: None,
-                        content: OneOrMany::one(ToolResultContent::text("r1")),
-                    }),
-                    UserContent::ToolResult(ToolResult {
-                        id: "c_orphan".to_string(),
-                        call_id: None,
-                        content: OneOrMany::one(ToolResultContent::text("stale")),
-                    }),
-                ])
-                .expect("two items"),
+                content: vec![
+                    UserContent::tool_result("c1", "tool", vec![ToolResultContent::text("r1")]),
+                    UserContent::tool_result("c_orphan", "tool", vec![ToolResultContent::text("stale")]),
+                ],
             },
         ];
         let repaired = repair_orphan_tool_calls(history);

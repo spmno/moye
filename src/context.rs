@@ -19,6 +19,7 @@ use rig_core::OneOrMany;
 use rig_core::completion::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
 use rig_core::completion::{Message, Usage};
 use serde::Deserialize;
+use tracing::warn;
 use std::collections::HashMap;
 
 // ─── 配置 ────────────────────────────────────────────────────────────────────
@@ -716,13 +717,16 @@ fn find_turn_starts(history: &[Message]) -> Vec<usize> {
 // ─── 孤儿工具调用修复 ─────────────────────────────────────────────────────────
 // ─── Orphaned Tool-Call Repair ───────────────────────────────────────────────
 
-/// 为缺少对应 tool 结果的孤儿 `tool_calls` 补一条占位 tool 结果。
+/// 为缺少对应 tool 结果的孤儿 `tool_calls` 补一条占位 tool 结果，并剔除没有
+/// 对应 tool_call 的孤儿 tool 结果。
 ///
 /// OpenAI 兼容供应商（含 DeepSeek / vLLM）要求 assistant `tool_calls` 后必须紧跟
-/// 匹配的 tool 消息，否则请求 400。rig 的 `CompletionCall.history` 只含当前 prompt
-/// 之前的历史，而工具循环里当前 prompt 正是上一轮的 tool 结果，所以捕获下来的
-/// 历史会以未应答的 assistant tool_call 结尾；把它重新注入新 runner（重试 / 新任务
-/// / SDD 子代理 / --continue）即触发 400。无孤儿时原样返回。
+/// 匹配的 tool 消息，且 tool 消息必须是对此前 `tool_calls` 的应答，两者缺一都被
+/// 400 拒绝。孤儿 tool_call 来自 rig 的 `CompletionCall.history` 不含当前 prompt
+/// （工具循环里当前 prompt 正是上一轮的 tool 结果）；孤儿 tool result 来自反应式
+/// 截断（`agent_loop.rs` 只保留末尾 N 条）和 `--continue` 加载的旧 session——
+/// assistant tool_call 被切掉后，残留的 tool result 便成了无主之应答。无孤儿时
+/// 原样返回。
 pub fn repair_orphan_tool_calls(history: Vec<Message>) -> Vec<Message> {
     if !has_orphan_tool_calls(&history) {
         return history;
@@ -742,12 +746,50 @@ pub fn repair_orphan_tool_calls(history: Vec<Message>) -> Vec<Message> {
                 out.push(msg);
             }
             Message::User { content } => {
+                // 统计本条消息里的孤儿 tool result（id/call_id 无匹配的前置
+                // tool_call）。没有孤儿时原样保留，避免重建改变 OneOrMany 结构。
+                let orphan_count = content
+                    .iter()
+                    .filter(|item| match item {
+                        UserContent::ToolResult(tr) => !pending_matches(&pending, tr),
+                        _ => false,
+                    })
+                    .count();
+                if orphan_count == 0 {
+                    for item in content.iter() {
+                        if let UserContent::ToolResult(tr) = item {
+                            remove_pending(&mut pending, tr);
+                        }
+                    }
+                    out.push(msg);
+                    continue;
+                }
+                warn!(
+                    orphan_count,
+                    "dropping orphan tool results with no matching tool_call"
+                );
+                let mut kept: Vec<UserContent> = Vec::with_capacity(content.len());
                 for item in content.iter() {
-                    if let UserContent::ToolResult(tr) = item {
-                        remove_pending(&mut pending, tr);
+                    match item {
+                        UserContent::ToolResult(tr) => {
+                            if remove_pending(&mut pending, tr) {
+                                kept.push(item.clone());
+                            }
+                            // 不匹配 → 孤儿，丢弃。
+                        }
+                        other => kept.push(other.clone()),
                     }
                 }
-                out.push(msg);
+                // 整条消息都是孤儿 result → 连消息一起丢弃（OneOrMany 不允许为空）。
+                if kept.is_empty() {
+                    continue;
+                }
+                let content = if kept.len() == 1 {
+                    OneOrMany::one(kept.into_iter().next().expect("len checked"))
+                } else {
+                    OneOrMany::many(kept).expect("non-empty: len > 1")
+                };
+                out.push(Message::User { content });
             }
             Message::System { .. } => {
                 push_synthetic_tool_results(&mut out, &mut pending);
@@ -782,6 +824,9 @@ fn has_orphan_tool_calls(history: &[Message]) -> bool {
                             .find_map(|id| pending.iter().position(|p| *p == id));
                         if let Some(pos) = matched {
                             pending.remove(pos);
+                        } else {
+                            // 无匹配前置 tool_call 的 tool result → 孤儿。
+                            return true;
                         }
                     }
                 }
@@ -796,13 +841,25 @@ fn has_orphan_tool_calls(history: &[Message]) -> bool {
     !pending.is_empty()
 }
 
-fn remove_pending(pending: &mut Vec<String>, tr: &ToolResult) {
+/// tool result 的 `id`/`call_id` 是否命中 pending 中的某个 tool_call。
+fn pending_matches(pending: &[String], tr: &ToolResult) -> bool {
+    [Some(tr.id.as_str()), tr.call_id.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|id| pending.iter().any(|p| p.as_str() == id))
+}
+
+/// 从 pending 中移除与 tool result 匹配的 tool_call，返回是否命中。
+fn remove_pending(pending: &mut Vec<String>, tr: &ToolResult) -> bool {
     let matched = [Some(tr.id.as_str()), tr.call_id.as_deref()]
         .into_iter()
         .flatten()
         .find_map(|id| pending.iter().position(|p| p.as_str() == id));
     if let Some(pos) = matched {
         pending.remove(pos);
+        true
+    } else {
+        false
     }
 }
 
@@ -1282,5 +1339,81 @@ microcompact_protected_results = 5
         assert_eq!(repaired.len(), 4);
         assert_eq!(tool_result_ids(&repaired[2]), vec!["c1".to_string()]);
         assert!(matches!(repaired[3], Message::Assistant { .. }));
+    }
+
+    #[test]
+    fn repair_drops_orphan_tool_result_message() {
+        // 反应式截断把 assistant tool_call 切掉后，残留的 tool result 是孤儿：
+        // 整条消息都是孤儿 result → 连消息一起移除。
+        let history = vec![
+            Message::tool_result("c_gone", "stale output"),
+            Message::user("goal"),
+        ];
+        assert!(
+            has_orphan_tool_calls(&history),
+            "orphan tool result must count as orphan"
+        );
+        let repaired = repair_orphan_tool_calls(history);
+        assert_eq!(repaired.len(), 1);
+        assert!(matches!(repaired[0], Message::User { .. }));
+        assert!(tool_result_ids(&repaired[0]).is_empty());
+    }
+
+    #[test]
+    fn repair_keeps_text_when_dropping_orphan_tool_result() {
+        // ToolResult + Text 混合的 User 消息：只摘除孤儿 ToolResult，保留 Text。
+        let history = vec![
+            Message::User {
+                content: OneOrMany::many(vec![
+                    UserContent::ToolResult(ToolResult {
+                        id: "c_gone".to_string(),
+                        call_id: None,
+                        content: OneOrMany::one(ToolResultContent::text("stale")),
+                    }),
+                    UserContent::text("keep me"),
+                ])
+                .expect("two items"),
+            },
+            Message::user("goal"),
+        ];
+        let repaired = repair_orphan_tool_calls(history);
+        assert_eq!(repaired.len(), 2);
+        match &repaired[0] {
+            Message::User { content } => {
+                assert_eq!(content.len(), 1);
+                assert!(matches!(content.iter().next(), Some(UserContent::Text(_))));
+            }
+            other => panic!("expected user message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repair_keeps_matching_result_while_dropping_orphan() {
+        // 同一消息里既有正常应答又有孤儿 result：保留匹配项、丢弃孤儿项，
+        // 且不影响后续 assistant tool_call 的占位补全。
+        let history = vec![
+            Message::user("goal"),
+            assistant_tool_call("c1"),
+            Message::User {
+                content: OneOrMany::many(vec![
+                    UserContent::ToolResult(ToolResult {
+                        id: "c1".to_string(),
+                        call_id: None,
+                        content: OneOrMany::one(ToolResultContent::text("r1")),
+                    }),
+                    UserContent::ToolResult(ToolResult {
+                        id: "c_orphan".to_string(),
+                        call_id: None,
+                        content: OneOrMany::one(ToolResultContent::text("stale")),
+                    }),
+                ])
+                .expect("two items"),
+            },
+        ];
+        let repaired = repair_orphan_tool_calls(history);
+        assert_eq!(repaired.len(), 3);
+        assert_eq!(tool_result_ids(&repaired[2]), vec!["c1".to_string()]);
+        // 修复后历史自身必须无孤儿。
+        assert!(!has_orphan_tool_calls(&repaired));
     }
 }

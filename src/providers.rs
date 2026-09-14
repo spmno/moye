@@ -511,8 +511,8 @@ pub fn provider_models_for_plan(provider: Provider, plan: ApiPlan) -> Vec<ModelI
                 desc: "Kimi K3 · 1M 上下文",
             },
             ModelInfo {
-                slug: "glm-5.2".into(),
-                desc: "GLM-5.2 · 1M 上下文",
+                slug: "glm-5.3".into(),
+                desc: "GLM-5.3 · 1M 上下文",
             },
             ModelInfo {
                 slug: "kimi-k2.7-code".into(),
@@ -1020,6 +1020,24 @@ mod tests {
         assert_eq!(context_limit_for_model("glm-5.3-flash"), 1_000_000);
     }
 
+    #[test]
+    fn setup_volcengine_agent_catalog_upgrades_glm_to_5_3() {
+        // 火山引擎 Agent 套餐目录：glm-5.2 已升级为 glm-5.3（防回归锚点）。
+        // Volcengine Agent plan catalog: glm-5.2 was upgraded to glm-5.3 (regression anchor).
+        let models = provider_models_for_plan(Provider::Volcengine, ApiPlan::Agent);
+        let slugs: Vec<_> = models.iter().map(|model| model.slug.as_str()).collect();
+
+        assert!(
+            slugs.contains(&"glm-5.3"),
+            "Volcengine agent catalog must expose glm-5.3, got {slugs:?}",
+        );
+        assert!(
+            !slugs.contains(&"glm-5.2"),
+            "Volcengine agent catalog must not keep retired glm-5.2, got {slugs:?}",
+        );
+        assert_eq!(context_limit_for_model("glm-5.3"), 1_000_000);
+    }
+
     // 使用 crate 根的共享 env 互斥锁（避免跨模块 env 竞争）。
     // Use the crate-root shared env mutex to avoid cross-module env races.
     use crate::TEST_ENV_MUTEX as ENV_MUTEX;
@@ -1042,6 +1060,7 @@ mod tests {
         assert!(is_reasoning_model("GLM-5.2"));
         assert!(is_reasoning_model("glm-4.7"));
         assert!(is_reasoning_model("glm-5.3-flash"));
+        assert!(is_reasoning_model("glm-5.3"));
         // DeepSeek V4 系列（pro/flash）thinking 默认开启，输出 reasoning_content，
         // 属于推理模型。
         // DeepSeek V4 series (pro/flash) has thinking enabled by default and emits

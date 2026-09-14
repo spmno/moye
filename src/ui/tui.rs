@@ -2791,7 +2791,7 @@ fn finalize_switch(
     }
 
     let mut env_err: Option<String> = None;
-    if let Err(e) = persist_switch_to_env(slug, flow.plan, flow.base_url.as_deref()) {
+    if let Err(e) = persist_switch_to_env(slug, flow.plan, flow.base_url.as_deref(), &model) {
         env_err = Some(e.to_string());
     }
     if let Some(ref key) = api_key {
@@ -2813,6 +2813,12 @@ fn finalize_switch(
     // 让读取 env 的显示路径（侧栏 plan、日志）与本会话一致。
     unsafe {
         std::env::set_var("AGENT_PROVIDER", slug);
+        // AGENT_MODEL 是启动时 resolve_default_model / AgentRegistry::new 读取的模型来源；
+        // 写入本会话进程环境，保证切换后立即一致（.env 中的新值供下次启动使用）。
+        // AGENT_MODEL is the model source read by resolve_default_model /
+        // AgentRegistry::new at startup; set it in this session's env so the switch is
+        // immediately consistent (the .env value serves the next launch).
+        std::env::set_var("AGENT_MODEL", &model);
         if provider_enum != crate::providers::Provider::Custom
             && flow.plan != crate::providers::ApiPlan::Standard
         {
@@ -2877,14 +2883,22 @@ fn persist_key_to_env(key_env: &str, key: &str) -> std::io::Result<()> {
     std::fs::write(path, out)
 }
 
-/// 把切换结果写入项目 `.moye/.env`：更新 AGENT_PROVIDER / AGENT_PLAN / AGENT_BASE_URL 行，
-/// 不触碰任何 API key 行。文件不存在时创建。
+/// 把切换结果写入项目 `.moye/.env`：更新 AGENT_PROVIDER / AGENT_PLAN / AGENT_BASE_URL /
+/// AGENT_MODEL 行，不触碰任何 API key 行。文件不存在时创建。
 /// Persists the switch to the project `.moye/.env`: updates AGENT_PROVIDER /
-/// AGENT_PLAN / AGENT_BASE_URL lines, never touches API-key lines. Creates the file if missing.
+/// AGENT_PLAN / AGENT_BASE_URL / AGENT_MODEL lines, never touches API-key lines.
+/// Creates the file if missing.
+///
+/// AGENT_MODEL 是重启后 `resolve_default_model()` / `AgentRegistry::new()` 的首选模型来源，
+/// 缺了它会导致重启后模型回落到 `agent.toml` 的 `[agent].default_model`（用户报的 bug）。
+/// AGENT_MODEL is the preferred model source for `resolve_default_model()` /
+/// `AgentRegistry::new()` after a restart; without it the model falls back to
+/// `[agent].default_model` in `agent.toml` (the bug the user reported).
 fn persist_switch_to_env(
     provider: &str,
     plan: crate::providers::ApiPlan,
     base_url: Option<&str>,
+    model: &str,
 ) -> std::io::Result<()> {
     let path = crate::config::PROJECT_ENV_PATH;
     std::fs::create_dir_all(crate::config::PROJECT_CONFIG_DIR)?;
@@ -2902,6 +2916,14 @@ fn persist_switch_to_env(
         None
     };
     keys.push(("AGENT_BASE_URL", url_val));
+    keys.push((
+        "AGENT_MODEL",
+        if model.trim().is_empty() {
+            None
+        } else {
+            Some(model.trim().to_string())
+        },
+    ));
 
     let mut handled = vec![false; keys.len()];
     let mut out = String::new();

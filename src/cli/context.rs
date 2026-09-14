@@ -153,6 +153,14 @@ impl AppContext {
             let mut hist = self.model_history.lock().unwrap();
             hist.record(&s, &p, &b);
             let _ = hist.save();
+            drop(hist);
+            // 持久化到 `.moye/.env` 的 AGENT_MODEL，并同步本进程环境：
+            // 重启后 `resolve_default_model()` / `AgentRegistry::new()` 优先读 AGENT_MODEL，
+            // 否则会回落到 `agent.toml` 的 `[agent].default_model`，导致模型被重置。
+            // Persist AGENT_MODEL to `.moye/.env` and sync this process's env: after a
+            // restart `resolve_default_model()` / `AgentRegistry::new()` read AGENT_MODEL
+            // first, otherwise the model resets to `[agent].default_model` in agent.toml.
+            persist_model_env(&s);
         }
     }
 
@@ -676,6 +684,99 @@ patches = [
             "profile format error must propagate as Err, got: {result:?}"
         );
     }
+
+    #[test]
+    fn upsert_env_line_replaces_existing_model_line() {
+        // 已存在 AGENT_MODEL 行 → 替换为新值，其他行（含 key/注释）不变。
+        // An existing AGENT_MODEL line is replaced; every other line stays intact.
+        let before = "# comment\nAGENT_PROVIDER=deepseek\nAGENT_MODEL=doubao-seed-evolving\nDEEPSEEK_API_KEY=sk-x\n";
+        let after = upsert_env_line(before, "AGENT_MODEL", "deepseek-flash");
+        assert!(after.contains("AGENT_MODEL=deepseek-flash\n"));
+        assert!(!after.contains("doubao-seed-evolving"));
+        assert!(after.contains("AGENT_PROVIDER=deepseek\n"));
+        assert!(after.contains("DEEPSEEK_API_KEY=sk-x\n"));
+        assert!(after.contains("# comment\n"));
+        // 只应出现一次 AGENT_MODEL 行。
+        assert_eq!(after.matches("AGENT_MODEL=").count(), 1);
+    }
+
+    #[test]
+    fn upsert_env_line_appends_when_absent_and_ignores_comments() {
+        // 无 AGENT_MODEL 行（注释里的同名不算）→ 追加到末尾，注释行保留。
+        // No AGENT_MODEL line (a commented one does not count) → appended at the end;
+        // the commented line is preserved.
+        let before = "# AGENT_MODEL=old\nAGENT_PROVIDER=volcengine\n";
+        let after = upsert_env_line(before, "AGENT_MODEL", "deepseek-flash");
+        assert!(after.contains("# AGENT_MODEL=old\n"));
+        assert!(after.ends_with("AGENT_MODEL=deepseek-flash\n"));
+        assert_eq!(after.matches("AGENT_MODEL=deepseek-flash").count(), 1);
+    }
+
+    #[test]
+    fn upsert_env_line_on_empty_input() {
+        // 空文件 → 直接得到一行。
+        // Empty input yields a single line.
+        assert_eq!(
+            upsert_env_line("", "AGENT_MODEL", "deepseek-flash"),
+            "AGENT_MODEL=deepseek-flash\n"
+        );
+    }
+
+    #[test]
+    fn persist_model_env_writes_file_and_process_env_without_touching_keys() {
+        // 行为级验证：写入 env 文件 + 进程环境；不碰 API key 行；重复切换只保留一行；空值 no-op。
+        // Behavior-level: writes the env file + process env; leaves API-key lines intact;
+        // repeated switches keep a single line; an empty slug is a no-op.
+        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _guard = env_guard("AGENT_MODEL", None);
+        // 用工作树内的 target/ 而非 /tmp（沙箱可能拒绝对 /tmp 的写入）。
+        // Use target/ inside the work tree instead of /tmp (the sandbox may deny /tmp writes).
+        let dir = std::path::Path::new("target")
+            .join(format!("persist-model-env-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        std::fs::write(&path, "AGENT_PROVIDER=deepseek\nDEEPSEEK_API_KEY=sk-x\n").unwrap();
+
+        persist_model_env_at("deepseek-flash", &path);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("AGENT_MODEL=deepseek-flash\n"),
+            "got:\n{after}"
+        );
+        assert!(after.contains("AGENT_PROVIDER=deepseek\n"), "got:\n{after}");
+        assert!(after.contains("DEEPSEEK_API_KEY=sk-x\n"), "got:\n{after}");
+        assert_eq!(
+            std::env::var("AGENT_MODEL").ok().as_deref(),
+            Some("deepseek-flash"),
+            "process env must reflect the switch"
+        );
+
+        // 再次切换：替换而非累加。
+        persist_model_env_at("deepseek-v4-pro", &path);
+        let after2 = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after2.matches("AGENT_MODEL=").count(), 1, "got:\n{after2}");
+        assert!(
+            after2.contains("AGENT_MODEL=deepseek-v4-pro\n"),
+            "got:\n{after2}"
+        );
+
+        // 空 / 空白 slug：no-op（文件与进程环境保持上次值）。
+        persist_model_env_at("   ", &path);
+        let after3 = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after3.contains("AGENT_MODEL=deepseek-v4-pro\n"),
+            "got:\n{after3}"
+        );
+        assert_eq!(
+            std::env::var("AGENT_MODEL").ok().as_deref(),
+            Some("deepseek-v4-pro"),
+            "blank slug must not clear the effective model"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// 返回当前 Unix 时间戳（秒）。系统时钟异常时退回 0。
@@ -700,4 +801,71 @@ fn resolve_default_model() -> Option<String> {
             Some(dm.clone())
         }
     })
+}
+
+/// 把选中的模型 slug 持久化：同步写入本进程的 `AGENT_MODEL` 环境变量（会话内立即一致），
+/// 并更新 `.moye/.env` 的 `AGENT_MODEL=` 行（重启后 `resolve_default_model()` /
+/// `AgentRegistry::new()` 优先读取）。空 slug 为 no-op；文件写入失败时静默忽略——
+/// 环境变量仍已生效，会话不受影响。
+/// Persist the selected model slug: sync the in-process `AGENT_MODEL` env var (immediately
+/// consistent within the session) and update the `AGENT_MODEL=` line in `.moye/.env`
+/// (preferred by `resolve_default_model()` / `AgentRegistry::new()` after a restart).
+/// An empty slug is a no-op; env-file write failures are ignored silently — the env var
+/// is already applied and the session is unaffected.
+fn persist_model_env(slug: &str) {
+    persist_model_env_at(slug, std::path::Path::new(crate::config::PROJECT_ENV_PATH));
+}
+
+/// `persist_model_env` 的路径可注入版本（便于测试）：同步进程 `AGENT_MODEL` 环境变量，
+/// 并把 `AGENT_MODEL=slug` 写入给定 env 文件（更新或追加，父目录自动创建）。
+/// Path-injectable core of `persist_model_env` (for tests): syncs the in-process
+/// `AGENT_MODEL` env var and writes `AGENT_MODEL=slug` into the given env file
+/// (updates or appends; parent dirs are created).
+fn persist_model_env_at(slug: &str, path: &std::path::Path) {
+    let slug = slug.trim();
+    if slug.is_empty() {
+        return;
+    }
+    // 进程环境：读 env 的路径（resolve_default_model / registry 初始化）本会话一致。
+    // Process env: env-reading paths (resolve_default_model / registry init) stay consistent.
+    unsafe {
+        std::env::set_var("AGENT_MODEL", slug);
+    }
+    // 文件：更新或新增 AGENT_MODEL 行，不触碰其他行（含 API key）。
+    // File: update or append the AGENT_MODEL line, leaving other lines (incl. API keys) untouched.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let out = upsert_env_line(&existing, "AGENT_MODEL", slug);
+    let _ = std::fs::write(path, out);
+}
+
+/// 纯函数：把 `KEY=value` 写回 env 文本——已存在同名（未注释）行则替换，
+/// 否则追加；其他行（含注释、API key）原样保留。
+/// Pure helper: write `KEY=value` into env text — replace an existing (uncommented)
+/// line with the same key, otherwise append; all other lines (incl. comments and API
+/// keys) are preserved verbatim.
+fn upsert_env_line(existing: &str, key: &str, value: &str) -> String {
+    let mut out = String::with_capacity(existing.len() + key.len() + value.len() + 2);
+    let mut written = false;
+    for line in existing.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('#')
+            && trimmed.contains('=')
+            && trimmed.split('=').next().unwrap_or("").trim() == key
+        {
+            out.push_str(&format!("{key}={value}\n"));
+            written = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !written {
+        out.push_str(&format!("{key}={value}\n"));
+    }
+    out
 }

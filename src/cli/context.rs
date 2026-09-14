@@ -442,7 +442,6 @@ fn write_plan_to_config(plan: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     // 使用 crate 根的共享 env 互斥锁（避免跨模块 env 竞争）。
     // Use the crate-root shared env mutex to avoid cross-module env races.

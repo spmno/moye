@@ -101,6 +101,10 @@ impl SandboxBackend {
     /// 真实探活 bwrap：spawn 最小命令验证能否写 uid_map + 建 mount namespace。
     /// 用 thread + `recv_timeout(1.5s)` 避免极端 hang 卡死 TUI 启动；bwrap 失败时
     /// 立即 exit，正常情况几十毫秒内返回。
+    ///
+    /// 仅 Linux 使用——macOS 的 detect() 直接返回 Seatbelt，不会调用此函数；
+    /// 若不加 cfg 会在 macOS 上触发 dead_code 警告。
+    #[cfg(target_os = "linux")]
     fn bwrap_usable() -> bool {
         use std::process::{Command, Stdio};
         use std::sync::mpsc;
@@ -147,6 +151,10 @@ impl SandboxBackend {
 
 /// 在 PATH 中查找可执行文件。
 /// Find an executable in PATH.
+///
+/// 仅 Linux 的 detect() 用于探测 bwrap 是否在 PATH 中；macOS 分支不会调用，
+/// 故加 cfg 避免 macOS 上的 dead_code 警告。
+#[cfg(target_os = "linux")]
 fn which(cmd: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -1489,6 +1497,7 @@ mod tests {
     }
 
     /// 不强断言 `== true`：bwrap 不可用的 CI 会挂；这里只验证不 panic。
+    #[cfg(target_os = "linux")]
     #[test]
     fn bwrap_usable_returns_bool_without_panic() {
         let _ = SandboxBackend::bwrap_usable();

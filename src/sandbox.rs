@@ -671,16 +671,31 @@ impl SimpleSandbox {
         if let Ok(canon) = path.canonicalize() {
             return canon;
         }
-        // 路径不存在时，规范化父目录再拼接文件名
-        // When the path doesn't exist, canonicalize the parent and append the filename
-        if let Some(parent) = path.parent()
-            && let Ok(canon_parent) = parent.canonicalize()
-        {
-            let filename = path.file_name().unwrap_or_default();
-            return canon_parent.join(filename);
+        // 路径不存在时，逐级上溯找到最深的存在祖先，规范化后再拼接不存在的尾部组件。
+        // 原实现只上溯一级：父目录也不存在时退回字面路径，丢失符号链接解析——
+        // 例如 macOS 上 /tmp 是 /private/tmp 的符号链接，/tmp/sub/dir/file.txt
+        // （父目录 /tmp/sub/dir 不存在）会退回字面 /tmp/... 前缀，无法匹配
+        // 已规范化的授权目录，导致已授权路径被误拒。
+        // When the path doesn't exist, walk up to the deepest existing ancestor,
+        // canonicalize it, then rejoin the non-existent tail components. The old
+        // one-level walk-up returned the literal path when the parent was also
+        // missing, losing symlink resolution (e.g. macOS /tmp -> /private/tmp),
+        // so authorized dirs failed to match.
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        for ancestor in path.ancestors() {
+            if let Ok(canon_ancestor) = ancestor.canonicalize() {
+                let mut result = canon_ancestor;
+                for component in tail.iter().rev() {
+                    result.push(component);
+                }
+                return result;
+            }
+            if let Some(name) = ancestor.file_name() {
+                tail.push(name.to_os_string());
+            }
         }
-        // 最后兜底：返回原始路径
-        // Last resort: return the path as-is
+        // 最后兜底：返回原始路径（连根都无法规范化时）。
+        // Last resort: return the path as-is (even the root failed to canonicalize).
         path.to_path_buf()
     }
 }

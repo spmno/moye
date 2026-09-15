@@ -944,6 +944,27 @@ fn is_obvious_question(message: &str) -> bool {
     false
 }
 
+/// 琐碎任务快速判定：短消息 + 明显的单点修改动词（替换/升级/改名/加注释等）。
+/// 命中时走快速路径（直接 Builder + 验证门），跳过调查/规划/审计瀑布——
+/// 「有任务的时候完成任务就行了，不要有其它的动作」。
+/// 误判风险由验证门兑底（构建/测试仍必须通过）。
+/// Trivial-task heuristic: short message + an obvious single-point edit verb.
+/// When matched, take the fast path (Builder + verification gate only), skipping
+/// the investigate/plan/audit waterfall. The verification gate is the safety net.
+fn is_trivial_task(message: &str) -> bool {
+    let m = message.trim();
+    // 长消息更可能包含多个要求或上下文依赖，不走快速路径。
+    // Longer messages likely carry multiple requirements or context; not trivial.
+    if m.chars().count() > 60 {
+        return false;
+    }
+    const TRIVIAL_MARKERS: &[&str] = &[
+        "替换", "改成", "改为", "换成", "改下", "改一下", "升级", "重命名", "改名",
+        "加注释", "补注释", "删掉", "移除", "拼写", "typo", "rename", "bump", "replace",
+    ];
+    TRIVIAL_MARKERS.iter().any(|k| m.contains(k))
+}
+
 /// 关键词降级匹配（LLM 不可用时的 fallback）。
 /// Keyword fallback matching (used when LLM is unavailable).
 pub fn classify_keyword_fallback(message: &str) -> Intent {
@@ -1789,11 +1810,17 @@ impl Orchestrator {
     }
 
     async fn run_sdd_pipeline(&self, message: &str, tx: &EventSender) -> anyhow::Result<String> {
-        let is_fast = self.registry.active_profile().as_deref() == Some("fast");
+        // 快速路径：显式 fast profile，或启发式判定的琐碎任务（单点小改动）。
+        // 琐碎任务直接 Builder + 验证门，不为一次字符串替换跑完整 SDD 瀑布。
+        // Fast path: explicit "fast" profile, or a heuristically trivial task
+        // (single-point edit). Trivial tasks go straight to Builder + gate.
+        let is_fast = self.registry.active_profile().as_deref() == Some("fast")
+            || is_trivial_task(message);
 
         if is_fast {
             // Fast mode: skip investigation, planning, AND audit (no
-            // AuditorListener registered).
+            // AuditorListener registered). The verification gate below is
+            // the quality net for trivial tasks.
             let built = crate::agent_loop::run_autonomous(
                 &self.registry,
                 &self.sandbox,
@@ -2040,6 +2067,21 @@ mod tests {
         assert!(!is_obvious_question("修复登录bug"));
     }
 
+    #[test]
+    fn trivial_task_detection() {
+        // 短消息 + 单点修改动词 → 琐碎，走快速路径。
+        // Short message + single-point edit verb → trivial, fast path.
+        assert!(is_trivial_task("把 glm-5.2 替换成 glm-5.3"));
+        assert!(is_trivial_task("升级下配置文件里的模型版本"));
+        assert!(is_trivial_task("rename the variable"));
+        // 长消息或多要求 → 非琐碎，走完整 SDD 瀑布。
+        // Long message or multiple requirements → not trivial, full waterfall.
+        assert!(!is_trivial_task(
+            "把 glm-5.2 替换成 glm-5.3，顺便重构 providers.rs 的目录生成逻辑，并补全所有供应商的测试覆盖"
+        ));
+        assert!(!is_trivial_task("实现一个带沙箱隔离的子代理系统"));
+    }
+
     /// 空历史应返回空字符串。
     /// Empty history should return an empty string.
     #[test]
@@ -2156,6 +2198,13 @@ mod tests {
         use crate::config::Config;
         let _env_lock = ENV_MUTEX.lock().unwrap();
         let _guard = env_guard("AGENT_PROFILE", None);
+        // AGENT_MODEL 会在 AgentRegistry::new 里作为会话级覆盖注入（见 new() 的
+        // session_model 初始化）；外部环境（如 .moye/.env）泄漏进来会让下面的
+        // 断言失败，还会毒化 ENV_MUTEX 连坐其它测试。与兄弟测试保持一致：清掉。
+        // AGENT_MODEL seeds the session override inside AgentRegistry::new; leaked
+        // from the outer env (e.g. .moye/.env) it breaks the assertion below and
+        // poisons ENV_MUTEX, cascading into other tests. Clear it like the sibling.
+        let _g_model = env_guard("AGENT_MODEL", None);
         let toml_str = r#"
 [agent]
 default_model = "base-model"

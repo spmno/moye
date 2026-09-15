@@ -121,11 +121,24 @@ impl LandlockSandbox {
         if let Ok(canon) = path.canonicalize() {
             return canon;
         }
-        if let Some(parent) = path.parent()
-            && let Ok(canon_parent) = parent.canonicalize()
-        {
-            let filename = path.file_name().unwrap_or_default();
-            return canon_parent.join(filename);
+        // 路径不存在时，逐级上溯找到最深的存在祖先，规范化后再拼接不存在的尾部
+        // 组件（与 SimpleSandbox::canonicalize_safe 一致；原一级上溯在父目录也不
+        // 存在时丢失符号链接解析，如 macOS /tmp -> /private/tmp）。
+        // Walk up to the deepest existing ancestor, canonicalize it, then rejoin
+        // the non-existent tail (mirrors SimpleSandbox::canonicalize_safe; the old
+        // one-level walk-up lost symlink resolution for deep missing paths).
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        for ancestor in path.ancestors() {
+            if let Ok(canon_ancestor) = ancestor.canonicalize() {
+                let mut result = canon_ancestor;
+                for component in tail.iter().rev() {
+                    result.push(component);
+                }
+                return result;
+            }
+            if let Some(name) = ancestor.file_name() {
+                tail.push(name.to_os_string());
+            }
         }
         path.to_path_buf()
     }

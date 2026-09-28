@@ -339,6 +339,7 @@ Enter 发送任务 | /help 帮助 | Ctrl+C 退出                │   DeepSeek
 | 按键 | 动作 |
 |------|------|
 | `Enter` | 发送输入 |
+| `Alt+Enter` / `Shift+Enter` / `Ctrl+J` | 插入换行（Shift+Enter 需终端支持 kitty 键盘协议） |
 | `Ctrl+C` / `Ctrl+D` | 退出 |
 | `Up` / `Down` | 浏览输入历史 |
 | `PageUp` / `PageDown` | 滚动消息（每次 5 行） |
@@ -803,9 +804,9 @@ tracing_subscriber::EnvFilter::new("info,rig_core=off")
 | `rig-memory 0.41` | rig 记忆扩展 |
 | `rig-agent 0.41` | rig agent 扩展 |
 | `tokio` | 异步运行时 |
-| `ratatui 0.29` | TUI 框架（全屏渲染、布局、部件） |
-| `crossterm 0.28` | 终端后端（事件流、原始模式、alt-screen） |
-| `pulldown-cmark 0.12` | Markdown 解析 → ratatui Text 渲染 |
+| `ratatui 0.30` | TUI 框架（全屏渲染、布局、部件） |
+| `crossterm 0.29` | 终端后端（事件流、原始模式、alt-screen、kitty 键盘协议） |
+| `pulldown-cmark 0.13` | Markdown 解析 → ratatui Text 渲染（GFM 表格/删除线/任务列表） |
 | `reqwest 0.13` | HTTP 客户端（web_fetch / web_search） |
 | `tracing` + `tracing-subscriber` | 结构化日志（仅文件） |
 | `chrono` | 本地时间戳 |

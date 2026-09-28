@@ -192,6 +192,10 @@ pub fn strong() -> Style {
     Style::new().add_modifier(Modifier::BOLD)
 }
 
+pub fn strikethrough() -> Style {
+    Style::new().add_modifier(Modifier::CROSSED_OUT)
+}
+
 // ===== 侧边栏样式 =====
 // ===== Sidebar styles =====
 

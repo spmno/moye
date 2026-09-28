@@ -339,6 +339,7 @@ Type a task for the Agent to complete. It will plan and execute autonomously. St
 | Key | Action |
 |------|------|
 | `Enter` | Submit input |
+| `Alt+Enter` / `Shift+Enter` / `Ctrl+J` | Insert newline (Shift+Enter needs kitty keyboard protocol) |
 | `Ctrl+C` / `Ctrl+D` | Quit |
 | `Up` / `Down` | Browse input history |
 | `PageUp` / `PageDown` | Scroll messages (5 lines per press) |
@@ -803,9 +804,9 @@ tracing_subscriber::EnvFilter::new("info,rig_core=off")
 | `rig-memory 0.41` | rig memory extension |
 | `rig-agent 0.41` | rig agent runtime (Tool trait, ToolContext, ToolExecutionError; rmcp feature) |
 | `tokio` | Async runtime |
-| `ratatui 0.29` | TUI framework (fullscreen rendering, layout, widgets) |
-| `crossterm 0.28` | Terminal backend (event stream, raw mode, alt-screen) |
-| `pulldown-cmark 0.12` | Markdown parser -> ratatui Text rendering |
+| `ratatui 0.30` | TUI framework (fullscreen rendering, layout, widgets) |
+| `crossterm 0.29` | Terminal backend (event stream, raw mode, alt-screen, kitty keyboard protocol) |
+| `pulldown-cmark 0.13` | Markdown parser -> ratatui Text rendering (GFM tables / strikethrough / task lists) |
 | `reqwest 0.13` | HTTP client (web_fetch / web_search) |
 | `tracing` + `tracing-subscriber` | Structured logging (file-only) |
 | `chrono` | Local timestamps |

@@ -4,7 +4,8 @@ use std::time::Duration;
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        EventStream, KeyCode, KeyEvent, KeyboardEnhancementFlags, KeyModifiers, MouseButton,
+        MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -40,6 +41,7 @@ const SPINNER_FRAMES: [&str; 10] = [
     "\u{2807}", "\u{280f}",
 ];
 const TICK_MS: u64 = 120;
+const INTERACTIVE_TICK_MS: u64 = 25;
 
 // ===== Terminal guard (panic-safe cleanup) =====
 // ===== 终端守卫（panic 安全清理） =====
@@ -71,7 +73,15 @@ impl TerminalGuard {
             std::io::stdout(),
             EnterAlternateScreen,
             EnableMouseCapture,
-            EnableBracketedPaste
+            EnableBracketedPaste,
+            // kitty 键盘协议：让 Shift+Enter 等修饰键组合以独立 CSI 序列上报，
+            // 而非退化成裸 Enter（否则换行与发送无法区分）。不支持的终端忽略
+            // 该序列，行为不变。
+            // Kitty keyboard protocol: reports modifier combos like Shift+Enter
+            // as distinct CSI sequences instead of degrading to bare Enter
+            // (otherwise newline and submit are indistinguishable). Terminals
+            // without support ignore the sequence; behavior is unchanged.
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )?;
         Ok(Self { original_termios })
     }
@@ -97,14 +107,16 @@ fn restore_terminal(original: Option<&libc::termios>) {
 
     // Write escape sequences to /dev/tty directly, not stdout.
     // This ensures they reach the terminal even if stdout is redirected.
+    // Leading \x1b[<u pops the kitty keyboard protocol flags pushed at enter().
     if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
-        let _ = tty.write_all(b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?1049l\x1b[?25h");
+        let _ = tty.write_all(b"\x1b[<u\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?1049l\x1b[?25h");
         let _ = tty.flush();
     }
 
     // Also write to stdout as fallback.
     let _ = execute!(
         std::io::stdout(),
+        PopKeyboardEnhancementFlags,
         DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen,
@@ -628,16 +640,13 @@ struct TuiState {
     /// Whether the autocomplete popup was dismissed by Esc. The predicate ANDs
     /// !dismissed — cleared when the buffer changes or a new `/` token starts.
     autocomplete_dismissed: bool,
-    /// 消息渲染版本号：messages 每次变化（push / 首条 System 改写）时 +1，
-    /// 作为 msg_cache 脏键的一部分。
-    /// Message render version: bumped whenever `messages` changes (push / first
-    /// System message rewrite); part of the msg_cache dirty key.
-    msg_version: u64,
-    /// 消息区渲染缓存：避免每帧对全量历史做 markdown 解析 / 语法高亮 / diff /
-    /// 软换行（这些曾导致长会话时输入框卡顿）。
-    /// Message render cache: avoids re-running markdown parse / syntax highlight /
-    /// diff / soft-wrap over the whole history every frame (the cause of input
-    /// lag in long sessions).
+    /// 消息区渲染缓存（增量维护，见 `MsgCache`）：避免每帧对全量历史做
+    /// markdown 解析 / 语法高亮 / diff / 软换行（这些曾导致长会话时输入框
+    /// 卡顿）。消息变化只增量更新对应段。
+    /// Message render cache (incrementally maintained; see `MsgCache`): avoids
+    /// re-running markdown parse / syntax highlight / diff / soft-wrap over the
+    /// whole history every frame (the cause of input lag in long sessions).
+    /// Message changes update only the affected segments.
     msg_cache: MsgCache,
     /// 帧脏标志：状态变化后置 true，run_loop 仅在 dirty 时重绘（空闲时 8fps 的
     /// tick 不再触发全量重绘）。
@@ -646,26 +655,150 @@ struct TuiState {
     dirty: bool,
 }
 
-/// 消息区渲染缓存。key = (msg_version, 内容区宽度, expand_tool_results)。
-/// Message-area render cache. key = (msg_version, content width, expand_tool_results).
+/// 单条消息的缓存产物（三层）：
+/// - `raw`：render_event 输出（markdown 解析 / syntect 高亮 / diff / 截断），
+///   与宽度无关；ToolCall-diff / ToolResult / Reasoning 的输出依赖 expand。
+/// - `wrapped`：raw 经 wrap_lines 软换行（依赖宽度），未注入边框续行前缀。
+/// - `rendered`：wrapped 经 apply_border_continuation（按本消息独立应用，
+///   等价于全局应用——render_event 每个分支末尾的空行会把状态机重置回
+///   None，消息边界处状态恒为初始值）。
 ///
-/// 同时保存两份软换行结果：
-/// - `wrapped`：未加边框续行前缀，供搜索路径使用（find_matches 列对齐要求
-///   前缀 span 尚未注入）。
-/// - `rendered`：已应用 apply_border_continuation（跨行状态机，必须在切片前
-///   对全量应用一次），无搜索时直接按可见窗口切片克隆。
-///
-/// Two post-wrap variants are kept:
-/// - `wrapped`: without border-continuation prefixes, used by the search path
-///   (find_matches column alignment requires the prefix spans not yet injected).
-/// - `rendered`: apply_border_continuation already applied (a cross-line state
-///   machine — must run over the full vector once, before slicing); sliced by
-///   visible window when search is inactive.
-#[derive(Default)]
-struct MsgCache {
-    key: Option<(u64, u16, bool)>,
+/// Per-message cached artifacts (three tiers):
+/// - `raw`: render_event output (markdown parse / syntect highlight / diff /
+///   truncation); width-independent. ToolCall-diff / ToolResult / Reasoning
+///   outputs depend on expand.
+/// - `wrapped`: raw soft-wrapped by wrap_lines (width-dependent), without
+///   border-continuation prefixes.
+/// - `rendered`: wrapped with apply_border_continuation applied per message
+///   (equivalent to a global pass — every render_event arm ends with a blank
+///   line that resets the state machine to None, so the state at each message
+///   boundary is always the initial value).
+struct MsgLines {
+    raw: Vec<Line<'static>>,
     wrapped: Vec<Line<'static>>,
     rendered: Vec<Line<'static>>,
+}
+
+/// 消息区渲染缓存（增量）：`MsgLines` 段与 `TuiState.messages` 一一对应。
+///
+/// - 追加消息：只渲染 + 换行新增段；旧消息的 markdown/高亮/diff 永不重跑
+///   （长会话流式的主要成本——此前每次 flush 都全量重建）。
+/// - 宽度变化：从 raw 重换行全部旧段（换行便宜，渲染昂贵）。
+/// - expand 翻转：只重渲染依赖 expand 的消息（见 event_uses_expand）。
+/// - 原地改写（refresh_system_header）：经 mark_dirty 按索引重渲染。
+/// - `offsets[i]` 为消息 i 的 wrapped/rendered 行起始序号（两者行数恒等：
+///   续行只加前缀 span，不增减行），供可见窗口跨段切片与搜索对齐。
+///
+/// Incremental message-area render cache: `MsgLines` segments aligned 1:1 with
+/// `TuiState.messages`.
+///
+/// - Append: render + wrap only the new segments; markdown/highlight/diff for
+///   old messages never re-run (the main long-session streaming cost — every
+///   flush used to rebuild the whole history).
+/// - Width change: re-wrap all old segments from raw (wrapping is cheap,
+///   rendering is expensive).
+/// - Expand toggle: re-render only expand-dependent messages (event_uses_expand).
+/// - In-place rewrite (refresh_system_header): re-render by index via mark_dirty.
+/// - `offsets[i]` is the starting display-line index of message i's
+///   wrapped/rendered lines (the two lengths are always equal: continuation
+///   only prefixes spans, never adds/removes lines), used for visible-window
+///   slicing across segments and search alignment.
+#[derive(Default)]
+struct MsgCache {
+    per_msg: Vec<MsgLines>,
+    offsets: Vec<usize>,
+    /// 全部段 rendered 行数之和（== wrapped 行数之和）。
+    /// Sum of rendered lines across segments (== sum of wrapped lines).
+    total: usize,
+    /// wrapped/rendered 构建时的内容区宽度。
+    /// Content width the wrapped/rendered tiers were built at.
+    width: u16,
+    /// 构建时的 expand_tool_results 状态。
+    /// expand_tool_results state the cache was built with.
+    expand: bool,
+    /// 待重渲染的消息索引（expand 翻转 / 原地改写标记）。
+    /// Message indices pending re-render (expand toggle / in-place rewrite).
+    dirty: Vec<usize>,
+    /// render_event 调用计数（测试断言增量性）。
+    /// render_event invocation count (for incrementality test assertions).
+    render_calls: u64,
+}
+
+impl MsgCache {
+    /// 标记消息 idx 待重渲染（原地改写后调用）。
+    /// Mark message idx for re-render (called after an in-place rewrite).
+    fn mark_dirty(&mut self, idx: usize) {
+        self.dirty.push(idx);
+    }
+
+    /// 可见窗口 [start, end) 的 rendered 行：跨段收集，只克隆窗口内的行。
+    /// rendered lines for the visible window [start, end): collected across
+    /// segments; only lines inside the window are cloned.
+    fn rendered_range(&self, start: usize, end: usize) -> Vec<Line<'static>> {
+        let mut out = Vec::with_capacity(end.saturating_sub(start));
+        for (i, m) in self.per_msg.iter().enumerate() {
+            let seg_start = self.offsets[i];
+            let seg_end = seg_start + m.rendered.len();
+            if seg_end <= start {
+                continue;
+            }
+            if seg_start >= end {
+                break;
+            }
+            let lo = start.max(seg_start) - seg_start;
+            let hi = end.min(seg_end) - seg_start;
+            out.extend(m.rendered[lo..hi].iter().cloned());
+        }
+        out
+    }
+
+    /// 搜索路径的可见窗口行：克隆可见的 wrapped 行 → 按全局行号叠加高亮 →
+    /// 以回放的边框状态为初值应用续行前缀（等价于旧全量管线，但只处理窗口）。
+    ///
+    /// Search-path visible window lines: clone the visible wrapped lines →
+    /// overlay highlights by global line number → apply continuation prefixes
+    /// from the replayed border state (equivalent to the old full pipeline,
+    /// but only the window is processed).
+    fn highlighted_range(
+        &self,
+        start: usize,
+        end: usize,
+        matches: &[usize],
+        current: Option<usize>,
+    ) -> Vec<Line<'static>> {
+        let mut out = Vec::with_capacity(end.saturating_sub(start));
+        for (i, m) in self.per_msg.iter().enumerate() {
+            let seg_start = self.offsets[i];
+            let seg_end = seg_start + m.wrapped.len();
+            if seg_end <= start {
+                continue;
+            }
+            if seg_start >= end {
+                break;
+            }
+            let lo = start.max(seg_start) - seg_start;
+            let hi = end.min(seg_end) - seg_start;
+            // 回放 [0..lo) 得到窗口起点处的边框状态（仅扫描首 span，无分配）。
+            // Replay [0..lo) for the border state at the window start (scans
+            // first spans only; no allocation).
+            let border = border_state_at(&m.wrapped, lo);
+            let mut seg: Vec<Line<'static>> = m.wrapped[lo..hi].to_vec();
+            highlight_matches_in(&mut seg, seg_start + lo, matches, current);
+            out.extend(apply_border_continuation_from(seg, border));
+        }
+        out
+    }
+
+    /// 重建 offsets / total（段数量或任一段行数变化后调用）。
+    /// Rebuild offsets / total (after the segment count or any length changes).
+    fn rebuild_offsets(&mut self) {
+        self.offsets = Vec::with_capacity(self.per_msg.len());
+        self.total = 0;
+        for m in &self.per_msg {
+            self.offsets.push(self.total);
+            self.total += m.rendered.len();
+        }
+    }
 }
 
 impl TuiState {
@@ -728,29 +861,97 @@ impl TuiState {
             autocomplete_sel: 0,
             autocomplete_area: Rect::new(0, 0, 0, 0),
             autocomplete_dismissed: false,
-            msg_version: 0,
             msg_cache: MsgCache::default(),
             // 首帧必须绘制 / First frame must be drawn.
             dirty: true,
         }
     }
 
-    /// 确保消息渲染缓存与 (msg_version, width, expand) 对齐；失配时重建。
-    /// Ensure the message render cache matches (msg_version, width, expand);
-    /// rebuild on mismatch.
+    /// 确保消息渲染缓存与 (messages, width, expand) 对齐；增量更新：
+    /// 追加只渲染新消息，宽度变化只重换行（从 raw），expand 翻转只重渲染
+    /// 依赖方，原地改写走 mark_dirty。旧消息的 markdown 解析 / syntect 高亮
+    /// / diff 对给定 (expand, 内容) 只跑一次——这是长会话流式不退化的关键。
+    /// Ensure the message render cache matches (messages, width, expand);
+    /// incremental updates: appends render only new messages, width changes
+    /// re-wrap only (from raw), expand toggles re-render only dependents,
+    /// in-place rewrites go through mark_dirty. Markdown parse / syntect
+    /// highlight / diff for an old message run exactly once per (expand,
+    /// content) — this is what keeps long-session streaming from degrading.
     fn ensure_msg_cache(&mut self, width: u16) {
-        let key = (self.msg_version, width, self.expand_tool_results);
-        if self.msg_cache.key == Some(key) {
+        // ── 0. 快路径：无任何变化（每帧的常态）──
+        // ── 0. Fast path: nothing changed (the per-frame norm) ──
+        if self.msg_cache.per_msg.len() == self.messages.len()
+            && self.msg_cache.width == width
+            && self.msg_cache.expand == self.expand_tool_results
+            && self.msg_cache.dirty.is_empty()
+        {
             return;
         }
-        let all_lines = self.all_message_lines();
-        let wrapped = crate::ui::wrap::wrap_lines(&all_lines, width);
-        let rendered = apply_border_continuation(wrapped.clone());
-        self.msg_cache = MsgCache {
-            key: Some(key),
-            wrapped,
-            rendered,
-        };
+        let mut structural = false;
+
+        // ── 1. expand 翻转：标记依赖 expand 的消息待重渲染 ──
+        // ── 1. Expand toggle: mark expand-dependent messages dirty ──
+        if self.msg_cache.expand != self.expand_tool_results {
+            let dirty_idx: Vec<usize> = self
+                .messages
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| event_uses_expand(m))
+                .map(|(i, _)| i)
+                .collect();
+            self.msg_cache.dirty.extend(dirty_idx);
+            self.msg_cache.expand = self.expand_tool_results;
+        }
+
+        // ── 2. 宽度变化：旧段从 raw 重换行（新段在步骤 3 直接按新宽度换行）──
+        // ── 2. Width change: re-wrap old segments from raw (new segments are
+        // wrapped at the new width directly in step 3) ──
+        let width_changed = self.msg_cache.width != width;
+        let old_len = self.msg_cache.per_msg.len();
+        if width_changed {
+            for m in self.msg_cache.per_msg.iter_mut() {
+                let wrapped = crate::ui::wrap::wrap_lines(&m.raw, width);
+                let rendered = apply_border_continuation(wrapped.clone());
+                m.wrapped = wrapped;
+                m.rendered = rendered;
+            }
+            self.msg_cache.width = width;
+            structural = true;
+        }
+
+        // ── 3. 追加新消息：只渲染 + 换行新增段 ──
+        // ── 3. Append: render + wrap only the new segments ──
+        while self.msg_cache.per_msg.len() < self.messages.len() {
+            let i = self.msg_cache.per_msg.len();
+            let raw = render_event(&self.messages[i], self.expand_tool_results);
+            self.msg_cache.render_calls += 1;
+            let wrapped = crate::ui::wrap::wrap_lines(&raw, width);
+            let rendered = apply_border_continuation(wrapped.clone());
+            self.msg_cache
+                .per_msg
+                .push(MsgLines { raw, wrapped, rendered });
+            structural = true;
+        }
+
+        // ── 4. 脏消息重渲染（expand 依赖 / 原地改写）──
+        // 步骤 3 中已按当前状态渲染的追加消息无需重跑。
+        // ── 4. Dirty re-render (expand-dependent / in-place rewrite). Messages
+        // appended in step 3 were already rendered with the current state.
+        for i in std::mem::take(&mut self.msg_cache.dirty) {
+            if i >= old_len || i >= self.msg_cache.per_msg.len() {
+                continue;
+            }
+            let raw = render_event(&self.messages[i], self.expand_tool_results);
+            self.msg_cache.render_calls += 1;
+            let wrapped = crate::ui::wrap::wrap_lines(&raw, self.msg_cache.width);
+            let rendered = apply_border_continuation(wrapped.clone());
+            self.msg_cache.per_msg[i] = MsgLines { raw, wrapped, rendered };
+            structural = true;
+        }
+
+        if structural {
+            self.msg_cache.rebuild_offsets();
+        }
     }
 
     fn tick(&mut self) {
@@ -775,10 +976,15 @@ impl TuiState {
 
     /// 将事件推入消息历史，同时写入 tracing 文件日志。
     /// 这样文件 log 与终端 TUI 显示的内容保持一致。
+    /// 缓存经结构对齐（per_msg.len() == messages.len()）自动感知追加，
+    /// 无需版本号。
+    /// Push an event into message history and write it to the tracing file log,
+    /// keeping file log and terminal display in sync. The cache picks appends
+    /// up structurally (per_msg.len() == messages.len()); no version counter
+    /// needed.
     fn push_event(&mut self, event: AgentEvent) {
         log_event(&event);
         self.messages.push(event);
-        self.msg_version += 1;
     }
 
     /// 切换模型/供应商后，更新首条 System 消息使其反映当前状态。
@@ -790,7 +996,10 @@ impl TuiState {
     fn refresh_system_header(&mut self) {
         if let Some(AgentEvent::System(text)) = self.messages.first_mut() {
             *text = format!("moye ({}) | model: {}", self.provider, self.model);
-            self.msg_version += 1;
+            // 原地改写不改变 messages.len()，须显式标记消息 0 待重渲染。
+            // An in-place rewrite doesn't change messages.len(); message 0 must
+            // be explicitly marked for re-render.
+            self.msg_cache.mark_dirty(0);
         }
     }
 
@@ -971,7 +1180,20 @@ fn bordered(lines: Vec<Line<'static>>, border: Style) -> Vec<Line<'static>> {
 /// Search highlighting runs before this (spans already carry bg patches);
 /// the border span added here is NOT search-patched (clean border look).
 fn apply_border_continuation(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
-    let mut current_border: Option<Style> = None;
+    apply_border_continuation_from(lines, None)
+}
+
+/// 同上，但状态机从 `initial` 起步（搜索路径只处理可见窗口时，窗口起点可能
+/// 落在某个边框块中间——初值由 border_state_at 回放得到）。
+///
+/// Same as above, but the state machine starts from `initial` (when the search
+/// path processes only the visible window, the window start may fall inside a
+/// bordered block — the initial value comes from border_state_at's replay).
+fn apply_border_continuation_from(
+    lines: Vec<Line<'static>>,
+    initial: Option<Style>,
+) -> Vec<Line<'static>> {
+    let mut current_border = initial;
     lines
         .into_iter()
         .map(|line| {
@@ -998,6 +1220,44 @@ fn apply_border_continuation(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
             }
         })
         .collect()
+}
+
+/// 回放 wrapped 行 [0..lo) 推导窗口起点处的边框续行状态。镜像
+/// apply_border_continuation_from 的状态转移：以 `┃` 开头 → 记录样式；
+/// 空行 → 重置；其余非空行（续行）→ 状态保持。
+///
+/// Replay wrapped lines [0..lo) to derive the border-continuation state at the
+/// window start. Mirrors apply_border_continuation_from's transitions: a line
+/// starting with `┃` records its style; an empty line resets; other non-empty
+/// lines (continuations) keep the state.
+fn border_state_at(lines: &[Line<'static>], lo: usize) -> Option<Style> {
+    let mut current: Option<Style> = None;
+    for line in lines.iter().take(lo) {
+        if let Some(first) = line.spans.first()
+            && first.content.starts_with('\u{2503}')
+        {
+            current = Some(first.style);
+        } else if line.spans.is_empty() {
+            current = None;
+        }
+    }
+    current
+}
+
+/// render_event 的输出是否依赖 expand 参数——增量缓存在 expand 翻转时只
+/// 重渲染这些消息，其余直接复用。
+/// Whether render_event's output depends on the expand argument — on an
+/// expand toggle the incremental cache re-renders only these messages and
+/// reuses the rest.
+fn event_uses_expand(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::ToolCall {
+            diff: Some(_),
+            ..
+        } | AgentEvent::ToolResult { .. }
+            | AgentEvent::Reasoning(_)
+    )
 }
 
 fn render_event(event: &AgentEvent, expand: bool) -> Vec<Line<'static>> {
@@ -1293,11 +1553,20 @@ pub async fn run_tui(ctx: Arc<AppContext>) -> anyhow::Result<()> {
         }
     }
     state.push_event(AgentEvent::Info(
-        "Enter \u{53d1}\u{9001}\u{4efb}\u{52a1} | Alt+Enter \u{6362}\u{884c} | /help \u{5e2e}\u{52a9} | Esc \u{4e2d}\u{65ad}\u{4efb}\u{52a1} | Ctrl+C \u{9000}\u{51fa}".into(),
+        "Enter \u{53d1}\u{9001}\u{4efb}\u{52a1} | Alt/Shift+Enter \u{6362}\u{884c} | /help \u{5e2e}\u{52a9} | Esc \u{4e2d}\u{65ad}\u{4efb}\u{52a1} | Ctrl+C \u{9000}\u{51fa}".into(),
     ));
 
     let mut events = EventStream::new();
     let mut tick = interval(Duration::from_millis(TICK_MS));
+    // 交互式终端快速轮询：select 分支带 guard，默认休眠；overlay 打开时
+    // 25ms 一拍（原 120ms 对 vim/htop 类输出有可感知延迟）。Skip 避免
+    // 关闭期间积压的 tick 在重开时突发。
+    // Fast poll for the interactive terminal: the select branch is guarded and
+    // dormant by default; 25ms per beat while the overlay is open (the old
+    // 120ms cadence was perceptibly laggy for vim/htop-style output). Skip
+    // prevents ticks accumulated while closed from bursting on reopen.
+    let mut fast_tick = interval(Duration::from_millis(INTERACTIVE_TICK_MS));
+    fast_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let result = run_loop(
         &mut terminal,
@@ -1307,11 +1576,13 @@ pub async fn run_tui(ctx: Arc<AppContext>) -> anyhow::Result<()> {
         &mut action_rx,
         &mut events,
         &mut tick,
+        &mut fast_tick,
     )
     .await;
 
     drop(events);
     drop(tick);
+    drop(fast_tick);
 
     restore_terminal(SAVED_TERMIOS.get().and_then(|opt| opt.as_ref()));
 
@@ -1326,6 +1597,7 @@ async fn run_loop(
     action_rx: &mut EventReceiver,
     events: &mut EventStream,
     tick: &mut tokio::time::Interval,
+    fast_tick: &mut tokio::time::Interval,
 ) -> anyhow::Result<()> {
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -1394,26 +1666,33 @@ async fn run_loop(
                 if state.spinner != before {
                     state.dirty = true;
                 }
-                // 轮询内嵌交互式终端：排空 PTY 输出 + 检查子进程退出。
-                // Poll in-TUI interactive terminal: drain PTY output + check exit.
-                if state.interactive.is_some() {
-                    let interactive = state.interactive.as_mut().unwrap();
-                    let new_data = interactive.poll_output();
-                    let exited = interactive.check_exit();
-                    if new_data || exited {
-                        state.dirty = true;
+            }
+            // 交互式 overlay 打开期间的 25ms 快速轮询：guard 条件保证 overlay
+            // 关闭时该分支休眠，定时器空转不做任何工作。
+            // 25ms fast poll while the interactive overlay is open: the guard
+            // keeps this branch dormant otherwise, so a firing timer with no
+            // overlay does no work.
+            _ = fast_tick.tick(), if state.interactive.is_some() => {
+                // 排空 PTY 输出 + 检查子进程退出。
+                // Drain PTY output + check child exit.
+                let Some(interactive) = state.interactive.as_mut() else {
+                    continue;
+                };
+                let new_data = interactive.poll_output();
+                let exited = interactive.check_exit();
+                if new_data || exited {
+                    state.dirty = true;
+                }
+                if exited {
+                    let output = std::mem::take(&mut interactive.output);
+                    let code = interactive.exit_code.unwrap_or(-1);
+                    if let Some(resp) = interactive.responder.take() {
+                        let _ = resp.send(format!("exit={code}\n{output}"));
                     }
-                    if exited {
-                        let output = std::mem::take(&mut interactive.output);
-                        let code = interactive.exit_code.unwrap_or(-1);
-                        if let Some(resp) = interactive.responder.take() {
-                            let _ = resp.send(format!("exit={code}\n{output}"));
-                        }
-                        state.interactive = None;
-                        state.push_event(AgentEvent::Info(format!(
-                            "\u{2705} \u{4ea4}\u{4e92}\u{5f0f}\u{547d}\u{4ee4}\u{5b8c}\u{6210} (exit={code}) / interactive command finished"
-                        )));
-                    }
+                    state.interactive = None;
+                    state.push_event(AgentEvent::Info(format!(
+                        "\u{2705} \u{4ea4}\u{4e92}\u{5f0f}\u{547d}\u{4ee4}\u{5b8c}\u{6210} (exit={code}) / interactive command finished"
+                    )));
                 }
             }
             _ = &mut ctrl_c => {
@@ -1752,27 +2031,30 @@ fn handle_key_event(
         }
     }
 
-    // Alt+Enter 插入换行（须在普通 Enter 提交前拦截，否则会被 Enter 提交路径捕获）。
-    // Alt+Enter inserts a newline (must intercept before the plain Enter submit
-    // arm, otherwise it would be captured by the Enter submit path).
-    // 注意：Shift+Enter 未实现——终端无 kitty keyboard-protocol 时 Shift+Enter
-    // 与 Enter 不可区分，实现它会静默提交。详见报告。
-    // Note: Shift+Enter is NOT implemented — without the kitty keyboard protocol,
-    // Shift+Enter is indistinguishable from Enter and would silently submit.
-    // See the report for details.
-    if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::ALT) {
+    // Alt+Enter / Shift+Enter 插入换行（须在普通 Enter 提交前拦截，否则会被
+    // Enter 提交路径捕获）。Shift+Enter 依赖 enter() 时推入的 kitty 键盘协议
+    // （DISAMBIGUATE_ESCAPE_CODES）才与裸 Enter 可区分；不支持该协议的终端
+    // 会把 Shift+Enter 退化为裸 Enter（提交），Alt+Enter / Ctrl+J 仍可用。
+    // Alt+Enter / Shift+Enter insert a newline (must intercept before the plain
+    // Enter submit arm, otherwise they would be captured by the submit path).
+    // Shift+Enter depends on the kitty keyboard protocol pushed at enter()
+    // (DISAMBIGUATE_ESCAPE_CODES) to be distinguishable from bare Enter;
+    // terminals without it degrade Shift+Enter to bare Enter (submit), and
+    // Alt+Enter / Ctrl+J remain available.
+    if key.code == KeyCode::Enter
+        && (key.modifiers.contains(KeyModifiers::ALT) || key.modifiers == KeyModifiers::SHIFT)
+    {
         state.input.insert_newline();
         return;
     }
 
     match key.code {
         KeyCode::Enter => {
-            // 仅在修饰键为空（或仅 SHIFT）时提交；Alt+Enter 已在上方拦截为换行。
-            // Submit only when modifiers are empty (or SHIFT-only); Alt+Enter was
-            // intercepted above as a newline.
-            let shift_only =
-                key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
-            if shift_only && !state.thinking
+            // 仅在修饰键为空时提交；Alt/Shift+Enter 已在上方拦截为换行。
+            // Submit only when modifiers are empty; Alt/Shift+Enter were
+            // intercepted above as newlines.
+            if key.modifiers.is_empty()
+                && !state.thinking
                 && let Some(input) = state.input.take_submitted()
             {
                 // 持久化输入历史（save-on-submit 是崩溃安全的；文件很小）。
@@ -1861,6 +2143,7 @@ fn copy_selection(state: &mut TuiState) {
 /// Returns display-line indices whose concatenated span text contains query
 /// (case-insensitive). Empty query → empty result. CJK-safe: operates on
 /// full Strings via to_lowercase + contains, never slicing mid-char.
+#[cfg(test)]
 fn find_matches(lines: &[Line<'static>], query: &str) -> Vec<usize> {
     if query.is_empty() {
         return Vec::new();
@@ -1870,14 +2153,41 @@ fn find_matches(lines: &[Line<'static>], query: &str) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(i, line)| {
-            let text: String = line.spans.iter().flat_map(|s| s.content.chars()).collect();
-            if text.to_lowercase().contains(&q) {
+            if line_matches_query(line, &q) {
                 Some(i)
             } else {
                 None
             }
         })
         .collect()
+}
+
+fn line_matches_query(line: &Line<'_>, q_lower: &str) -> bool {
+    let text: String = line.spans.iter().flat_map(|s| s.content.chars()).collect();
+    text.to_lowercase().contains(q_lower)
+}
+
+/// 段化版 find_matches：跨 MsgCache.per_msg.wrapped 段收集匹配的全局行号
+/// （offsets[i] 为段起点），语义与 find_matches 一致但免拼全量向量。
+/// Segment-wise find_matches: collect matching global line numbers across the
+/// MsgCache.per_msg.wrapped segments (offsets[i] is each segment's start);
+/// semantically identical to find_matches without materializing the full
+/// concatenation.
+fn find_matches_segments(cache: &MsgCache, query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let q = query.to_lowercase();
+    let mut out = Vec::new();
+    for (i, m) in cache.per_msg.iter().enumerate() {
+        let off = cache.offsets.get(i).copied().unwrap_or(0);
+        for (j, line) in m.wrapped.iter().enumerate() {
+            if line_matches_query(line, &q) {
+                out.push(off + j);
+            }
+        }
+    }
+    out
 }
 
 /// 下一个匹配（环绕）。len==0 时返回 0（调用方应先判空）。
@@ -1927,31 +2237,45 @@ fn jump_target_scroll(idx: usize, total: usize, height: u16) -> u16 {
 /// DarkGray), preserving the original span fg. Uses Style::patch: the
 /// highlight sets bg only, so fg/modifier survive patching. Non-matched
 /// lines are returned untouched.
+#[cfg(test)]
 fn highlight_matches(
     lines: Vec<Line<'static>>,
     matches: &[usize],
     current: Option<usize>,
 ) -> Vec<Line<'static>> {
+    let mut lines = lines;
+    highlight_matches_in(&mut lines, 0, matches, current);
     lines
-        .into_iter()
-        .enumerate()
-        .map(|(i, mut line)| {
-            if matches.contains(&i) {
-                let highlight = if Some(i) == current {
-                    theme::search_current()
-                } else {
-                    theme::search_match()
-                };
-                for span in line.spans.iter_mut() {
-                    // patch 仅覆盖 bg（highlight 的 fg=None），原 fg/modifier 保留。
-                    // patch overwrites bg only (highlight fg=None); original
-                    // fg/modifier survive — honors the code_block line-style contract.
-                    span.style = span.style.patch(highlight);
-                }
+}
+
+/// 段内高亮：把全局行号 [seg_start, seg_start+len) 区间内命中 matches 的行
+/// 叠加搜索 bg。与全量版语义一致——窗口外的匹配行根本不会被克隆。
+///
+/// In-segment highlight: patch the search bg onto lines whose global index
+/// (seg_start + local) hits `matches`. Same semantics as the full-vector
+/// version — matched lines outside the visible window are never even cloned.
+fn highlight_matches_in(
+    lines: &mut [Line<'static>],
+    seg_start: usize,
+    matches: &[usize],
+    current: Option<usize>,
+) {
+    for (i, line) in lines.iter_mut().enumerate() {
+        let g = seg_start + i;
+        if matches.contains(&g) {
+            let highlight = if Some(g) == current {
+                theme::search_current()
+            } else {
+                theme::search_match()
+            };
+            for span in line.spans.iter_mut() {
+                // patch 仅覆盖 bg（highlight 的 fg=None），原 fg/modifier 保留。
+                // patch overwrites bg only (highlight fg=None); original
+                // fg/modifier survive — honors the code_block line-style contract.
+                span.style = span.style.patch(highlight);
             }
-            line
-        })
-        .collect()
+        }
+    }
 }
 
 /// 搜索模式按键处理（从 handle_key_event 抽出以便单测）。
@@ -2025,50 +2349,81 @@ fn apply_search_key(state: &mut TuiState, key: KeyEvent) -> bool {
 }
 
 /// draw_messages 中调用：重算搜索匹配（对齐渲染用的软换行向量）、
-/// 确保当前匹配行可见（仅在离开可见区时滚动）、叠加高亮。
-/// 返回（可能已高亮的）显示行向量。
+/// 确保当前匹配行可见（仅在离开可见区时滚动）、返回叠加高亮与续行前缀的
+/// 可见窗口行。替代旧全量管线（每帧 clone 全部 wrapped 行再切窗口）：
+/// 1) dirty_key 变化时在段上重算匹配（全局行号）；
+/// 2) 当前匹配不可见时跳转（改写 scroll_offset）；
+/// 3) 只克隆可见窗口行、按全局行号叠加高亮、以回放的边框状态应用续行前缀
+///    （见 MsgCache::highlighted_range）。
 ///
 /// Called from draw_messages: recompute search matches (aligned with the
-/// soft-wrapped vector used for rendering), ensure the current match is
-/// visible (scroll only when outside the visible area), and overlay
-/// highlights. Returns the (possibly highlighted) display-line vector.
-fn apply_search_draw(
+/// soft-wrapped vector used for rendering), keep the current match visible
+/// (jumping only when it leaves the visible area), and return the visible
+/// window lines with highlights and continuation prefixes applied. Replaces
+/// the old full pipeline (which cloned every wrapped line each frame before
+/// slicing the window):
+/// 1) recompute matches over segments when dirty_key changes (global indices);
+/// 2) jump when the current match is off-screen (rewrites scroll_offset);
+/// 3) clone only the visible window, overlay highlights by global line
+///    number, apply continuation prefixes from the replayed border state
+///    (see MsgCache::highlighted_range).
+fn search_visible_lines(
     state: &mut TuiState,
-    display_lines: Vec<Line<'static>>,
-    total: u16,
-    base: u16,
+    total: usize,
+    base: usize,
     inner: Rect,
 ) -> Vec<Line<'static>> {
-    let Some(search) = state.search.as_mut() else {
-        return display_lines;
-    };
-    // 重算匹配：dirty_key = (messages.len(), inner.width, query)
-    let key = (state.messages.len(), inner.width, search.query.clone());
-    if search.dirty_key != key {
-        search.matches = find_matches(&display_lines, &search.query);
-        if search.current >= search.matches.len() {
-            search.current = 0;
-        }
-        search.dirty_key = key;
-    }
-    // 确保当前匹配行在可见区 [scroll_now, scroll_now+height) 内；
-    // 仅在离开时跳转（避免每次按键都跳动）。
-    // Keep the current match inside [scroll_now, scroll_now+height); jump
-    // only when it's outside (avoids jumping on every keystroke).
-    if !search.matches.is_empty() {
-        let idx = search.matches[search.current.min(search.matches.len() - 1)];
-        let scroll_now = base.saturating_sub(state.scroll_offset);
-        let idx16 = idx as u16;
-        if idx16 < scroll_now || idx16 >= scroll_now.saturating_add(inner.height) {
-            state.scroll_offset = jump_target_scroll(idx, total as usize, inner.height);
-            state.user_scrolled = true;
+    // ── 1. 重算匹配：dirty_key = (messages.len(), inner.width, query) ──
+    // ── 1. Recompute matches: dirty_key = (messages.len(), width, query) ──
+    let stale = state.search.as_ref().is_some_and(|s| {
+        s.dirty_key.0 != state.messages.len()
+            || s.dirty_key.1 != inner.width
+            || s.dirty_key.2 != s.query
+    });
+    if stale {
+        let query = state.search.as_ref().map(|s| s.query.clone());
+        if let Some(query) = query {
+            let matches = find_matches_segments(&state.msg_cache, &query);
+            let key = (state.messages.len(), inner.width, query);
+            if let Some(search) = state.search.as_mut() {
+                search.matches = matches;
+                if search.current >= search.matches.len() {
+                    search.current = 0;
+                }
+                search.dirty_key = key;
+            }
         }
     }
-    if search.matches.is_empty() {
-        display_lines
+    // ── 2. 当前匹配可见性：确保落在 [scroll_now, scroll_now+height) 内；
+    // 仅在离开时跳转（避免每次按键都跳动）。──
+    // ── 2. Current-match visibility: keep it inside [scroll_now,
+    // scroll_now+height); jump only when outside (avoids jumping on every
+    // keystroke). ──
+    if let Some(search) = state.search.as_ref() {
+        if !search.matches.is_empty() {
+            let idx = search.matches[search.current.min(search.matches.len() - 1)];
+            let scroll_now = base.saturating_sub(state.scroll_offset as usize);
+            let height = inner.height as usize;
+            if idx < scroll_now || idx >= scroll_now.saturating_add(height) {
+                state.scroll_offset = jump_target_scroll(idx, total, inner.height);
+                state.user_scrolled = true;
+            }
+        }
+    }
+    // ── 3. 可见窗口行（含高亮 + 续行前缀）。search 与 msg_cache 均为不可变
+    // 借用，可并存。──
+    // ── 3. Visible-window lines (with highlights + prefixes). Both the search
+    // and cache borrows are immutable, so they coexist. ──
+    let scroll = base.saturating_sub(state.scroll_offset as usize);
+    let start = scroll.min(total);
+    let end = (start + inner.height as usize).min(total);
+    if let Some(search) = state.search.as_ref() {
+        let cur = search.current.min(search.matches.len().saturating_sub(1));
+        state
+            .msg_cache
+            .highlighted_range(start, end, &search.matches, Some(cur))
     } else {
-        let cur = search.current.min(search.matches.len() - 1);
-        highlight_matches(display_lines, &search.matches, Some(cur))
+        Vec::new()
     }
 }
 
@@ -2116,12 +2471,13 @@ fn apply_autocomplete_key(
             true
         }
         KeyCode::Enter => {
-            if key.modifiers.contains(KeyModifiers::ALT) {
+            // Alt/Shift+Enter 交给主链拦截为换行（与主输入框行为一致）。
+            // Alt/Shift+Enter delegate to the main chain's newline intercept
+            // (consistent with the main input box).
+            if key.modifiers.contains(KeyModifiers::ALT) || key.modifiers == KeyModifiers::SHIFT {
                 return false;
             }
-            let shift_only =
-                key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
-            if !shift_only || state.thinking {
+            if !key.modifiers.is_empty() || state.thinking {
                 return true;
             }
             let decision = autocomplete_enter_decision(
@@ -3689,51 +4045,41 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
     // Store the message content area for handle_mouse_event hit-testing.
     state.msg_area = inner;
 
-    // 渲染缓存：仅当 (msg_version, 宽度, expand) 变化时才重新跑 markdown 解析、
-    // 语法高亮、diff 与软换行；否则直接复用。这是输入框卡顿的主要修复点——
-    // 此前每帧（含每个按键回显）都对全量历史重渲染。
-    // Render cache: re-runs markdown parse / syntax highlight / diff / soft-wrap
-    // only when (msg_version, width, expand) changes; otherwise reuses. This is
-    // the main fix for input lag — previously every frame (including every
-    // keystroke echo) re-rendered the entire history.
+    // 渲染缓存：增量维护（详见 MsgCache）。每帧常态是 O(1) 快路径检查；
+    // 消息追加只渲染新段，长会话流式不再 O(全量历史) 重建。
+    // Render cache: incrementally maintained (see MsgCache). The per-frame
+    // norm is an O(1) fast-path check; appended messages render only their
+    // own segments, so long-session streaming no longer rebuilds O(history).
     state.ensure_msg_cache(inner.width);
-    let total = state.msg_cache.rendered.len() as u16;
-    let base = total.saturating_sub(inner.height);
+    let total = state.msg_cache.total;
+    let base = total.saturating_sub(inner.height as usize);
 
-    // 搜索：draw 时重算匹配（对齐软换行向量）、确保当前匹配可见、叠加高亮。
-    // 须在算 scroll 之前调用——跳转会改写 scroll_offset。
-    // Search: recompute matches at draw (aligned with the wrapped vector),
-    // ensure the current match is visible, overlay highlights. Must run before
-    // computing scroll — a jump rewrites scroll_offset.
+    // 搜索：对齐软换行向量重算匹配（dirty_key 变化时）、确保当前匹配可见、
+    // 只对可见窗口叠加高亮与续行前缀（状态机回放，见 highlighted_range）。
+    // 须在算 scroll 之前——跳转会改写 scroll_offset。
+    // Search: recompute matches aligned with the wrapped vector (on dirty_key
+    // change), keep the current match visible, overlay highlights and
+    // continuation prefixes on the visible window only (state replay, see
+    // highlighted_range). Must run before computing scroll — a jump rewrites
+    // scroll_offset.
     //
-    // 只把"可见窗口"克隆给 Paragraph：长会话下避免每帧克隆全部显示行。
+    // 非搜索路径只克隆可见窗口内的行：每帧成本与窗口高度成正比，与历史长度无关。
     // 选区高亮的 逻辑行→屏幕行 公式 inner.y + (logical - scroll) 保持不变。
-    // Only the visible window is cloned for the Paragraph: avoids cloning all
-    // display lines per frame in long sessions. The selection overlay's
-    // logical→screen formula inner.y + (logical - scroll) is unchanged.
+    // The non-search path clones only the lines inside the visible window:
+    // per-frame cost scales with window height, not history length. The
+    // selection overlay's logical→screen formula inner.y + (logical - scroll)
+    // is unchanged.
     let visible: Vec<Line<'static>> = if state.search.is_some() {
-        // 搜索路径：在全量"预边框"行上重算匹配并叠加高亮（列对齐要求），
-        // 再补边框续行前缀，最后切可见窗口。搜索模式不常开，全量克隆可接受。
-        // Search path: recompute matches and overlay highlights over the full
-        // pre-border lines (required for column alignment), then re-apply
-        // border-continuation prefixes, then slice the visible window. Search
-        // mode is rare, so the full clone is acceptable.
-        let pre_border = state.msg_cache.wrapped.clone();
-        let searched = apply_search_draw(state, pre_border, total, base, inner);
-        let lines = apply_border_continuation(searched);
-        let scroll = base.saturating_sub(state.scroll_offset);
-        let start = (scroll as usize).min(lines.len());
-        let end = (start + inner.height as usize).min(lines.len());
-        lines[start..end].to_vec()
+        search_visible_lines(state, total, base, inner)
     } else {
-        let scroll = base.saturating_sub(state.scroll_offset);
-        let start = (scroll as usize).min(state.msg_cache.rendered.len());
-        let end = (start + inner.height as usize).min(state.msg_cache.rendered.len());
-        state.msg_cache.rendered[start..end].to_vec()
+        let scroll = base.saturating_sub(state.scroll_offset as usize);
+        let start = scroll.min(total);
+        let end = (start + inner.height as usize).min(total);
+        state.msg_cache.rendered_range(start, end)
     };
 
-    let scroll = base.saturating_sub(state.scroll_offset);
-    state.msg_scroll = scroll;
+    let scroll = base.saturating_sub(state.scroll_offset as usize);
+    state.msg_scroll = scroll as u16;
 
     // visible[0] 对应逻辑行 scroll，因此无需 Paragraph::scroll。
     // visible[0] is logical row `scroll`, so Paragraph::scroll is unnecessary.
@@ -3751,15 +4097,16 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
     if let Some(sel) = state.selection {
         let (lo_line, lo_col, hi_line, hi_col) = sel.bounds();
         let buf = f.buffer_mut();
+        let scroll_u16 = scroll as u16;
         for logical in lo_line..=hi_line {
             let logical_u16 = match u16::try_from(logical) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if logical_u16 < scroll {
+            if logical_u16 < scroll_u16 {
                 continue;
             }
-            let screen_row = inner.y + (logical_u16 - scroll);
+            let screen_row = inner.y + (logical_u16 - scroll_u16);
             if screen_row >= inner.y + inner.height {
                 continue;
             }
@@ -3783,10 +4130,10 @@ fn draw_messages(f: &mut Frame, area: Rect, state: &mut TuiState) {
         }
     }
 
-    if total > inner.height {
+    if total > inner.height as usize {
         let mut sb_state = ScrollbarState::default()
-            .content_length(total as usize)
-            .position(scroll as usize);
+            .content_length(total)
+            .position(scroll);
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("\u{2191}"))
@@ -6456,5 +6803,219 @@ mod tests {
         );
         let single = thinking_lines_with_spinner("\u{280b}", vec!["only".to_string()]);
         assert_eq!(joined_spans(&single[0]), "\u{280b} only".to_string());
+    }
+
+    // ===== 增量渲染缓存 / incremental render cache =====
+
+    // 多样化消息历史：覆盖各 render_event 分支（含三类 expand 依赖消息）。
+    // A varied message history covering the render_event arms (including the
+    // three expand-dependent kinds).
+    fn varied_state() -> TuiState {
+        let mut state = TuiState::new(
+            "test-provider".to_string(),
+            "test-model".to_string(),
+            20,
+            vec!["read_file".to_string(), "edit_file".to_string()],
+            vec![],
+            vec![],
+        );
+        state.push_event(AgentEvent::System("banner".to_string()));
+        state.push_event(AgentEvent::User("do things".to_string()));
+        state.push_event(AgentEvent::Agent(
+            "# Title\n\n**bold** and `code`\n\n```rust\nfn main() {}\n```".to_string(),
+        ));
+        state.push_event(AgentEvent::ToolCall {
+            name: "read_file".to_string(),
+            desc: "src/lib.rs".to_string(),
+            diff: None,
+        });
+        state.push_event(AgentEvent::ToolCall {
+            name: "edit_file".to_string(),
+            desc: "src/main.rs".to_string(),
+            diff: Some(Box::new(crate::event::FileEdit {
+                path: "src/main.rs".to_string(),
+                old: "old line\n".to_string(),
+                new: "new line\n".to_string(),
+            })),
+        });
+        state.push_event(AgentEvent::ToolResult {
+            name: "run_bash".to_string(),
+            result: "cargo build\nok".to_string(),
+            ok: true,
+        });
+        state.push_event(AgentEvent::Info("info line".to_string()));
+        state.push_event(AgentEvent::Error("error line".to_string()));
+        state.push_event(AgentEvent::Reasoning("thinking".to_string()));
+        state
+    }
+
+    // 参照实现：旧全量管线（渲染全部消息 → 全局换行 → 全局续行前缀）。
+    // Reference: the old full pipeline (render all messages → global wrap →
+    // global continuation prefixes).
+    fn full_rebuild_lines(state: &TuiState, width: u16) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        for msg in &state.messages {
+            lines.extend(render_event(msg, state.expand_tool_results));
+        }
+        apply_border_continuation(crate::ui::wrap::wrap_lines(&lines, width))
+    }
+
+    fn cache_rendered(state: &TuiState) -> Vec<Line<'static>> {
+        state
+            .msg_cache
+            .per_msg
+            .iter()
+            .flat_map(|m| m.rendered.clone())
+            .collect()
+    }
+
+    fn assert_lines_equal(got: &[Line<'static>], want: &[Line<'static>], ctx: &str) {
+        assert_eq!(got.len(), want.len(), "{ctx}: line count differs");
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(g.spans, w.spans, "{ctx}: line {i} spans differ");
+            assert_eq!(g.style, w.style, "{ctx}: line {i} style differs");
+        }
+    }
+
+    // 增量缓存（初始/追加/宽度/expand 翻转）与旧全量管线逐行等价。
+    // The incremental cache (initial / append / width / expand toggle) is
+    // line-for-line equivalent to the old full rebuild pipeline.
+    #[test]
+    fn incremental_cache_equals_full_rebuild() {
+        let mut state = varied_state();
+
+        state.ensure_msg_cache(40);
+        assert_lines_equal(&cache_rendered(&state), &full_rebuild_lines(&state, 40), "initial");
+
+        state.push_event(AgentEvent::Info("appended one".to_string()));
+        state.push_event(AgentEvent::User("appended two".to_string()));
+        state.ensure_msg_cache(40);
+        assert_lines_equal(&cache_rendered(&state), &full_rebuild_lines(&state, 40), "append");
+
+        state.ensure_msg_cache(23);
+        assert_lines_equal(&cache_rendered(&state), &full_rebuild_lines(&state, 23), "width 23");
+
+        state.expand_tool_results = true;
+        state.ensure_msg_cache(23);
+        assert_lines_equal(&cache_rendered(&state), &full_rebuild_lines(&state, 23), "expand on");
+
+        state.expand_tool_results = false;
+        state.ensure_msg_cache(23);
+        assert_lines_equal(&cache_rendered(&state), &full_rebuild_lines(&state, 23), "expand off");
+    }
+
+    // 增量性：无变化零渲染；追加恰好 +1；宽度变化零重渲染（只重换行）。
+    // Incrementality: a no-op renders nothing; an append renders exactly +1;
+    // a width change re-renders nothing (re-wrap only).
+    #[test]
+    fn append_does_not_rerender_old_messages() {
+        let mut state = varied_state();
+        state.ensure_msg_cache(40);
+        let calls = state.msg_cache.render_calls;
+
+        state.ensure_msg_cache(40);
+        assert_eq!(state.msg_cache.render_calls, calls, "no-op must not render");
+
+        state.push_event(AgentEvent::Info("extra".to_string()));
+        state.ensure_msg_cache(40);
+        assert_eq!(
+            state.msg_cache.render_calls,
+            calls + 1,
+            "append renders exactly the new message"
+        );
+
+        state.ensure_msg_cache(31);
+        assert_eq!(
+            state.msg_cache.render_calls,
+            calls + 1,
+            "width change re-wraps without re-rendering"
+        );
+    }
+
+    // 首条 System 消息原地改写后只重渲染消息 0。
+    // After the in-place rewrite of the first System message, only message 0
+    // re-renders.
+    #[test]
+    fn refresh_system_header_rerenders_first_message_only() {
+        let mut state = varied_state();
+        state.ensure_msg_cache(40);
+        let calls = state.msg_cache.render_calls;
+
+        state.provider = "newprov".to_string();
+        state.model = "newmodel".to_string();
+        state.refresh_system_header();
+        state.ensure_msg_cache(40);
+
+        assert_eq!(
+            state.msg_cache.render_calls,
+            calls + 1,
+            "header refresh re-renders exactly message 0"
+        );
+        let joined: String = state.msg_cache.per_msg[0]
+            .rendered
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .flat_map(|s| s.content.chars())
+            .collect();
+        assert!(
+            joined.contains("newprov") && joined.contains("newmodel"),
+            "header text updated: {joined:?}"
+        );
+    }
+
+    // 搜索窗口化路径与旧全量管线（全量克隆 → 匹配 → 高亮 → 全局续行 → 切窗）等价。
+    // The search windowing path equals the old full pipeline (full clone →
+    // matches → highlight → global continuation → slice).
+    #[test]
+    fn search_visible_window_equals_full_pipeline() {
+        let mut state = TuiState::new(
+            "p".to_string(),
+            "m".to_string(),
+            5,
+            vec![],
+            vec![],
+            vec![],
+        );
+        for i in 0..4 {
+            state.push_event(AgentEvent::Info(format!("needle {i} {}", "x".repeat(90))));
+        }
+        state.ensure_msg_cache(40);
+        let total = state.msg_cache.total;
+        assert!(total > 10, "test needs a scrollable history, total={total}");
+
+        state.search = Some(SearchState {
+            query: "needle".to_string(),
+            cursor: 0,
+            matches: Vec::new(),
+            current: 0,
+            dirty_key: (0, 0, String::new()),
+        });
+        let inner = Rect::new(0, 0, 40, 10);
+        let base = total.saturating_sub(inner.height as usize);
+
+        let got = search_visible_lines(&mut state, total, base, inner);
+
+        // 参照：旧全量管线（复用调用后已定型的 matches 与 scroll_offset——
+        // 跳转可能已改写后者）。
+        // Reference: the old full pipeline (reusing the post-call matches and
+        // scroll_offset — the jump may have rewritten the latter).
+        let concat: Vec<Line<'static>> = state
+            .msg_cache
+            .per_msg
+            .iter()
+            .flat_map(|m| m.wrapped.clone())
+            .collect();
+        let s = state.search.as_ref().expect("search state kept");
+        let matches = find_matches(&concat, &s.query);
+        assert_eq!(&matches, &s.matches, "segment matches == full-vector matches");
+        let cur = s.current.min(s.matches.len().saturating_sub(1));
+        let searched = highlight_matches(concat, &s.matches, Some(cur));
+        let lines = apply_border_continuation(searched);
+        let scroll = base.saturating_sub(state.scroll_offset as usize);
+        let start = scroll.min(lines.len());
+        let end = (start + inner.height as usize).min(lines.len());
+        let want = lines[start..end].to_vec();
+
+        assert_lines_equal(&got, &want, "search window");
     }
 }

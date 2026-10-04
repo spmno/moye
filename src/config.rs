@@ -994,6 +994,9 @@ fn persist_authorized_dir_to(dir: &str, config_path: &str) -> anyhow::Result<()>
                     for (i, l) in lines.iter().enumerate() {
                         if i == auth_idx {
                             out.push_str(&new_line);
+                            // 漏掉换行会把下一行(可能是 [section] 头)粘连成本行尾,产生非法 TOML(真实事故)。
+                            // Missing newline glues the next line (possibly a [section] header) into invalid TOML (real incident).
+                            out.push('\n');
                         } else if i > auth_idx && i <= multi_end {
                             // Skip multi-line array continuation lines (collapsed to single line).
                         } else {
@@ -2241,6 +2244,36 @@ permissions.read_file = "allow"
             cfg2.sandbox.authorized_dirs.len(),
             2,
             "no duplicate entry added"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn persist_keeps_next_section_separated_when_array_rewritten() {
+        let path = temp_config_path("glue-regression");
+        let dir1 = make_temp_dir("glue-1");
+        let dir2 = make_temp_dir("glue-2");
+        let initial = format!(
+            "[sandbox]\nbackend = \"auto\"\nmode = \"auto\"\nauthorized_dirs = [\"{dir1}\"]\n\n\
+             [mcp.codegraph]\ncommand = \"codegraph\"\nargs = [\"serve\", \"--mcp\"]\n\
+             package = \"@colbymchenry/codegraph\"\ninit = [\"init\"]\ninit_if_missing = \".codegraph\"\n"
+        );
+        std::fs::write(&path, &initial).unwrap();
+
+        persist_authorized_dir_to(&dir2, &path).expect("persist");
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("]["),
+            "section header must not glue onto the array line: {raw}"
+        );
+        let cfg: Config = toml::from_str(&raw).expect("file must stay valid TOML");
+        assert_eq!(cfg.sandbox.authorized_dirs.len(), 2);
+        assert!(
+            raw.contains("[mcp.codegraph]") && raw.contains("command = \"codegraph\""),
+            "following section must survive intact: {raw}"
         );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&dir1);

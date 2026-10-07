@@ -714,17 +714,19 @@ patches = [
 **压缩后历史结构：**
 
 ```
-[System: [对话历史摘要]
+[User: [对话历史摘要]
   ## 1. Objective ...
   ## 2. Important Details ...
   ...
   ## 5. Relevant Files ...]
-[System: Continue if you have next steps ...]
+[User: Continue if you have next steps ...]
 [User: 最近第 1 轮消息]          ← keep_recent_turns 保留
 [Assistant: 最近第 1 轮回复]
 [User: 最近第 2 轮消息]
 ...
 ```
+
+> 摘要与续跑提示以 **user 角色**注入:rig 的 agent preamble 已占据首条 system 位置,而严格的聊天模板(如 llama.cpp 本地模型)会拒绝任何不在开头的 system 消息(`System message must be at the beginning`)。
 
 ### rig PatchRequest 机制
 

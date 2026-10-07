@@ -631,9 +631,12 @@ impl ContextHook {
             }
         };
 
+        // 摘要必须用 user 角色:rig 的 preamble 已是首条 system,摘要若为 system 会
+        // 出现在非开头位置,严格聊天模板(如 llama.cpp 本地模型)会直接 500
+        // "System message must be at the beginning"。user 角色对所有 provider 安全。
         let summary_msg =
-            Message::system(format!("[对话历史摘要 / Conversation Summary]\n{summary}"));
-        let continue_msg = Message::system(
+            Message::user(format!("[对话历史摘要 / Conversation Summary]\n{summary}"));
+        let continue_msg = Message::user(
             "Continue executing the task based on the summary above. Do not stop to ask questions — make your best judgment and proceed.\n\
              基于上方摘要继续执行任务，不要停下来提问，自行判断并推进。",
         );

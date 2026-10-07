@@ -714,17 +714,19 @@ Triggered when tokens still exceed `compaction_threshold` after Tier 1. Sends ol
 **Compacted History Structure:**
 
 ```
-[System: [Conversation Summary]
+[User: [Conversation Summary]
   ## 1. Objective ...
   ## 2. Important Details ...
   ...
   ## 5. Relevant Files ...]
-[System: Continue if you have next steps ...]
+[User: Continue if you have next steps ...]
 [User: recent turn 1 message]          ← keep_recent_turns retained
 [Assistant: recent turn 1 reply]
 [User: recent turn 2 message]
 ...
 ```
+
+> Summary and continuation notes are injected as **user-role** messages: rig's agent preamble already occupies the leading system slot, and strict chat templates (e.g. local llama.cpp models) reject any system message that is not first (`System message must be at the beginning`).
 
 ### rig PatchRequest Mechanism
 

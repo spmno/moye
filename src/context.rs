@@ -628,13 +628,26 @@ pub const COMPACTION_PREAMBLE: &str = "\
 不要回答对话本身。不要提及你在做摘要。";
 
 /// 在历史中查找上一次压缩的摘要文本（锚定摘要）。
+/// 摘要历史上先后以 system（旧行为）和 user（现行为）两种角色注入，二者都需识别。
 /// Find the previous compaction summary text in history (anchored summary).
+/// Summaries were injected as system (old behavior) and user (current) roles; match both.
 pub fn find_previous_summary(history: &[Message]) -> Option<String> {
     for msg in history.iter().rev() {
-        if let Message::System { content } = msg
+        let text = match msg {
+            Message::System { content } => Some(content.clone()),
+            Message::User { content } => content.iter().find_map(|item| {
+                if let UserContent::Text(t) = item {
+                    Some(t.text.clone())
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        };
+        if let Some(content) = text
             && content.starts_with("[对话历史摘要")
         {
-            return Some(content.clone());
+            return Some(content);
         }
     }
     None
@@ -1083,6 +1096,45 @@ mod tests {
         let formatted = format_messages_for_summary(&msgs);
         assert!(formatted.contains("[User]: hello"));
         assert!(formatted.contains("[Assistant]: hi there"));
+    }
+
+    // ── find_previous_summary ──
+
+    #[test]
+    fn find_previous_summary_matches_user_role() {
+        let summary = "[对话历史摘要 / Conversation Summary]\n## 1. Objective\nkeep going";
+        let history = vec![
+            Message::user("goal"),
+            Message::assistant("done part 1"),
+            Message::user(summary),
+            Message::user("continue"),
+        ];
+        assert_eq!(find_previous_summary(&history).as_deref(), Some(summary));
+    }
+
+    #[test]
+    fn find_previous_summary_matches_system_role_legacy() {
+        let summary = "[对话历史摘要 / Conversation Summary]\nlegacy";
+        let history = vec![Message::user("goal"), Message::system(summary)];
+        assert_eq!(find_previous_summary(&history).as_deref(), Some(summary));
+    }
+
+    #[test]
+    fn find_previous_summary_returns_none_without_summary() {
+        let history = vec![
+            Message::user("hello"),
+            Message::assistant("hi"),
+            Message::user("not a summary"),
+        ];
+        assert_eq!(find_previous_summary(&history), None);
+    }
+
+    #[test]
+    fn find_previous_summary_prefers_most_recent() {
+        let old = "[对话历史摘要 / Conversation Summary]\nold";
+        let new = "[对话历史摘要 / Conversation Summary]\nnew";
+        let history = vec![Message::user(old), Message::user("work"), Message::user(new)];
+        assert_eq!(find_previous_summary(&history).as_deref(), Some(new));
     }
 
     // ── microcompact ──

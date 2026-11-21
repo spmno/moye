@@ -274,6 +274,119 @@ fn not_found_error(content: &str, needle: &str, pair_label: Option<(usize, usize
     ToolError(msg)
 }
 
+/// 空白漂移自恢复：把「逐行 trim 后与 `old` 完全一致」的唯一窗口替换为 `new`。
+/// Whitespace-drift recovery: replaces the unique window whose lines equal `old`'s
+/// lines after trimming with `new`.
+///
+/// 触发条件（必须全部满足，否则返回 None 交给 `not_found_error` 报错）：
+/// - `old` 有足够辨识度（≥2 行，或 ≥40 字符）——避免 `}`、`);` 这类单 token 撞车；
+/// - 窗口在文件中**唯一**（多处命中说明定位不明确，宁可报错）；
+/// - `new` 与 `old` 行数 1:1（不做跨行结构变更）；
+/// - 逐行忽略首尾空白后完全一致——**只有空白/缩进漂移才自动应用**，
+///   任何真实字符差异（标识符、运算符）仍然报错，交由模型重发。
+///
+/// Trigger conditions (all required, otherwise None → `not_found_error`):
+/// - `old` is distinctive enough (>=2 lines, or >=40 chars) so single-token
+///   needles like `}` cannot collide with unrelated lines;
+/// - the window is **unique** in the file (multiple hits mean ambiguous
+///   targeting — erroring out is safer than guessing);
+/// - `new` maps 1:1 to `old`'s lines (no structural change);
+/// - every line matches after trimming — **only whitespace drift auto-applies**;
+///   real character differences still error out and are re-issued by the model.
+///
+/// 恢复是可见的：调用方把行号与匹配方式写进工具输出，模型和用户都能看到这不是
+/// 精确匹配。checkpoints 已在写入前快照，可回滚。
+/// Recovery is visible: the caller reports the line range and match mode in the
+/// tool output. A checkpoint was already recorded before writing, so it is
+/// revertible.
+fn auto_apply_closest(content: &str, old: &str, new: &str) -> Option<(String, usize, usize)> {
+    let old_lines: Vec<&str> = old.lines().collect();
+    if old_lines.is_empty() {
+        return None;
+    }
+    if old_lines.len() < 2 && old.chars().count() < 40 {
+        return None;
+    }
+    let new_lines: Vec<&str> = new.lines().collect();
+    if new_lines.len() != old_lines.len() {
+        return None;
+    }
+    let (start_line, end_line) = find_trimmed_window(content, old)?;
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    if lines.len() < end_line {
+        return None;
+    }
+    let window = &lines[start_line - 1..end_line];
+
+    // 逐行映射到 new：内容没变的行保留文件原行（原缩进），改动的行沿用文件缩进
+    // 并叠加 old→new 的缩进差。这样恢复出来的代码缩进与文件一致，不会因为模型
+    // 把 old 重排成 2 空格而把整段代码弄歪。
+    // Map line-by-line onto `new`: unchanged lines keep the file's own line (and
+    // indent); changed lines reuse the file's indent plus the old→new indent delta,
+    // so the patched block keeps the file's formatting instead of the drift.
+    let mut out = String::with_capacity(content.len() + new.len());
+    for line in &lines[..start_line - 1] {
+        out.push_str(line);
+    }
+    for ((actual, expected), replacement) in window
+        .iter()
+        .zip(old_lines.iter())
+        .zip(new_lines.iter())
+    {
+        if replacement.trim() == expected.trim() {
+            out.push_str(actual);
+            continue;
+        }
+        let delta = indent_cols(replacement) as i32 - indent_cols(expected) as i32;
+        let target = (indent_cols(actual) as i32 + delta).max(0) as usize;
+        out.push_str(&" ".repeat(target));
+        out.push_str(replacement.trim_start());
+        if actual.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    for line in &lines[end_line..] {
+        out.push_str(line);
+    }
+    if out == content {
+        return None;
+    }
+    Some((out, start_line, end_line))
+}
+
+/// 在 `content` 中定位「逐行 trim 后与 `old` 完全一致」的唯一窗口（1-based 行号）。
+/// 多处命中返回 None——定位不明确时宁可报错。
+/// Locates the unique window in `content` whose lines equal `old`'s lines after
+/// trimming (1-based). Multiple hits return None: ambiguous targeting errors out.
+fn find_trimmed_window(content: &str, old: &str) -> Option<(usize, usize)> {
+    let file_lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let needle: Vec<&str> = old.lines().map(str::trim).collect();
+    if needle.is_empty() || file_lines.len() < needle.len() {
+        return None;
+    }
+    let mut found: Option<usize> = None;
+    for start in 0..=(file_lines.len() - needle.len()) {
+        let hit = needle
+            .iter()
+            .enumerate()
+            .all(|(k, expected)| file_lines[start + k].trim() == *expected);
+        if hit {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(start);
+        }
+    }
+    found.map(|start| (start + 1, start + needle.len()))
+}
+
+/// 行首缩进宽度（空格按 1 列，制表符按 1 列计——只用于比较相对缩进差）。
+/// Leading indent width (spaces and tabs both count as one column — only used
+/// to compare relative indentation deltas).
+fn indent_cols(line: &str) -> usize {
+    line.chars().take_while(|c| *c == ' ' || *c == '\t').count()
+}
+
 /// 对文件做精确文本替换的工具。
 /// Tool that performs exact text replacement in a file.
 struct EditFile {
@@ -390,8 +503,21 @@ impl PortableTool for EditFile {
         // Pair N may patch text produced by pair N-1, so validation simulates
         // apply-then-check against the running in-memory string.
         let mut working = content;
+        // 自动恢复记录：命中的行号 + 相似度，写进最终输出（不静默）。
+        // Auto-recovery log: line range + similarity, reported in the final output.
+        let mut auto_fixed: Vec<String> = Vec::new();
         for (i, (old, new)) in pairs.iter().enumerate() {
             if !working.contains(old.as_str()) {
+                // 先尝试空白漂移自恢复——命中即应用并记录，否则按原样报错。
+                // Try whitespace-drift recovery first; on miss, report as before.
+                if let Some((patched, start_line, end_line)) = auto_apply_closest(&working, old, new)
+                {
+                    auto_fixed.push(format!(
+                        "lines {start_line}-{end_line} (matched after normalizing indentation)"
+                    ));
+                    working = patched;
+                    continue;
+                }
                 let label = if is_multi {
                     Some((i + 1, n)) // 1-based for humans
                 } else {
@@ -406,10 +532,19 @@ impl PortableTool for EditFile {
         // Phase 2: all pairs valid → write the final content once.
         std::fs::write(&path, &working).map_err(|e| ToolError(e.to_string()))?;
 
-        if is_multi {
-            Ok(format!("edited {} ({} edits)", args.path, n))
+        let recovered = if auto_fixed.is_empty() {
+            String::new()
         } else {
-            Ok(format!("edited {}", args.path))
+            format!(
+                "\n(near-miss auto-applied — old text differed only in whitespace; \
+                 verify the result: {})",
+                auto_fixed.join("; ")
+            )
+        };
+        if is_multi {
+            Ok(format!("edited {} ({} edits){recovered}", args.path, n))
+        } else {
+            Ok(format!("edited {}{recovered}", args.path))
         }
     }
 }
@@ -2849,6 +2984,103 @@ mod tests {
         assert!(msg.contains("lines 1-4"), "msg should contain line range: {msg}");
         assert!(msg.contains("75%"), "msg should contain similarity pct: {msg}");
         assert!(msg.contains("let x = 1"), "msg should contain snippet text: {msg}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 空白漂移自恢复：只有缩进不同的 old/new 应自动应用，缩进按文件对齐，并在
+    /// 工具输出里显式说明「不是精确匹配」。
+    /// Whitespace-drift recovery: an `old` that differs only in indentation is
+    /// auto-applied, re-indented to the file, and reported in the tool output.
+    #[tokio::test]
+    async fn edit_file_auto_recovers_whitespace_drift() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_edit_auto_recover.txt");
+        let original = "fn main() {\n    let a = 1;\n    let b = 2;\n    let c = a + b;\n    print(c);\n}\n";
+        std::fs::write(&path, original).unwrap();
+        let raw_path = path.to_string_lossy().to_string();
+        // old 把整段重排成 2 空格缩进（文件是 4 空格）——典型漂移。
+        // `old` re-indents the whole block to 2 spaces while the file uses 4.
+        let old = "fn main() {\n  let a = 1;\n  let b = 2;\n  let c = a + b;\n  print(c);\n}\n";
+        let new = "fn main() {\n  let a = 10;\n  let b = 20;\n  let c = a + b;\n  print(c);\n}\n";
+        let tool = EditFile {
+            checkpoints: Arc::new(crate::checkpoint::CheckpointStore::new()),
+        };
+        let args = EditFileArgs {
+            path: raw_path.clone(),
+            old: Some(old.into()),
+            new: Some(new.into()),
+            edits: None,
+        };
+
+        let result = tool.call(args).await.unwrap();
+
+        assert!(
+            result.contains("near-miss auto-applied"),
+            "recovery must be visible in the output: {result}"
+        );
+        assert!(result.contains("lines 1-6"), "line range: {result}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        // 改动行沿用文件缩进（4 空格），未改动行保持原样。
+        // Changed lines adopt the file's 4-space indent; untouched lines are kept as-is.
+        assert_eq!(
+            after,
+            "fn main() {\n    let a = 10;\n    let b = 20;\n    let c = a + b;\n    print(c);\n}\n"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 真实字符差异（标识符不同）绝不自动应用——仍然报错让模型重发。
+    /// A real character difference (different identifier) is never auto-applied.
+    #[tokio::test]
+    async fn edit_file_rejects_real_content_difference() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_edit_auto_recover_reject.txt");
+        let original = "fn main() {\n    let total = 1;\n    print(total);\n}\n";
+        std::fs::write(&path, original).unwrap();
+        let raw_path = path.to_string_lossy().to_string();
+        // 第 2 行标识符不同（total vs count）——不是空白漂移。
+        // Line 2 differs by identifier (total vs count) — not whitespace drift.
+        let old = "fn main() {\n    let count = 1;\n    print(total);\n}\n";
+        let tool = EditFile {
+            checkpoints: Arc::new(crate::checkpoint::CheckpointStore::new()),
+        };
+        let args = EditFileArgs {
+            path: raw_path,
+            old: Some(old.into()),
+            new: Some("replaced".into()),
+            edits: None,
+        };
+
+        let err = tool.call(args).await.unwrap_err().to_string();
+
+        assert!(
+            !err.contains("auto-applied"),
+            "must not claim recovery: {err}"
+        );
+        assert!(err.contains("old text not found"), "hint expected: {err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 缺乏辨识度的短 old（如单个 `}`）不进入自动恢复。
+    /// A low-signal short `old` (e.g. a lone `}`) never triggers recovery.
+    #[tokio::test]
+    async fn edit_file_auto_recovery_skips_low_signal_needle() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_edit_auto_recover_short.txt");
+        std::fs::write(&path, "fn main() {\n    run();\n}\n").unwrap();
+        let raw_path = path.to_string_lossy().to_string();
+        let tool = EditFile {
+            checkpoints: Arc::new(crate::checkpoint::CheckpointStore::new()),
+        };
+        let args = EditFileArgs {
+            path: raw_path,
+            old: Some("  }".into()),
+            new: Some("}".into()),
+            edits: None,
+        };
+
+        assert!(tool.call(args).await.is_err());
         std::fs::remove_file(&path).ok();
     }
 

@@ -89,6 +89,8 @@ moye
 | **模型历史** | 用过的模型持久化到 `~/.config/moye/models.json`，`/models` 选择器列出最近使用，一键切回。 |
 | **沙箱 Provider** | 启动时根据 `[sandbox].mode` 选择 OS 级沙箱：`auto` 探测 bwrap，`landlock` 为 LSM 回退，`off` 禁用。以 `SandboxProvider` seam trait 注入。 |
 | **工具管线** | 3 阶段执行：pre/post `PipelineHooks` + `TimeoutRetryTool` around-execute 包装器，由 rig 的 `HitlHook` 组合。 |
+| **todo 续跑约束** | 模型在无工具调用的收尾轮里，若 `todo_write` 清单仍有未完成项，会被打回继续执行（单次 run 最多 2 次），达上限后输出未完成清单。避免"说到一半就停"。 |
+| **编辑空白漂移自恢复** | `edit_file` 精确匹配失败时，若文件中有唯一窗口在**忽略缩进后**与 `old` 逐行一致，自动应用并把行号写进工具输出（改动行沿用文件缩进）；真实字符差异仍报错。 |
 | **Waterfall 事件** | 生命周期事件（AgentPreStep / ToolsPreExecute / ToolsPostExecute / AgentTurnStopping）分发给 emit / waterfall / serial 三种监听器。 |
 | **Profile 系统** | 声明式配置叠加（`[profile.<name>]` patches），解析时应用；`--dump-config` 查看合并后的配置树。 |
 

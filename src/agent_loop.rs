@@ -24,7 +24,7 @@ use rig_core::completion::{Message, Usage};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
-use crate::event::{AgentEvent, EventSender, FileEdit, HitlDecision};
+use crate::event::{AgentEvent, EventSender, FileEdit, HitlDecision, TodoItem, TodoStatus};
 use crate::events::{PreStepState, WaterfallAction, WaterfallEvent, WaterfallRegistry};
 use crate::registry::{AgentRegistry, ApprovalChain, DefaultApproval, Permission, Role, ToolPerms};
 use crate::sandbox::Sandbox;
@@ -475,10 +475,26 @@ pub struct ContextHook {
     /// 自主循环轮数上限，用于轮次预算提醒。
     /// Max turns for the autonomous loop, used for turn-budget awareness.
     max_turns: usize,
+    /// todo 清单共享 store——仅 Builder / Orchestrator 有值（其余角色为 None）。
+    /// 未清空时模型想收尾会被打回继续执行（见 `continuation_action`）。
+    /// Shared todo store — Some only for Builder / Orchestrator. When it is not
+    /// cleared, a finishing turn is bounced back (see `continuation_action`).
+    todo_store: Option<Arc<Mutex<Vec<TodoItem>>>>,
+    /// 已触发的续跑次数——防止清单永远清不空时无限打回。
+    /// Continuations already triggered — prevents infinite bouncing when the
+    /// list can never be cleared.
+    continuations: Arc<Mutex<usize>>,
     /// todo 11: waterfall 注册表，派发 AgentRequest 事件（fire-and-forget）。
     /// todo 11: waterfall registry, dispatches AgentRequest events (fire-and-forget).
     waterfall: Arc<WaterfallRegistry>,
 }
+
+/// 单次 agent run 内允许的最大续跑次数。
+/// Maximum continuations allowed within one agent run.
+///
+/// 2 次足够覆盖「模型提前收尾」的常见情况；再打回只是烧 token。
+/// Two is enough for the common premature-finish case; more just burns tokens.
+const MAX_CONTINUATIONS: usize = 2;
 
 impl ContextHook {
     /// 创建上下文管理 Hook。
@@ -503,8 +519,93 @@ impl ContextHook {
             history_capture: None,
             turn_capture: None,
             max_turns,
+            todo_store: None,
+            continuations: Arc::new(Mutex::new(0)),
             waterfall,
         }
+    }
+
+    /// 启用 todo 续跑约束：传入共享清单 store（仅 Builder / Orchestrator 有）。
+    /// Enables the todo continuation guard with the shared todo store
+    /// (Some only for Builder / Orchestrator).
+    pub fn with_todo_store(mut self, store: Option<Arc<Mutex<Vec<TodoItem>>>>) -> Self {
+        self.todo_store = store;
+        self
+    }
+
+    /// 清单里未完成（pending / in_progress）的项数与前几项内容。
+    /// Number of unfinished (pending / in_progress) items plus their text.
+    fn pending_todos(&self) -> Option<(usize, String)> {
+        let store = self.todo_store.as_ref()?;
+        let items = store.lock().unwrap();
+        let pending: Vec<&TodoItem> = items
+            .iter()
+            .filter(|item| item.status != TodoStatus::Completed)
+            .collect();
+        if pending.is_empty() {
+            return None;
+        }
+        let list = pending
+            .iter()
+            .take(5)
+            .map(|item| match item.status {
+                TodoStatus::InProgress => format!("- {}（进行中 / in progress）", item.content),
+                _ => format!("- {}", item.content),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some((pending.len(), list))
+    }
+
+    /// todo 续跑判定：模型在「无工具调用」的收尾轮里，若清单仍有未完成项，
+    /// 打回一次带纠正反馈的重试；达到上限或轮次预算用尽则放行并提示。
+    /// Todo continuation decision: on a tool-free finishing turn, if the list
+    /// still has unfinished items, retry once with corrective feedback. Gives up
+    /// (and reports) once the cap or the turn budget is exhausted.
+    fn continuation_action(
+        &self,
+        content: &[AssistantContent],
+        turn: usize,
+    ) -> ModelTurnAction {
+        if self.todo_store.is_none() {
+            return ModelTurnAction::Continue;
+        }
+        // 带工具调用的回合说明还在干活，不打断。
+        // A turn carrying tool calls is still working — leave it alone.
+        if content
+            .iter()
+            .any(|item| matches!(item, AssistantContent::ToolCall(_)))
+        {
+            return ModelTurnAction::Continue;
+        }
+        let Some((pending, list)) = self.pending_todos() else {
+            return ModelTurnAction::Continue;
+        };
+        let mut used = self.continuations.lock().unwrap();
+        let no_budget = self.max_turns > 0 && turn >= self.max_turns;
+        if *used >= MAX_CONTINUATIONS || no_budget {
+            let why = if no_budget {
+                "轮次预算用尽"
+            } else {
+                "已达续跑上限"
+            };
+            let _ = self.tx.send(AgentEvent::Info(format!(
+                "  [未完成 / incomplete] 清单仍有 {pending} 项未完成（{why}）:\n{list}"
+            )));
+            return ModelTurnAction::Continue;
+        }
+        *used += 1;
+        let nth = *used;
+        drop(used);
+        let _ = self.tx.send(AgentEvent::Info(format!(
+            "  [续跑 / continue] 清单还有 {pending} 项未完成，继续执行（{nth}/{MAX_CONTINUATIONS}）:\n{list}"
+        )));
+        ModelTurnAction::retry_with_feedback(format!(
+            "[系统] 你的清单里还有 {pending} 项未完成：\n{list}\n\
+             不要向用户提问，直接继续执行剩余项；每完成一项立即用 todo_write 标为 completed。\n\
+             若某项确实无法完成（缺权限/缺信息/用户已取消），把它从清单移除并在最终回复里说明原因。\n\
+             Continue now. Do not stop to ask the user."
+        ))
     }
 
     /// 启用 SSE 重试历史捕获：传入共享 Arc，每轮 CompletionCall 时写入最新历史。
@@ -784,7 +885,9 @@ impl AgentHook for ContextHook {
         event: ModelTurnFinished<'_>,
     ) -> ModelTurnAction {
         self.handle_model_turn_finished(&event.usage);
-        ModelTurnAction::Continue
+        // 清单未清空时打回续跑（无工具调用的收尾轮才触发）。
+        // Bounce a finishing turn back while the todo list is unfinished.
+        self.continuation_action(event.content, event.turn)
     }
 
     /// 只观察低频事件，跳过高频 delta 事件以提升性能。
@@ -1171,7 +1274,8 @@ async fn run_autonomous_inner(
             max_turns_remaining,
             waterfall.clone(),
         )
-        .with_history_capture(captured_history.clone(), captured_turn.clone());
+        .with_history_capture(captured_history.clone(), captured_turn.clone())
+        .with_todo_store(todo_ctx.as_ref().map(|ctx| ctx.store.clone()));
 
         let agent = build_runner_agent_spec(
             registry,
@@ -1979,5 +2083,142 @@ mod tests {
             1,
             "AgentRequest emit listener must fire on completion_call"
         );
+    }
+
+    /// 构造带 todo store 的 ContextHook。
+    /// Builds a ContextHook wired to a shared todo store.
+    fn hook_with_todos(
+        store: Arc<Mutex<Vec<TodoItem>>>,
+        tx: EventSender,
+    ) -> ContextHook {
+        ContextHook::new(
+            128_000,
+            ContextConfig::default(),
+            dummy_client(),
+            "test-model".to_string(),
+            tx,
+            30,
+            Arc::new(crate::events::WaterfallRegistry::new()),
+        )
+        .with_todo_store(Some(store))
+    }
+
+    fn todo(id: &str, content: &str, status: TodoStatus) -> TodoItem {
+        TodoItem {
+            id: id.to_string(),
+            content: content.to_string(),
+            status,
+        }
+    }
+
+    /// 收尾轮（无工具调用）+ 清单未清空 → 打回续跑；清空后放行。
+    /// A tool-free finishing turn with an unfinished list is bounced; a cleared
+    /// list passes through.
+    #[tokio::test]
+    async fn todo_continuation_bounces_finishing_turn() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(Mutex::new(vec![
+            todo("1", "改配置", TodoStatus::Completed),
+            todo("2", "跑测试", TodoStatus::InProgress),
+        ]));
+        let hook = hook_with_todos(store.clone(), tx);
+
+        // When: the model produces a text-only final answer.
+        let action = hook.continuation_action(&[AssistantContent::text("done")], 5);
+
+        // Then: the turn is rejected with corrective feedback naming the item.
+        match action {
+            ModelTurnAction::Retry(_) => {}
+            other => panic!("expected Retry, got {other:?}"),
+        }
+
+        // And: an Info event tells the user why the run continues.
+        let mut saw_continue = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::Info(msg) = ev {
+                if msg.contains("续跑") && msg.contains("跑测试") {
+                    saw_continue = true;
+                }
+            }
+        }
+        assert!(saw_continue, "a continuation Info event must be emitted");
+
+        // And: once every item is completed, the turn is accepted.
+        for item in store.lock().unwrap().iter_mut() {
+            item.status = TodoStatus::Completed;
+        }
+        assert!(matches!(
+            hook.continuation_action(&[AssistantContent::text("done")], 6),
+            ModelTurnAction::Continue
+        ));
+    }
+
+    /// 带工具调用的回合说明还在干活，不能打回。
+    /// A turn carrying tool calls is still working and must not be bounced.
+    #[tokio::test]
+    async fn todo_continuation_ignores_tool_calls() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(Mutex::new(vec![todo("1", "跑测试", TodoStatus::Pending)]));
+        let hook = hook_with_todos(store, tx);
+
+        let action = hook.continuation_action(
+            &[
+                AssistantContent::text("checking"),
+                AssistantContent::tool_call("call_1", "run_bash", serde_json::json!({})),
+            ],
+            2,
+        );
+        assert!(matches!(action, ModelTurnAction::Continue));
+    }
+
+    /// 续跑次数达上限后放行，并报告仍有未完成项（不无限打回）。
+    /// After the continuation cap the run is released with an incomplete report.
+    #[tokio::test]
+    async fn todo_continuation_stops_at_cap() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(Mutex::new(vec![todo("1", "跑测试", TodoStatus::Pending)]));
+        let hook = hook_with_todos(store, tx);
+
+        for _ in 0..MAX_CONTINUATIONS {
+            assert!(matches!(
+                hook.continuation_action(&[AssistantContent::text("done")], 3),
+                ModelTurnAction::Retry(_)
+            ));
+        }
+        // 第 MAX_CONTINUATIONS + 1 次收尾 → 放行。
+        assert!(matches!(
+            hook.continuation_action(&[AssistantContent::text("done")], 3),
+            ModelTurnAction::Continue
+        ));
+
+        let mut saw_incomplete = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::Info(msg) = ev {
+                if msg.contains("未完成") {
+                    saw_incomplete = true;
+                }
+            }
+        }
+        assert!(saw_incomplete, "giving up must be reported to the user");
+    }
+
+    /// 没有 todo store（Investigator / Planner / 子代理）时永远不打回。
+    /// Without a todo store (Investigator / Planner / subagents) nothing is bounced.
+    #[tokio::test]
+    async fn todo_continuation_no_store_is_noop() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let hook = ContextHook::new(
+            128_000,
+            ContextConfig::default(),
+            dummy_client(),
+            "test-model".to_string(),
+            tx,
+            30,
+            Arc::new(crate::events::WaterfallRegistry::new()),
+        );
+        assert!(matches!(
+            hook.continuation_action(&[AssistantContent::text("done")], 3),
+            ModelTurnAction::Continue
+        ));
     }
 }

@@ -31,14 +31,77 @@ pub enum Role {
 
 /// 单个角色的运行时配置：模型、preamble（提示词）文件、权限分级。
 /// Runtime config for a single role: model, preamble (prompt) file, permission tiers.
+///
+/// 三个字段都可省略，省略时走「角色语义默认」而非中性默认值——配置因此可以只写
+/// 需要偏离默认的那几行，而不是把每个角色九行全部展开。
+/// - `model` 缺省 → `[agent].default_model`
+/// - `preamble` 缺省 → 编译期内置提示词（`prompts::default_for`）
+/// - `permissions` 缺省 → `default_perms_for(role)`（builder 可写，其余只读）
+///
+/// All three fields are optional; when omitted they resolve to *role-semantic*
+/// defaults rather than neutral ones, so a config only needs to spell out the
+/// lines that actually deviate.
 #[derive(Debug, Deserialize, Clone)]
 pub struct RoleConfig {
-    pub model: String,
-    pub preamble: String,
+    /// 模型；缺省用 `[agent].default_model`。
+    /// Model; defaults to `[agent].default_model`.
     #[serde(default)]
-    pub permissions: ToolPerms,
+    pub model: Option<String>,
+    /// 提示词文件路径；缺省用编译期内置提示词。
+    /// Preamble file path; defaults to the compiled-in prompt.
+    #[serde(default)]
+    pub preamble: Option<String>,
+    /// 权限分级；缺省用角色语义默认。**整段写了就整段生效**，不再叠加语义默认。
+    /// Permission tiers; defaults to the role-semantic set. When the section is
+    /// present it wins outright — no merging with the semantic defaults.
+    #[serde(default)]
+    pub permissions: Option<ToolPerms>,
     #[serde(default)]
     pub max_turns: Option<usize>,
+}
+
+impl RoleConfig {
+    /// 该角色实际生效的权限：显式配置优先，否则角色语义默认。
+    /// Effective permissions for this role: explicit config wins, else the
+    /// role-semantic default.
+    pub fn resolved_permissions(&self, role: Role) -> ToolPerms {
+        self.permissions
+            .clone()
+            .unwrap_or_else(|| default_perms_for(role))
+    }
+}
+
+/// 角色语义默认权限：只有 builder 能改文件、跑会改变状态的命令、起子代理干活；
+/// 其余角色只读（与 AGENTS.md「编排者、调查者与规划者只读」一致），auditor 额外断网。
+///
+/// 这是内置角色的领域知识，不该由用户逐配置——需要偏离时才在 `[agents.<role>]`
+/// 里写 permissions 覆盖。
+/// Role-semantic default permissions: only builder may modify files, run
+/// state-changing commands and spawn sub-agents; every other role is read-only
+/// (matching AGENTS.md), with auditor additionally offline. This is domain
+/// knowledge for built-in roles, not user configuration — override only when
+/// a role needs to deviate.
+pub fn default_perms_for(role: Role) -> ToolPerms {
+    let mut perms = ToolPerms::default();
+    let writable = matches!(role, Role::Builder);
+    let may_write = if writable {
+        Permission::Allow
+    } else {
+        Permission::Deny
+    };
+    perms.run_bash_mutating = may_write;
+    perms.edit_file = may_write;
+    perms.write_file = may_write;
+    // 联网：只有 auditor 断网（评审不该去网上找答案）。
+    // Network: only auditor is offline (review should not look up answers online).
+    let net = if matches!(role, Role::Auditor) {
+        Permission::Deny
+    } else {
+        Permission::Allow
+    };
+    perms.web_fetch = net;
+    perms.web_search = net;
+    perms
 }
 
 // 自主循环 HITL（人在环）门控所用的按工具权限分级：
@@ -677,16 +740,23 @@ impl AgentRegistry {
 
     /// 为指定角色构建 Agent（带工具或纯对话，取决于权限）。
     /// Builds an Agent for the specified role (with tools or pure chat, depending on permissions).
+    ///
+    /// 角色在配置里缺席也能构建：模型回落 `[agent].default_model`，提示词回落编译期
+    /// 内置版本，权限回落角色语义默认。配置因而只需写偏离默认的项。
+    /// A missing role section is fine: model falls back to `[agent].default_model`,
+    /// the preamble to the compiled-in prompt, permissions to the role-semantic
+    /// default. The config therefore only spells out deviations.
     pub fn build(&self, role: Role) -> anyhow::Result<RoleAgent> {
         let key = format!("{role:?}").to_lowercase();
-        let rc = self
-            .config
-            .agents
-            .roles
-            .get(&key)
-            .ok_or_else(|| anyhow::anyhow!("no config for role {key}"))?;
+        let rc = self.config.agents.roles.get(&key);
+        let perms = rc
+            .map(|c| c.resolved_permissions(role))
+            .unwrap_or_else(|| default_perms_for(role));
         let client = self.create_client()?;
-        let preamble = crate::prompts::load(role, &rc.preamble);
+        let preamble = match rc.and_then(|c| c.preamble.as_deref()) {
+            Some(path) => crate::prompts::load(role, path),
+            None => crate::prompts::default_for(role).to_string(),
+        };
         // 把与角色领域相关的技能指令注入提示词，使模型遵循技能中的步骤。
         // Injects role-domain skill instructions into the preamble so the model follows the steps in skills.
         let preamble = inject_skills_public(&preamble);
@@ -706,14 +776,16 @@ impl AgentRegistry {
         // Session-level model override takes priority over per-role configured model.
         let model = match *self.session_model.lock().unwrap() {
             Some(ref m) => m.clone(),
-            None => rc.model.clone(),
+            None => rc
+                .and_then(|c| c.model.clone())
+                .unwrap_or_else(|| self.config.agent.default_model.clone()),
         };
-        let with_tools = rc.permissions.read_file == Permission::Allow
-            || rc.permissions.run_bash_readonly == Permission::Allow
-            || rc.permissions.run_bash_mutating == Permission::Allow
-            || rc.permissions.edit_file == Permission::Allow
-            || rc.permissions.web_fetch != Permission::Deny
-            || rc.permissions.web_search != Permission::Deny;
+        let with_tools = perms.read_file == Permission::Allow
+            || perms.run_bash_readonly == Permission::Allow
+            || perms.run_bash_mutating == Permission::Allow
+            || perms.edit_file == Permission::Allow
+            || perms.web_fetch != Permission::Deny
+            || perms.web_search != Permission::Deny;
         let params = crate::providers::provider_additional_params();
         let max_turns = self.max_turns();
         info!("[build] role={key} model={model} max_turns={max_turns}");
@@ -806,8 +878,8 @@ impl AgentRegistry {
             .agents
             .roles
             .get(&key)
-            .map(|rc| rc.permissions.clone())
-            .unwrap_or_default();
+            .map(|rc| rc.resolved_permissions(role))
+            .unwrap_or_else(|| default_perms_for(role));
         perms.command_rules = self.config.sandbox.command_rules.clone();
         perms
     }
@@ -836,13 +908,17 @@ impl AgentRegistry {
     pub fn agent_spec(&self, role: Role) -> AgentSpec {
         let key = format!("{role:?}").to_lowercase();
         let rc = self.config.agents.roles.get(&key);
-        let mut permissions = rc.map(|c| c.permissions.clone()).unwrap_or_default();
+        let mut permissions = rc
+            .map(|c| c.resolved_permissions(role))
+            .unwrap_or_else(|| default_perms_for(role));
         permissions.command_rules = self.config.sandbox.command_rules.clone();
         AgentSpec {
             name: key,
-            preamble_path: rc.map(|c| c.preamble.clone()).unwrap_or_default(),
+            preamble_path: rc
+                .and_then(|c| c.preamble.clone())
+                .unwrap_or_default(),
             permissions,
-            model: rc.map(|c| c.model.clone()),
+            model: rc.and_then(|c| c.model.clone()),
             max_turns: rc.and_then(|c| c.max_turns),
             embedded_preamble: Some(crate::prompts::default_for(role)),
         }
@@ -884,8 +960,7 @@ impl AgentRegistry {
                 .agents
                 .roles
                 .values()
-                .next()
-                .map(|rc| rc.model.clone())
+                .find_map(|rc| rc.model.clone())
                 .unwrap_or_else(|| "deepseek-v4-pro".to_string())
         })
     }
@@ -1025,7 +1100,7 @@ async fn classify_with_llm(
         .or_else(|| {
             registry
                 .role_config(Role::Orchestrator)
-                .map(|rc| rc.model.clone())
+                .and_then(|rc| rc.model.clone())
         })
         .unwrap_or_else(|| registry.config.agent.default_model.clone());
 
@@ -3404,6 +3479,59 @@ max_turns = 10
 
     // ── AgentSpec + custom_spec tests ──
 
+    /// 端到端：向导生成的「精简配置」（只有 provider + agent + sandbox + mcp）
+    /// 经 Registry 解析后，五个内置角色的权限必须正确——builder 可写、其余只读、
+    /// auditor 断网。这条测试同时锁住「生成器只写必要项」与「registry 走语义默认」
+    /// 两条链路，任一侧改坏都会红。
+    /// End-to-end: the wizard's minimal config (provider + agent + sandbox + mcp only)
+    /// must resolve to correct permissions for all five built-in roles — builder
+    /// writable, the rest read-only, auditor offline. This locks both the "generator
+    /// stays minimal" and "registry uses role semantics" halves of the chain.
+    #[test]
+    fn generated_minimal_config_yields_correct_role_permissions() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = env_guard("AGENT_PROFILE", None);
+        let raw = crate::config::render_agent_toml(
+            "volcengine",
+            "test-model",
+            None,
+            Some("ARK_API_KEY"),
+            None,
+        );
+        let cfg = Arc::new(
+            crate::config::Config::from_str_with_profile(&raw, None).expect("config parse"),
+        );
+        let reg = AgentRegistry::new(cfg, empty_mcp(), disabled_sandbox_provider());
+
+        let builder = reg.tool_perms(Role::Builder);
+        assert_eq!(builder.edit_file, Permission::Allow);
+        assert_eq!(builder.write_file, Permission::Allow);
+        assert_eq!(builder.run_bash_mutating, Permission::Allow);
+
+        for role in [
+            Role::Orchestrator,
+            Role::Investigator,
+            Role::Planner,
+            Role::Auditor,
+        ] {
+            let p = reg.tool_perms(role);
+            assert_eq!(p.edit_file, Permission::Deny, "{role:?} must be read-only");
+            assert_eq!(p.write_file, Permission::Deny, "{role:?} must be read-only");
+            assert_eq!(
+                p.run_bash_mutating,
+                Permission::Deny,
+                "{role:?} must not run mutating bash"
+            );
+            assert_eq!(p.read_file, Permission::Allow, "{role:?} must still read");
+        }
+        assert_eq!(reg.tool_perms(Role::Auditor).web_fetch, Permission::Deny);
+        assert_eq!(
+            reg.tool_perms(Role::Investigator).web_fetch,
+            Permission::Allow,
+            "investigator keeps network access"
+        );
+    }
+
     fn registry_with_roles() -> AgentRegistry {
         use crate::config::Config;
         let _env_lock = ENV_MUTEX.lock().unwrap();
@@ -3448,9 +3576,9 @@ permissions.edit_file = "deny"
         let spec = reg.agent_spec(Role::Builder);
         let rc = reg.role_config(Role::Builder).expect("builder config");
         assert_eq!(spec.name, "builder");
-        assert_eq!(spec.preamble_path, rc.preamble);
-        assert_eq!(spec.permissions, rc.permissions);
-        assert_eq!(spec.model.as_deref(), Some(rc.model.as_str()));
+        assert_eq!(spec.preamble_path, rc.preamble.clone().unwrap_or_default());
+        assert_eq!(spec.permissions, rc.resolved_permissions(Role::Builder));
+        assert_eq!(spec.model, rc.model);
         assert_eq!(spec.max_turns, rc.max_turns);
         assert!(spec.embedded_preamble.is_some());
     }
@@ -3461,8 +3589,8 @@ permissions.edit_file = "deny"
         let spec = reg.agent_spec(Role::Investigator);
         let rc = reg.role_config(Role::Investigator).expect("investigator config");
         assert_eq!(spec.name, "investigator");
-        assert_eq!(spec.preamble_path, rc.preamble);
-        assert_eq!(spec.permissions, rc.permissions);
+        assert_eq!(spec.preamble_path, rc.preamble.clone().unwrap_or_default());
+        assert_eq!(spec.permissions, rc.resolved_permissions(Role::Investigator));
     }
 
     #[test]

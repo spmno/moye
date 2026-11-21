@@ -379,57 +379,23 @@ default_model = "kimi-k3"
 # 自主循环最大轮数
 max_turns = 30
 
-# 各角色配置（model 可被 /model 命令覆盖）
-# 权限字段：read_file / run_bash_readonly / run_bash_mutating / edit_file / web_fetch / web_search
-[agents.orchestrator]
-model = "kimi-k3"
-preamble = "AGENTS.md"
-permissions.read_file = "allow"
-permissions.run_bash_readonly = "allow"
-permissions.run_bash_mutating = "deny"
-permissions.edit_file = "deny"
-permissions.web_fetch = "allow"
-permissions.web_search = "allow"
-
-[agents.investigator]
-model = "kimi-k3"
-preamble = "prompts/investigator.md"
-permissions.read_file = "allow"
-permissions.run_bash_readonly = "allow"
-permissions.run_bash_mutating = "deny"
-permissions.edit_file = "deny"
-permissions.web_fetch = "allow"
-permissions.web_search = "allow"
-
-[agents.planner]
-model = "kimi-k3"
-preamble = "prompts/planner.md"
-permissions.read_file = "allow"
-permissions.run_bash_readonly = "allow"
-permissions.run_bash_mutating = "deny"
-permissions.edit_file = "deny"
-permissions.web_fetch = "allow"
-permissions.web_search = "allow"
-
-[agents.builder]
-model = "kimi-k3"
-preamble = "prompts/builder.md"
-permissions.read_file = "allow"
-permissions.run_bash_readonly = "allow"
-permissions.run_bash_mutating = "ask"     # 需人工确认
-permissions.edit_file = "allow"
-permissions.web_fetch = "allow"
-permissions.web_search = "allow"
-
-[agents.auditor]
-model = "kimi-k3"
-preamble = "prompts/auditor.md"
-permissions.read_file = "allow"
-permissions.run_bash_readonly = "allow"
-permissions.run_bash_mutating = "deny"
-permissions.edit_file = "deny"
-permissions.web_fetch = "deny"
-permissions.web_search = "deny"
+# ── 角色（全部可选）──────────────────────────────────────
+# 五个内置角色都有语义默认，省略即生效：
+#   orchestrator / investigator / planner / auditor  只读（auditor 额外禁止联网）
+#   builder                                          可改文件、可跑会改变状态的命令
+# 提示词内置在二进制里，preamble 只在需要覆盖时才写。
+# 换模型时只写那一行：
+#
+# [agents.investigator]
+# model = "kimi-k3"
+#
+# [agents.auditor]
+# model = "kimi-k3"
+#
+# 改权限就写整段 [agents.<role>.permissions]（7 项全写）：写了就整段生效，
+# 不与默认叠加；漏写的项会回落成 ask。可选值 allow / ask / deny。
+# 7 项：read_file / run_bash_readonly / run_bash_mutating / edit_file /
+#       write_file / web_fetch / web_search
 
 [context]
 # 上下文管理配置

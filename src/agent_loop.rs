@@ -1761,18 +1761,28 @@ fn build_runner_agent_spec(
 ) -> anyhow::Result<Agent> {
     let client = registry.create_client()?;
     // preamble：文件优先；内置角色有内嵌回退，自定义子代理无。
+    // 未配置 preamble（空路径）时直接用内置提示词——不要先撞一次 IO 失败再回退，
+    // 否则每个省略 preamble 的角色每次启动都刷一条 warn。
     // Preamble: file first; built-in roles have embedded fallback, custom don't.
-    let preamble = match std::fs::read_to_string(&spec.preamble_path) {
-        Ok(content) => content,
-        Err(e) => {
-            tracing::warn!(
-                path = %spec.preamble_path,
-                error = %e,
-                "preamble file not found, using embedded fallback if available"
-            );
-            spec.embedded_preamble
-                .map(|s| s.to_string())
-                .unwrap_or_default()
+    // An empty path means "not configured" → use the embedded prompt directly,
+    // instead of logging a spurious IO failure on every startup.
+    let preamble = if spec.preamble_path.is_empty() {
+        spec.embedded_preamble
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    } else {
+        match std::fs::read_to_string(&spec.preamble_path) {
+            Ok(content) => content,
+            Err(e) => {
+                tracing::warn!(
+                    path = %spec.preamble_path,
+                    error = %e,
+                    "preamble file not found, using embedded fallback if available"
+                );
+                spec.embedded_preamble
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+            }
         }
     };
     let preamble = crate::registry::inject_skills_public(&preamble);

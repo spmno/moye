@@ -379,57 +379,24 @@ default_model = "kimi-k3"
 # Max turns for autonomous loop
 max_turns = 30
 
-# Role configs (model can be overridden by `/model` command)
-# Permission fields: read_file / run_bash_readonly / run_bash_mutating / edit_file / web_fetch / web_search
-[agents.orchestrator]
-model = "kimi-k3"
-preamble = "AGENTS.md"
-permissions.read_file = "allow"
-permissions.run_bash_readonly = "allow"
-permissions.run_bash_mutating = "deny"
-permissions.edit_file = "deny"
-permissions.web_fetch = "allow"
-permissions.web_search = "allow"
-
-[agents.investigator]
-model = "kimi-k3"
-preamble = "prompts/investigator.md"
-permissions.read_file = "allow"
-permissions.run_bash_readonly = "allow"
-permissions.run_bash_mutating = "deny"
-permissions.edit_file = "deny"
-permissions.web_fetch = "allow"
-permissions.web_search = "allow"
-
-[agents.planner]
-model = "kimi-k3"
-preamble = "prompts/planner.md"
-permissions.read_file = "allow"
-permissions.run_bash_readonly = "allow"
-permissions.run_bash_mutating = "deny"
-permissions.edit_file = "deny"
-permissions.web_fetch = "allow"
-permissions.web_search = "allow"
-
-[agents.builder]
-model = "kimi-k3"
-preamble = "prompts/builder.md"
-permissions.read_file = "allow"
-permissions.run_bash_readonly = "allow"
-permissions.run_bash_mutating = "ask"     # Requires confirmation
-permissions.edit_file = "allow"
-permissions.web_fetch = "allow"
-permissions.web_search = "allow"
-
-[agents.auditor]
-model = "kimi-k3"
-preamble = "prompts/auditor.md"
-permissions.read_file = "allow"
-permissions.run_bash_readonly = "allow"
-permissions.run_bash_mutating = "deny"
-permissions.edit_file = "deny"
-permissions.web_fetch = "deny"
-permissions.web_search = "deny"
+# ── Roles (all optional) ──────────────────────────────────
+# The five built-in roles have semantic defaults; omitting them is enough:
+#   orchestrator / investigator / planner / auditor  read-only (auditor is also offline)
+#   builder                                          may edit files and run state-changing commands
+# Prompts are compiled in, so `preamble` is only written when overriding.
+# To swap a model, write just that line:
+#
+# [agents.investigator]
+# model = "kimi-k3"
+#
+# [agents.auditor]
+# model = "kimi-k3"
+#
+# To change permissions, write the whole [agents.<role>.permissions] table (all 7
+# keys): it applies wholesale — no merging with the defaults — and any key you
+# leave out falls back to `ask`. Values: allow / ask / deny.
+# 7 keys: read_file / run_bash_readonly / run_bash_mutating / edit_file /
+#         write_file / web_fetch / web_search
 
 [context]
 # Context management config

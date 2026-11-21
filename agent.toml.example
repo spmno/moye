@@ -1,6 +1,13 @@
 # Agent 运行时配置。
 # 通过环境变量 AGENT_PROVIDER 选择供应商（deepseek / bailian / moonshot / volcengine）。
 # API Key 从供应商对应的环境变量读取（DEEPSEEK / DASHSCOPE / MOONSHOT / ARK）。
+#
+# ⚠ 这是一个「全量参考」文件：下面的每个段都列出来是为了让你知道有什么可配。
+#   实际项目里的 .moye/agent.toml 只需要 [provider] + [agent] 两段——角色、context、
+#   memory、evolution、sandbox 都有默认值，省略即生效（详见 README 的配置章节）。
+# This is a FULL REFERENCE listing every available key. A real .moye/agent.toml only
+# needs [provider] + [agent]; role / context / memory / evolution / sandbox sections
+# all have defaults and may be omitted (see the configuration section in README).
 
 [provider]
 # 默认供应商（deepseek / bailian / moonshot / volcengine / custom）。

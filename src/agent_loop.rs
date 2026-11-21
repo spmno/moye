@@ -484,6 +484,14 @@ pub struct ContextHook {
     /// Continuations already triggered — prevents infinite bouncing when the
     /// list can never be cleared.
     continuations: Arc<Mutex<usize>>,
+    /// 累计工具调用次数（跨回合），用于判断多步任务是否该建清单。
+    /// Cumulative tool-call count across turns, used to decide whether a
+    /// multi-step task should have a todo list by now.
+    tool_calls_seen: Arc<Mutex<usize>>,
+    /// 是否已提醒过建清单——每次 run 只提醒一次，避免反复唠叨烧 token。
+    /// Whether the "build a todo list" nudge already fired — once per run, so
+    /// the reminder does not turn into nagging that burns tokens.
+    todo_nudged: Arc<Mutex<bool>>,
     /// todo 11: waterfall 注册表，派发 AgentRequest 事件（fire-and-forget）。
     /// todo 11: waterfall registry, dispatches AgentRequest events (fire-and-forget).
     waterfall: Arc<WaterfallRegistry>,
@@ -495,6 +503,15 @@ pub struct ContextHook {
 /// 2 次足够覆盖「模型提前收尾」的常见情况；再打回只是烧 token。
 /// Two is enough for the common premature-finish case; more just burns tokens.
 const MAX_CONTINUATIONS: usize = 2;
+
+/// 触发「强制清单」提醒的累计工具调用阈值。
+/// 3 次工具调用大致对应 3 步以上工作——正是提示词要求先建清单的那条线。
+/// 更早提醒会在"单点小改动"上白烧一轮，更晚提醒则清单已经赶不上收尾核对。
+/// Cumulative tool-call threshold that triggers the "build a todo list" nudge.
+/// Three calls roughly means a 3+ step task — exactly the line the role prompt
+/// draws. Warning earlier wastes a turn on single-point edits; warning later
+/// means the list can no longer help verify the finishing claim.
+const TODO_NUDGE_AFTER_TOOL_CALLS: usize = 3;
 
 impl ContextHook {
     /// 创建上下文管理 Hook。
@@ -521,6 +538,8 @@ impl ContextHook {
             max_turns,
             todo_store: None,
             continuations: Arc::new(Mutex::new(0)),
+            tool_calls_seen: Arc::new(Mutex::new(0)),
+            todo_nudged: Arc::new(Mutex::new(false)),
             waterfall,
         }
     }
@@ -555,6 +574,64 @@ impl ContextHook {
             .collect::<Vec<_>>()
             .join("\n");
         Some((pending.len(), list))
+    }
+
+    /// 强制清单：多步任务在完全没有清单的情况下试图收尾时，打回一次要求先建清单。
+    /// Todo guard: when a multi-step task tries to finish with no list at all,
+    /// bounce it once and demand a list first.
+    ///
+    /// 与 `continuation_action` 的分工：本函数管「一开始就没清单」——没有清单，
+    /// 续跑约束根本无从判断是否真做完；`continuation_action` 管「有清单但没清空」。
+    /// Division of labour with `continuation_action`: this one covers "no list at
+    /// all" (without a list the continuation guard has nothing to verify against);
+    /// that one covers "list exists but is unfinished".
+    ///
+    /// 每次 run 只提醒一次：模型若判断任务确实已结束，不会被打回第二次。
+    /// At most one nudge per run, so a model that is genuinely done is not pestered.
+    fn todo_guard_action(&self, content: &[AssistantContent], turn: usize) -> ModelTurnAction {
+        let Some(store) = self.todo_store.as_ref() else {
+            return ModelTurnAction::Continue;
+        };
+        let calls_now = content
+            .iter()
+            .filter(|item| matches!(item, AssistantContent::ToolCall(_)))
+            .count();
+        let total = {
+            let mut seen = self.tool_calls_seen.lock().unwrap();
+            *seen += calls_now;
+            *seen
+        };
+        // 本轮仍带工具调用 = 还在干活；步数不够 = 可能是单点小改动。都不打断。
+        // A turn with tool calls is still working; too few steps may be a
+        // single-point edit. Neither is bounced.
+        if calls_now > 0 || total < TODO_NUDGE_AFTER_TOOL_CALLS {
+            return ModelTurnAction::Continue;
+        }
+        // 已有清单 → 归 continuation_action 管（锁在此处提前释放）。
+        // A list already exists → hand over to continuation_action (lock dropped here).
+        if !store.lock().unwrap().is_empty() {
+            return ModelTurnAction::Continue;
+        }
+        if self.max_turns > 0 && turn >= self.max_turns {
+            return ModelTurnAction::Continue;
+        }
+        {
+            let mut nudged = self.todo_nudged.lock().unwrap();
+            if *nudged {
+                return ModelTurnAction::Continue;
+            }
+            *nudged = true;
+        }
+        let _ = self.tx.send(AgentEvent::Info(format!(
+            "  [清单 / todo] 已执行 {total} 次工具调用但仍无任务清单，要求先建清单再收尾"
+        )));
+        ModelTurnAction::retry_with_feedback(format!(
+            "[系统] 你已经执行了 {total} 次工具调用，但还没有用 todo_write 建立任务清单。\n\
+             多步任务必须先建清单，否则收尾时无法核对是否真的做完。\n\
+             现在立刻用 todo_write 列出步骤：已完成项标 completed，当前正在做的那一项标 in_progress，\n\
+             其余标 pending，然后继续执行。不要向用户提问。\n\
+             If the remaining work is genuinely one step, write a one-item list and finish it."
+        ))
     }
 
     /// todo 续跑判定：模型在「无工具调用」的收尾轮里，若清单仍有未完成项，
@@ -885,6 +962,17 @@ impl AgentHook for ContextHook {
         event: ModelTurnFinished<'_>,
     ) -> ModelTurnAction {
         self.handle_model_turn_finished(&event.usage);
+        // 顺序有意义：先要求"有清单"，再要求"清单清空"。
+        // 没清单时 continuation_action 本就无事可做，反过来先判续跑会让
+        // 多步任务一路裸奔到收尾才被要求补清单。
+        // Order matters: demand a list first, then demand it be cleared. With no
+        // list the continuation check is a no-op, so checking it first would let
+        // multi-step runs finish bare and only then get asked for a list.
+        if let bounce @ ModelTurnAction::Retry(_) =
+            self.todo_guard_action(event.content, event.turn)
+        {
+            return bounce;
+        }
         // 清单未清空时打回续跑（无工具调用的收尾轮才触发）。
         // Bounce a finishing turn back while the todo list is unfinished.
         self.continuation_action(event.content, event.turn)
@@ -1089,6 +1177,14 @@ pub fn decide_tier(perms: &ToolPerms, tool_name: &str, args: &str) -> Permission
         "web_fetch" => perms.web_fetch,
         "web_search" => perms.web_search,
         "run_file" => perms.run_bash_mutating,
+        // 以下四条与 `ToolPerms::permission_for` 保持一致（该函数是线上审批数据源，
+        // 本函数仅测试用）；漂移会被 `permission_for_consistent_with_decide_tier` 抓到。
+        // These four mirror `ToolPerms::permission_for` (the production approval
+        // source; this fn is test-only). Drift is caught by the consistency test.
+        "bash_output" => perms.run_bash_readonly,
+        "kill_shell" => perms.run_bash_mutating,
+        "todo_write" => Permission::Allow,
+        "task" => Permission::Allow,
         "run_bash" => {
             let command = serde_json::from_str::<serde_json::Value>(args)
                 .ok()
@@ -2109,6 +2205,131 @@ mod tests {
             content: content.to_string(),
             status,
         }
+    }
+
+    /// 无清单 + 已跑 3 步以上 + 收尾轮 → 打回一次要求建清单；之后不再重复。
+    /// No list + 3+ steps + finishing turn → bounced once to demand a list;
+    /// subsequent finishing turns pass through.
+    #[tokio::test]
+    async fn todo_guard_asks_for_list_after_three_steps() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let hook = hook_with_todos(Arc::new(Mutex::new(Vec::new())), tx);
+
+        // 三轮工具调用累积到阈值；这些回合本身不该被打断。
+        // Three tool-call turns accumulate to the threshold; these turns themselves
+        // must never be bounced.
+        for _ in 0..3 {
+            let action = hook.todo_guard_action(
+                &[AssistantContent::tool_call(
+                    "c1",
+                    "read_file",
+                    serde_json::json!({}),
+                )],
+                1,
+            );
+            assert!(
+                matches!(action, ModelTurnAction::Continue),
+                "a turn carrying tool calls must not be bounced"
+            );
+        }
+
+        // 收尾轮（无工具调用）+ 清单为空 → 打回。
+        // Finishing turn (no tool calls) with an empty list → bounced.
+        match hook.todo_guard_action(&[AssistantContent::text("done")], 2) {
+            ModelTurnAction::Retry(_) => {}
+            other => panic!("expected Retry, got {other:?}"),
+        }
+
+        let mut saw = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::Info(msg) = ev {
+                if msg.contains("清单") && msg.contains("3") {
+                    saw = true;
+                }
+            }
+        }
+        assert!(saw, "an Info event must explain the todo nudge");
+
+        // 每次 run 只提醒一次。
+        // At most one nudge per run.
+        assert!(matches!(
+            hook.todo_guard_action(&[AssistantContent::text("done again")], 3),
+            ModelTurnAction::Continue
+        ));
+    }
+
+    /// 已有清单时不越权——是否续跑归 `continuation_action` 管。
+    /// With a list already present the guard stays out of the way; continuation
+    /// handling belongs to `continuation_action`.
+    #[tokio::test]
+    async fn todo_guard_skips_when_list_exists() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(Mutex::new(vec![todo("1", "跑测试", TodoStatus::Completed)]));
+        let hook = hook_with_todos(store, tx);
+        for _ in 0..3 {
+            let _ = hook.todo_guard_action(
+                &[AssistantContent::tool_call(
+                    "c1",
+                    "read_file",
+                    serde_json::json!({}),
+                )],
+                1,
+            );
+        }
+        assert!(matches!(
+            hook.todo_guard_action(&[AssistantContent::text("done")], 2),
+            ModelTurnAction::Continue
+        ));
+    }
+
+    /// 步数不足时不打扰——单点小改动（如一次 edit_file）不该被要求建清单。
+    /// Too few steps → no nudge. A single-point edit must not be asked for a list.
+    #[tokio::test]
+    async fn todo_guard_ignores_short_tasks() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let hook = hook_with_todos(Arc::new(Mutex::new(Vec::new())), tx);
+        let _ = hook.todo_guard_action(
+            &[AssistantContent::tool_call(
+                "c1",
+                "edit_file",
+                serde_json::json!({}),
+            )],
+            1,
+        );
+        assert!(matches!(
+            hook.todo_guard_action(&[AssistantContent::text("done")], 2),
+            ModelTurnAction::Continue
+        ));
+    }
+
+    /// 无 store（只读角色 / 子代理）→ 完全不介入。
+    /// No store (read-only roles / sub-agents) → the guard never engages.
+    #[tokio::test]
+    async fn todo_guard_no_store_is_noop() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let hook = ContextHook::new(
+            128_000,
+            ContextConfig::default(),
+            dummy_client(),
+            "test-model".to_string(),
+            tx,
+            30,
+            Arc::new(crate::events::WaterfallRegistry::new()),
+        );
+        for _ in 0..5 {
+            let _ = hook.todo_guard_action(
+                &[AssistantContent::tool_call(
+                    "c1",
+                    "read_file",
+                    serde_json::json!({}),
+                )],
+                1,
+            );
+        }
+        assert!(matches!(
+            hook.todo_guard_action(&[AssistantContent::text("done")], 2),
+            ModelTurnAction::Continue
+        ));
     }
 
     /// 收尾轮（无工具调用）+ 清单未清空 → 打回续跑；清空后放行。

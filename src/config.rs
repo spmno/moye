@@ -827,9 +827,9 @@ model = "{model}"
 preamble = "AGENTS.md"
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
-permissions.run_bash_mutating = "allow"
-permissions.edit_file = "allow"
-permissions.write_file = "allow"
+permissions.run_bash_mutating = "deny"
+permissions.edit_file = "deny"
+permissions.write_file = "deny"
 permissions.web_fetch = "allow"
 permissions.web_search = "allow"
 
@@ -839,9 +839,9 @@ preamble = "prompts/investigator.md"
 max_turns = 50
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
-permissions.run_bash_mutating = "allow"
-permissions.edit_file = "allow"
-permissions.write_file = "allow"
+permissions.run_bash_mutating = "deny"
+permissions.edit_file = "deny"
+permissions.write_file = "deny"
 permissions.web_fetch = "allow"
 permissions.web_search = "allow"
 
@@ -850,9 +850,9 @@ model = "{model}"
 preamble = "prompts/planner.md"
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
-permissions.run_bash_mutating = "allow"
-permissions.edit_file = "allow"
-permissions.write_file = "allow"
+permissions.run_bash_mutating = "deny"
+permissions.edit_file = "deny"
+permissions.write_file = "deny"
 permissions.web_fetch = "allow"
 permissions.web_search = "allow"
 
@@ -873,9 +873,9 @@ model = "{model}"
 preamble = "prompts/auditor.md"
 permissions.read_file = "allow"
 permissions.run_bash_readonly = "allow"
-permissions.run_bash_mutating = "allow"
-permissions.edit_file = "allow"
-permissions.write_file = "allow"
+permissions.run_bash_mutating = "deny"
+permissions.edit_file = "deny"
+permissions.write_file = "deny"
 permissions.web_fetch = "deny"
 permissions.web_search = "deny"
 
@@ -1473,6 +1473,49 @@ MOONSHOT_API_KEY = "global-moon"
         );
         let cfg: Config = toml::from_str(&content).unwrap();
         assert_eq!(cfg.provider.plan, None);
+    }
+
+    /// 生成配置里的只读角色必须真的只读——与 AGENTS.md「编排者、调查者与规划者只读」一致。
+    /// 历史模板把四个角色都写成 allow，导致规划/审计角色能直接改文件，四段瀑布的隔离
+    /// 只剩提示词层面（审计变成同模型自审）。
+    /// Read-only roles in the generated config must actually be read-only, matching
+    /// AGENTS.md ("orchestrator, investigator and planner are read-only"). The old
+    /// template emitted `allow` for all four, letting planning/audit roles edit
+    /// files directly and reducing waterfall isolation to prompt-level only
+    /// (audit degenerated into same-model self-review).
+    #[test]
+    fn generate_agent_toml_keeps_readonly_roles_readonly() {
+        let content = render_agent_toml("volcengine", "doubao-seed-evolving", None, None, None);
+        let cfg: Config = toml::from_str(&content).unwrap();
+        for role in ["orchestrator", "investigator", "planner", "auditor"] {
+            let perms = &cfg.agents.roles.get(role).unwrap().permissions;
+            assert_eq!(
+                perms.edit_file,
+                Permission::Deny,
+                "{role} must not edit files"
+            );
+            assert_eq!(
+                perms.write_file,
+                Permission::Deny,
+                "{role} must not write files"
+            );
+            assert_eq!(
+                perms.run_bash_mutating,
+                Permission::Deny,
+                "{role} must not run mutating bash"
+            );
+            assert_eq!(
+                perms.read_file,
+                Permission::Allow,
+                "{role} must still read files"
+            );
+        }
+        // Builder 是唯一写入方，权限不能被误伤。
+        // Builder is the only writer; its permissions must stay intact.
+        let builder = &cfg.agents.roles.get("builder").unwrap().permissions;
+        assert_eq!(builder.edit_file, Permission::Allow);
+        assert_eq!(builder.write_file, Permission::Allow);
+        assert_eq!(builder.run_bash_mutating, Permission::Allow);
     }
 
     #[test]

@@ -13,3 +13,4 @@ result/
 .codegraph/codegraph.db
 /.codegraph
 pp.txt
+.DS_Store

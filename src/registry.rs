@@ -2354,6 +2354,17 @@ patches = [
 
     fn test_registry() -> AgentRegistry {
         use crate::config::Config;
+        // `from_str_with_profile(toml, None)` 会回退读进程级 `AGENT_PROFILE`。
+        // 并行测试里若有别的测试把它设成 "fast"，这里解析就会报
+        // "profile 'fast' not found"。兄弟辅助函数（make_registry_with_todo_ctx /
+        // registry_with_roles）都持 TEST_ENV_MUTEX，这个漏了。
+        // `from_str_with_profile(toml, None)` falls back to the process-wide
+        // `AGENT_PROFILE`. If a parallel test sets it to "fast", parsing here fails
+        // with "profile 'fast' not found". Sibling helpers
+        // (make_registry_with_todo_ctx / registry_with_roles) hold TEST_ENV_MUTEX;
+        // this one was missed.
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = env_guard("AGENT_PROFILE", None);
         let toml_str = r#"
 [agent]
 default_model = "test-model"
@@ -2607,6 +2618,21 @@ max_turns = 10
             ("run_bash", r#"{"command":"rm -rf x"}"#),
             ("edit_file", r#"{"path":"x","old":"a","new":"b"}"#),
             ("web_fetch", r#"{"url":"u"}"#),
+            // 无副作用/编排类工具：曾经只出现在 permission_for 分支里，
+            // decide_tier 漏了对应分支导致两者漂移（线上走 permission_for，
+            // 所以未爆雷）。列进契约测试后，任何一侧新增工具都必须同步。
+            // Side-effect-free / orchestration tools: previously only handled in
+            // permission_for, so decide_tier drifted (production uses
+            // permission_for, hence no visible bug). Listing them here forces
+            // both sides to stay in sync.
+            ("bash_output", r#"{"shell_id":"1"}"#),
+            ("kill_shell", r#"{"shell_id":"1"}"#),
+            ("todo_write", r#"{"todos":[]}"#),
+            ("task", r#"{"tasks":[]}"#),
+            ("run_file", r#"{"path":"x.py"}"#),
+            ("write_file", r#"{"path":"x","content":"y"}"#),
+            ("web_search", r#"{"query":"q"}"#),
+            ("nonexistent_tool", r#"{}"#),
         ] {
             let value = serde_json::from_str(args).unwrap();
             let via_perms = perms.permission_for(name, &value);

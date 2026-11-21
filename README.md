@@ -89,6 +89,7 @@ The domain layer (`agent_loop`, `registry`, `reviewer`, `prompt_evolve`) depends
 | **Model History** | Used models persisted to `~/.config/moye/models.json`; the `/models` picker lists recently used for one-tap switching. |
 | **Sandbox Providers** | OS-level sandbox selected at startup via `[sandbox].mode`: `auto` probes bwrap, `landlock` is the LSM fallback, `off` disables. Injected as a `SandboxProvider` seam trait. |
 | **Tool Pipeline** | 3-stage execution: pre/post `PipelineHooks` + `TimeoutRetryTool` around-execute wrapper, composed by rig's `HitlHook`. |
+| **Todo Required Guard** | When Builder / Orchestrator has made 3+ tool calls with no list yet, the finishing turn is bounced once to demand a `todo_write` breakdown (once per run; single-point edits are left alone). |
 | **Todo Continuation Guard** | On a tool-free finishing turn, if the `todo_write` list still has unfinished items the turn is bounced back with corrective feedback (at most 2 per run); past the cap the remaining items are reported. Prevents "stopping halfway". |
 | **Edit Whitespace-Drift Recovery** | When `edit_file`'s exact match fails, a unique window matching `old` line-by-line **after trimming** is applied automatically and reported (changed lines adopt the file's indentation); real character differences still error out. |
 | **Waterfall Events** | Lifecycle events (AgentPreStep / ToolsPreExecute / ToolsPostExecute / AgentTurnStopping) dispatched to emit / waterfall / serial listeners. |
